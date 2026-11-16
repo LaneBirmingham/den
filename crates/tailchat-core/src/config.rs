@@ -120,10 +120,8 @@ pub struct ServerConfig {
     pub bind: String,
     pub port: u16,
     pub channels: Vec<ChannelSpec>,
-    /// Messages kept per channel (memory and replay on join).
+    /// Messages kept per channel (memory, disk and replay on join).
     pub history_limit: usize,
-    /// Persist history to the data directory (always on for `tailchat serve`).
-    pub persist: bool,
     /// Reject peers that cannot be identified through Tailscale.
     pub require_tailnet: bool,
     /// If non-empty, only these tailnet logins may join.
@@ -145,12 +143,19 @@ impl Default for ServerConfig {
                 ChannelSpec { id: "lounge".into(), name: None, kind: ChannelKind::Voice, topic: None },
             ],
             history_limit: 500,
-            persist: false,
             require_tailnet: false,
             allow: Vec::new(),
             max_members: 64,
             rate_limit: 20,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Channels with clean, unique ids.
+    pub fn channel_list(&self) -> Vec<Channel> {
+        let mut seen = std::collections::HashSet::new();
+        self.channels.iter().map(ChannelSpec::to_channel).filter(|c| !c.id.is_empty() && seen.insert(c.id.clone())).collect()
     }
 }
 
@@ -167,6 +172,12 @@ pub struct ChannelSpec {
 
 fn default_kind() -> ChannelKind {
     ChannelKind::Text
+}
+
+impl From<&Channel> for ChannelSpec {
+    fn from(c: &Channel) -> ChannelSpec {
+        ChannelSpec { id: c.id.clone(), name: (c.name != c.id).then(|| c.name.clone()), kind: c.kind, topic: c.topic.clone() }
+    }
 }
 
 impl ChannelSpec {

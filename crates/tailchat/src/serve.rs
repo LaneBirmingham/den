@@ -1,12 +1,19 @@
-//! `tailchat serve`: a persistent headless room with an admin console.
+//! `tailchat serve`: an always-on host for a room, with an admin console.
+//!
+//! Which room: `--room <id|name>` (a saved room, e.g. one copied from a
+//! member's data folder), `--adopt <addr>` (the room someone is hosting
+//! there right now), or by default the saved room named like the config's
+//! `name` (created on first run).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use tailchat_core::config::{self, ChannelSpec, ServerConfig};
 use tailchat_core::events::Event;
 use tailchat_core::paths::Paths;
 use tailchat_core::proto::{ChannelKind, ChatMessage, Member, MessageKind};
+use tailchat_core::rooms::{self, RoomSave};
 use tailchat_core::server_node::{NodeOptions, ServerNode};
 use tailchat_core::tailscale::Tailscale;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -19,6 +26,14 @@ pub struct ServeArgs {
     /// Server config file (default: <config>/server.toml).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Host this saved room (id or name, see `<data>/rooms/`). Its name,
+    /// channels and join rules win over server.toml's; flags still override.
+    #[arg(long, conflicts_with = "adopt")]
+    room: Option<String>,
+    /// Take over the room hosted at this address (`machine` or `host:port`).
+    /// Members' copies fill in its history as they move over.
+    #[arg(long)]
+    adopt: Option<String>,
     #[arg(long)]
     name: Option<String>,
     /// tailnet (default), localhost, all, or an IP.
@@ -37,9 +52,6 @@ pub struct ServeArgs {
     /// Only admit these tailnet logins. Repeatable.
     #[arg(long = "allow")]
     allow: Vec<String>,
-    /// Keep history in memory only.
-    #[arg(long)]
-    no_persist: bool,
     /// Don't load server-side mods.
     #[arg(long)]
     no_mods: bool,
@@ -60,6 +72,33 @@ pub struct ServeArgs {
 pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
     let path = args.config.clone().unwrap_or_else(|| paths.server_config_file());
     let mut cfg: ServerConfig = config::load_or_default(&path)?;
+    let save = match (&args.room, &args.adopt) {
+        (Some(key), _) => {
+            let save = rooms::find(&paths, key).with_context(|| format!("no saved room {key:?} in {}", paths.rooms_dir().display()))?;
+            cfg = save.server_config(cfg);
+            save
+        }
+        (None, Some(addr)) => {
+            let save = rooms::adopt(&paths, addr, cfg.port).await.with_context(|| format!("adopting the room at {addr}"))?;
+            cfg = save.server_config(cfg);
+            save
+        }
+        (None, None) => {
+            let name = args.name.clone().unwrap_or_else(|| cfg.name.clone());
+            match rooms::find(&paths, &name) {
+                Some(save) => save,
+                None => {
+                    let save = RoomSave::new(&ServerConfig { name, ..cfg.clone() });
+                    // History from before rooms were saved per room.
+                    let n = rooms::import_history(&paths.legacy_history_dir(), &rooms::history_dir(&paths, &save.id))?;
+                    if n > 0 {
+                        println!("imported history from {}", paths.legacy_history_dir().display());
+                    }
+                    save
+                }
+            }
+        }
+    };
     if let Some(v) = args.name {
         cfg.name = v;
     }
@@ -88,19 +127,15 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
     }
     cfg.require_tailnet |= args.require_tailnet;
     cfg.allow.extend(args.allow);
-    cfg.persist = !args.no_persist;
     if args.write_config {
         config::save(&path, &cfg)?;
         println!("wrote {}", path.display());
         return Ok(());
     }
 
-    let node = ServerNode::start(
-        cfg.clone(),
-        paths.clone(),
-        NodeOptions { api: !args.no_api, mods: !args.no_mods, persist: cfg.persist, tailscale_bin: None },
-    )
-    .await?;
+    let node =
+        ServerNode::start(cfg.clone(), save, paths.clone(), NodeOptions { api: !args.no_api, mods: !args.no_mods, tailscale_bin: None })
+            .await?;
     print_banner(&node, &cfg, &paths, !args.no_console).await;
 
     let quiet = args.quiet;
@@ -170,8 +205,10 @@ async fn print_banner(node: &ServerNode, cfg: &ServerConfig, paths: &Paths, cons
         .map(|c| if c.kind == ChannelKind::Voice { format!("~{}", c.id) } else { format!("#{}", c.id) })
         .collect();
     println!("  channels:   {}", channels.join(" "));
-    if cfg.persist {
-        println!("  history:    {}", paths.history_dir().display());
+    let save = node.save();
+    println!("  room:       {} (term {}) · saved in {}", save.id, save.term, rooms::dir(paths, &save.id).display());
+    if let Some(from) = node.claimed_from() {
+        println!("  took over:  the room was hosted at {from}; members are moving here");
     }
     if let Some(api) = node.api_addr() {
         println!("  control API {api} (tailchat api --server …)");
@@ -210,6 +247,7 @@ fn log_event(ev: &Event, quiet: bool) {
                 println!("- [{}] {} left ({})", m.id, m.nick, d["reason"].as_str().unwrap_or(""));
             }
         }
+        "room.moved" => println!("== the room moved to {} (term {})", d["to"][0].as_str().unwrap_or("?"), d["term"]),
         _ => {}
     }
 }

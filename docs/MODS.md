@@ -102,7 +102,8 @@ Buttons run one of the mod's commands (`command` + `args`) and/or emit a
 
 `connection.changed`, `message.created`, `member.joined`, `member.left`,
 `member.updated`, `voice.joined`, `voice.left`, `app.message`, `notice`,
-`ui.action`, `ui.changed`, `hosting.changed`, `command.run`.
+`ui.action`, `ui.changed`, `hosting.changed`, `room.moved` (`{to, term}`: the
+room changed host), `command.run`.
 Payloads are what `tailchat api events.subscribe` prints — the easiest way to
 see them is to run that while you chat.
 

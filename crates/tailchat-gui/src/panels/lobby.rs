@@ -5,8 +5,8 @@ use super::{Panel, PanelCx};
 use crate::icons;
 use crate::kit::{self, Face, W};
 
-/// The screen before you're in a room: host one, join one, or pick a room
-/// discovered on your tailnet.
+/// The screen before you're in a room: reopen a saved room, join one, pick
+/// a room discovered on your tailnet, or host a new one.
 #[derive(Default)]
 pub struct Lobby {
     init: bool,
@@ -15,7 +15,8 @@ pub struct Lobby {
     addr: String,
     bind: String,
     port: String,
-    persist: bool,
+    /// Saved room waiting for a second click on "forget".
+    confirm_forget: Option<String>,
 }
 
 const BINDS: &[(&str, &str)] = &[("tailnet", "Tailnet only"), ("localhost", "This computer"), ("all", "All interfaces")];
@@ -108,6 +109,11 @@ impl Lobby {
             }
         });
 
+        if !cx.state.rooms.is_empty() {
+            ui.add_space(8.0);
+            card(ui, &p, raised, |ui| self.saved_rooms(ui, cx));
+        }
+
         ui.add_space(8.0);
         card(ui, &p, raised, |ui| {
             title(ui, "Join a room", &p);
@@ -156,11 +162,13 @@ impl Lobby {
                             cx.actions.session(move |s| s.join(a));
                         }
                         ui.label(RichText::new(&room.server.name).strong());
+                        let saved = cx.state.rooms.iter().any(|r| r.id == room.server.room_id);
                         ui.label(cx.small(format!(
-                            "{} · {} online{}",
+                            "{} · {} online{}{}",
                             room.peer.short_name(),
                             room.members,
-                            if room.server.mode == "server" { " · server" } else { "" }
+                            if room.server.mode == "server" { " · server" } else { "" },
+                            if saved { " · saved" } else { "" }
                         )));
                     });
                 }
@@ -170,7 +178,9 @@ impl Lobby {
         ui.add_space(8.0);
         card(ui, &p, raised, |ui| {
             title(ui, "Host a room", &p);
-            ui.label(cx.small("Runs the room on this computer; friends join with your machine name."));
+            ui.label(cx.small(
+                "Runs the room on this computer; friends join with your machine name. Everyone keeps a copy, so anyone can host it later.",
+            ));
             egui::Grid::new("host-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Name");
                 ui.add(TextEdit::singleline(&mut self.room).desired_width(240.0));
@@ -186,9 +196,6 @@ impl Lobby {
                 ui.label("Port");
                 ui.add(TextEdit::singleline(&mut self.port).desired_width(80.0));
                 ui.end_row();
-                ui.label("");
-                ui.checkbox(&mut self.persist, "keep history between runs");
-                ui.end_row();
             });
             let port = self.port.trim().parse::<u16>().ok();
             if port.is_none() {
@@ -201,13 +208,56 @@ impl Lobby {
                     name: if self.room.trim().is_empty() { format!("{}'s room", self.nick) } else { self.room.trim().to_owned() },
                     bind: self.bind.clone(),
                     port: port.unwrap_or(cfg.port),
-                    persist: self.persist,
                 };
                 cx.actions.session(move |s| s.host(opts));
             }
         });
         ui.add_space(12.0);
         ui.label(cx.small(format!("tailchat {} · {} · {}", tailchat_core::VERSION, cx.shell.theme, cx.shell.layout)));
+    }
+
+    /// Rooms you've been in. "Open" joins whoever hosts it now, or hosts it
+    /// from your copy if nobody does.
+    fn saved_rooms(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
+        let p = *cx.palette;
+        title(ui, "Your rooms", &p);
+        ui.label(cx.small("Open joins whoever is hosting it now, or hosts it from your copy."));
+        let busy = matches!(cx.state.conn, ConnState::Connecting { .. });
+        for room in cx.state.rooms.clone() {
+            ui.horizontal(|ui| {
+                if kit::pill_button(ui, "Open", &p).clicked() && !busy {
+                    self.save_nick(cx);
+                    let id = room.id.clone();
+                    cx.actions.session(move |s| s.open_room(&id));
+                }
+                ui.label(RichText::new(&room.name).strong());
+                let live = cx.state.discovery.rooms.iter().find(|d| d.server.room_id == room.id);
+                let line = match (live, room.addrs.first()) {
+                    (Some(d), _) => format!("live on {} · {} online", d.peer.short_name(), d.members),
+                    (None, Some(a)) => format!("last hosted at {a}"),
+                    (None, None) => "not hosted yet".into(),
+                };
+                ui.label(cx.small(line));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.confirm_forget.as_deref() == Some(room.id.as_str()) {
+                        if ui.small_button(RichText::new("delete history").color(p.danger)).clicked() {
+                            self.confirm_forget = None;
+                            let id = room.id.clone();
+                            cx.actions.session(move |s| {
+                                if let Err(e) = s.forget_room(&id) {
+                                    s.notice(tailchat_core::proto::NoticeLevel::Warn, format!("{e:#}"));
+                                }
+                            });
+                        }
+                        if ui.small_button("keep").clicked() {
+                            self.confirm_forget = None;
+                        }
+                    } else if ui.small_button("forget").on_hover_text("delete your copy of this room").clicked() {
+                        self.confirm_forget = Some(room.id.clone());
+                    }
+                });
+            });
+        }
     }
 
     fn save_nick(&self, cx: &mut PanelCx<'_>) {

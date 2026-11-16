@@ -4,16 +4,19 @@
 //!
 //! * **Host (peer-to-peer)** — someone clicks *Host* in the app; the server
 //!   runs inside their process and they join it like everyone else.
-//! * **Headless** — `tailchat serve` on an always-on box; history persists.
+//! * **Headless** — `tailchat serve` on an always-on box.
 //!
 //! The server owns membership, channels and history, relays chat and mod
 //! `app` messages, and forwards voice datagrams between members of the same
 //! voice channel without decoding them (an SFU, not a mixer).
+//!
+//! A room isn't tied to one server: it has an id and a term, members sync
+//! history with it on join, and it can hand everyone over to another host
+//! ([`ServerHandle::hand_off`], or a `claim` from a host with a higher term).
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,8 +26,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tailchat_proto::voice::{self, Packet};
 use tailchat_proto::{
-    Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, Identity, MAX_MESSAGE_LEN, Member, MemberId, MessageKind, PROTOCOL_VERSION,
-    ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
+    MessageKind, PROTOCOL_VERSION, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -32,6 +35,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::config::ServerConfig;
 use crate::net::{read_frame, write_frame};
+use crate::rooms;
 use crate::tailscale::{Tailscale, WhoIs};
 
 /// History sent to a member on join, per text channel.
@@ -59,20 +63,63 @@ pub struct ServerOptions {
     pub config: ServerConfig,
     pub mode: ServerMode,
     pub bind: SocketAddr,
-    /// Persist history as JSON lines here.
+    /// Load and persist history as JSON lines here (a room save's `history/`).
     pub history_dir: Option<PathBuf>,
     pub tailscale: Option<Tailscale>,
+    /// Stable room id (see [`rooms`]).
+    pub room_id: String,
+    /// This host's term: one more than the room's previous host.
+    pub term: u64,
+}
+
+/// Progress of handing the room to another host.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HandoffState {
+    None,
+    /// Waiting for `member` to start hosting at `term`.
+    Asked {
+        member: MemberId,
+        term: u64,
+    },
+    /// Everyone was sent to `to`; this server is done.
+    Moved {
+        to: Vec<String>,
+        term: u64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// What happened on the server, for consoles, mods and the control API.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerEvent {
-    MemberJoined { member: Member },
-    MemberLeft { member: Member, reason: String },
-    MemberUpdated { member: Member },
-    Message { message: ChatMessage },
-    App { from: MemberId, ns: String, channel: Option<ChannelId>, data: Value },
+    MemberJoined {
+        member: Member,
+    },
+    MemberLeft {
+        member: Member,
+        reason: String,
+    },
+    MemberUpdated {
+        member: Member,
+    },
+    Message {
+        message: ChatMessage,
+    },
+    App {
+        from: MemberId,
+        ns: String,
+        channel: Option<ChannelId>,
+        data: Value,
+    },
+    /// The room moved to another host.
+    Moved {
+        to: Vec<String>,
+        term: u64,
+    },
 }
 
 /// Resolve a bind spec (`tailnet`, `localhost`, `all`, or an IP) to a socket address.
@@ -106,9 +153,12 @@ struct Room {
     members: HashMap<MemberId, Conn>,
     tokens: HashMap<u64, MemberId>,
     channels: Vec<Channel>,
+    /// Sorted by id.
     history: HashMap<ChannelId, VecDeque<ChatMessage>>,
     next_member: MemberId,
-    next_msg: u64,
+    last_id: u64,
+    /// Member asked to take over, and at which term.
+    pending: Option<(MemberId, u64)>,
 }
 
 impl Room {
@@ -138,6 +188,36 @@ impl Room {
             }
             send_to(conn, frame);
         }
+    }
+
+    /// Time-ordered ids that stay unique when the room changes host:
+    /// `(unix ms << 10) | 10 random bits`, never below the last id. Stays
+    /// under 2^53, so JSON tools that use doubles keep it exact.
+    fn next_id(&mut self) -> u64 {
+        let stamp = ((crate::now_ms().max(0) as u64) << 10) | (rand::random::<u64>() & 0x3ff);
+        self.last_id = stamp.max(self.last_id + 1);
+        self.last_id
+    }
+
+    /// Merge messages from a member's copy. Returns the ones that were new
+    /// and survived trimming to `limit`.
+    fn merge_history(&mut self, channel: &str, msgs: Vec<ChatMessage>, limit: usize) -> Vec<ChatMessage> {
+        let h = self.history.entry(channel.to_owned()).or_default();
+        let mut known: HashSet<u64> = h.iter().map(|m| m.id).collect();
+        let mut added: Vec<ChatMessage> = msgs.into_iter().filter(|m| known.insert(m.id)).collect();
+        if added.is_empty() {
+            return added;
+        }
+        h.extend(added.iter().cloned());
+        h.make_contiguous().sort_by_key(|m| m.id);
+        while h.len() > limit.max(1) {
+            h.pop_front();
+        }
+        let oldest = h.front().map(|m| m.id).unwrap_or(0);
+        added.retain(|m| m.id >= oldest);
+        added.sort_by_key(|m| m.id);
+        self.last_id = self.last_id.max(added.last().map(|m| m.id).unwrap_or(0));
+        added
     }
 
     fn push_history(&mut self, msg: ChatMessage, limit: usize) {
@@ -181,6 +261,7 @@ struct Shared {
     tailscale: Option<Tailscale>,
     persist: Option<mpsc::UnboundedSender<ChatMessage>>,
     shutdown: watch::Sender<bool>,
+    handoff: watch::Sender<HandoffState>,
     whois: Mutex<HashMap<IpAddr, (Instant, Option<WhoIs>)>>,
 }
 
@@ -209,21 +290,18 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
     let (listener, udp) = bind_tcp_udp(opts.bind).await?;
     let local_addr = listener.local_addr()?;
 
-    let channels: Vec<Channel> = {
-        let mut seen = std::collections::HashSet::new();
-        opts.config.channels.iter().map(|c| c.to_channel()).filter(|c| !c.id.is_empty() && seen.insert(c.id.clone())).collect()
-    };
+    let channels = opts.config.channel_list();
     if channels.is_empty() {
         bail!("server needs at least one channel");
     }
 
-    let (history, next_msg, persist) = match &opts.history_dir {
+    let (history, last_id, persist) = match &opts.history_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).with_context(|| format!("creating history dir {}", dir.display()))?;
-            let (h, max_id) = load_history(dir, &channels, opts.config.history_limit)?;
-            (h, max_id + 1, Some(spawn_persister(dir.clone())))
+            let (h, max_id) = rooms::load_history(dir, &channels, opts.config.history_limit)?;
+            (h, max_id, Some(rooms::spawn_persister(dir.clone())))
         }
-        None => (HashMap::new(), 1, None),
+        None => (HashMap::new(), 0, None),
     };
 
     let info = ServerInfo {
@@ -231,11 +309,15 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
         motd: opts.config.motd.clone(),
         version: crate::VERSION.into(),
         mode: opts.mode.as_str().into(),
+        room_id: opts.room_id,
+        term: opts.term,
     };
     let (events, _) = broadcast::channel(1024);
     let (shutdown, _) = watch::channel(false);
+    let (handoff, _) = watch::channel(HandoffState::None);
+    let room = Room { members: HashMap::new(), tokens: HashMap::new(), channels, history, next_member: 1, last_id, pending: None };
     let shared = Arc::new(Shared {
-        room: Mutex::new(Room { members: HashMap::new(), tokens: HashMap::new(), channels, history, next_member: 1, next_msg }),
+        room: Mutex::new(room),
         info: Mutex::new(info),
         cfg: opts.config,
         events,
@@ -244,6 +326,7 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
         tailscale: opts.tailscale,
         persist,
         shutdown,
+        handoff,
         whois: Mutex::new(HashMap::new()),
     });
 
@@ -280,7 +363,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     let (mut rd, mut wr) = stream.into_split();
 
     let first = tokio::time::timeout(Duration::from_secs(10), read_frame::<_, ClientMsg>(&mut rd)).await;
-    let (nick, client, codecs) = match first {
+    let (nick, client, codecs, features) = match first {
         Ok(Ok(Some(ClientMsg::Probe))) => {
             let (members, channels) = {
                 let room = shared.room.lock();
@@ -290,13 +373,24 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
             let _ = write_frame(&mut wr, &ServerMsg::ProbeInfo { server: info, members, channels }).await;
             return;
         }
-        Ok(Ok(Some(ClientMsg::Hello { version, nick, client, codecs, .. }))) => {
+        Ok(Ok(Some(ClientMsg::Claim { room, term, addrs }))) => {
+            let reply = shared.claim(peer.ip(), &room, term, addrs).await;
+            let _ = write_frame(&mut wr, &reply).await;
+            return;
+        }
+        Ok(Ok(Some(ClientMsg::Hello { version, nick, client, codecs, features }))) => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("protocol {version} not supported (server speaks {PROTOCOL_VERSION})");
                 let _ = write_frame(&mut wr, &reject("version", msg)).await;
                 return;
             }
-            (nick, client, codecs)
+            // Late arrivals after a handoff are sent on to the new host.
+            let moved = shared.handoff.borrow().clone();
+            if let HandoffState::Moved { to, term } = moved {
+                let _ = write_frame(&mut wr, &ServerMsg::Handoff { to, term }).await;
+                return;
+            }
+            (nick, client, codecs, features)
         }
         _ => {
             let _ = write_frame(&mut wr, &reject("handshake", "expected hello")).await;
@@ -305,16 +399,9 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     };
 
     let identity = shared.identify(peer.ip()).await;
-    if shared.cfg.require_tailnet && !identity.verified {
-        let _ = write_frame(&mut wr, &reject("not_tailnet", "this room only admits tailnet members")).await;
+    if let Some(refusal) = shared.refusal(&identity) {
+        let _ = write_frame(&mut wr, &refusal).await;
         return;
-    }
-    if !shared.cfg.allow.is_empty() {
-        let ok = identity.login.as_ref().is_some_and(|l| shared.cfg.allow.iter().any(|a| a.eq_ignore_ascii_case(l)));
-        if !ok {
-            let _ = write_frame(&mut wr, &reject("not_allowed", "you are not on this room's allow list")).await;
-            return;
-        }
     }
 
     let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(OUTBOX_FRAMES);
@@ -344,6 +431,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                 deafened: false,
                 client: client.chars().take(64).collect(),
                 codecs,
+                can_host: features.iter().any(|f| f == FEATURE_HOST),
             };
             let mut conn = Conn { member: member.clone(), ip: peer.ip(), token, udp: None, tx, kick: Some(kick_tx), sent: VecDeque::new() };
             // Welcome and history go into the outbox before anything else can.
@@ -358,6 +446,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                     m.push(member.clone());
                     m
                 },
+                access: shared.access(),
             };
             send_to(&mut conn, &frame(&welcome));
             let text_channels: Vec<ChannelId> =
@@ -405,6 +494,10 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     let removed = {
         let mut room = shared.room.lock();
         let conn = room.members.remove(&id);
+        if room.pending.is_some_and(|(asked, _)| asked == id) {
+            room.pending = None;
+            shared.handoff.send_replace(HandoffState::Failed { error: "the member asked to host left".into() });
+        }
         if let Some(c) = &conn {
             room.tokens.remove(&c.token);
             if reason != "left" && !reason.starts_with("connection error") {
@@ -432,6 +525,59 @@ fn describe_identity(id: &Identity) -> String {
 }
 
 impl Shared {
+    fn access(&self) -> Access {
+        Access { require_tailnet: self.cfg.require_tailnet, allow: self.cfg.allow.clone() }
+    }
+
+    /// The room's join rules: why `identity` may not come in, if it may not.
+    /// Every way in (joining, claiming) goes through here.
+    fn refusal(&self, identity: &Identity) -> Option<ServerMsg> {
+        if self.cfg.require_tailnet && !identity.verified {
+            return Some(reject("not_tailnet", "this room only admits tailnet members"));
+        }
+        let listed = identity.login.as_ref().is_some_and(|l| self.cfg.allow.iter().any(|a| a.eq_ignore_ascii_case(l)));
+        if !self.cfg.allow.is_empty() && !listed {
+            return Some(reject("not_allowed", "you are not on this room's allow list"));
+        }
+        None
+    }
+
+    /// Another peer hosts this room at a higher term and wants everyone.
+    async fn claim(&self, ip: IpAddr, room: &str, term: u64, addrs: Vec<String>) -> ServerMsg {
+        let identity = self.identify(ip).await;
+        if let Some(refusal) = self.refusal(&identity) {
+            return refusal;
+        }
+        let (id, current) = {
+            let info = self.info.lock();
+            (info.room_id.clone(), info.term)
+        };
+        if room != id {
+            return reject("wrong_room", "this server hosts a different room");
+        }
+        if term <= current {
+            return reject("stale_term", format!("this room is already at term {current}"));
+        }
+        if addrs.is_empty() || addrs.len() > 8 {
+            return reject("bad_claim", "a claim needs 1-8 addresses");
+        }
+        tracing::info!("room claimed at term {term} by {} ({})", addrs[0], describe_identity(&identity));
+        self.finish_handoff(addrs.clone(), term);
+        ServerMsg::Handoff { to: addrs, term }
+    }
+
+    /// Send everyone to the new host. This server keeps running until its
+    /// owner shuts it down, answering late joiners with the same handoff.
+    fn finish_handoff(&self, to: Vec<String>, term: u64) {
+        {
+            let mut room = self.room.lock();
+            room.pending = None;
+            room.broadcast(&frame(&ServerMsg::Handoff { to: to.clone(), term }), None);
+        }
+        self.handoff.send_replace(HandoffState::Moved { to: to.clone(), term });
+        let _ = self.events.send(ServerEvent::Moved { to, term });
+    }
+
     async fn identify(&self, ip: IpAddr) -> Identity {
         let ip = ip.to_canonical();
         if ip.is_loopback() {
@@ -494,7 +640,7 @@ impl Shared {
                 let author = conn.member.nick.clone();
                 let author_login = conn.member.identity.login.clone();
                 let message = ChatMessage {
-                    id: room.next_msg,
+                    id: room.next_id(),
                     channel,
                     ts: crate::now_ms(),
                     author_id: Some(id),
@@ -503,7 +649,6 @@ impl Shared {
                     text,
                     kind: MessageKind::User,
                 };
-                room.next_msg += 1;
                 self.publish(&mut room, message);
             }
             ClientMsg::History { channel, before, limit } => {
@@ -543,6 +688,72 @@ impl Shared {
                 drop(room);
                 let _ = self.events.send(ServerEvent::App { from: id, ns, channel, data });
             }
+            ClientMsg::Sync { channel, have } => {
+                if !room.channel(&channel).is_some_and(|c| c.kind == ChannelKind::Text) {
+                    return;
+                }
+                let limit = self.cfg.history_limit.max(1);
+                let have: HashSet<u64> = have.into_iter().take(limit * 4).collect();
+                let (missing, want) = {
+                    let empty = VecDeque::new();
+                    let h = room.history.get(&channel).unwrap_or(&empty);
+                    let missing: Vec<ChatMessage> = h.iter().filter(|m| !have.contains(&m.id)).cloned().collect();
+                    let mine: HashSet<u64> = h.iter().map(|m| m.id).collect();
+                    // When full, only ask for what would survive trimming.
+                    let floor = if h.len() >= limit { h.front().map(|m| m.id).unwrap_or(0) } else { 0 };
+                    let mut want: Vec<u64> = have.iter().copied().filter(|i| *i > floor && !mine.contains(i)).collect();
+                    want.sort_unstable();
+                    let skip = want.len().saturating_sub(limit);
+                    (missing, want.split_off(skip))
+                };
+                for chunk in missing.chunks(MAX_BATCH) {
+                    self.reply(&mut room, id, &ServerMsg::Backfill { channel: channel.clone(), messages: chunk.to_vec() });
+                }
+                if !want.is_empty() {
+                    self.reply(&mut room, id, &ServerMsg::Want { channel, ids: want });
+                }
+            }
+            ClientMsg::Upload { channel, messages } => {
+                if !room.channel(&channel).is_some_and(|c| c.kind == ChannelKind::Text) {
+                    return;
+                }
+                let msgs: Vec<ChatMessage> = messages
+                    .into_iter()
+                    .take(MAX_BATCH)
+                    .filter(|m| m.id != 0 && m.channel == channel && m.text.len() <= MAX_MESSAGE_LEN && m.author.len() <= 64)
+                    .map(|mut m| {
+                        // Member ids belong to the host that assigned them.
+                        m.author_id = None;
+                        m
+                    })
+                    .collect();
+                let added = room.merge_history(&channel, msgs, self.cfg.history_limit);
+                if added.is_empty() {
+                    return;
+                }
+                if let Some(p) = &self.persist {
+                    for m in &added {
+                        let _ = p.send(m.clone());
+                    }
+                }
+                room.broadcast(&frame(&ServerMsg::Backfill { channel, messages: added }), Some(id));
+            }
+            ClientMsg::HostReady { term, addrs } => {
+                let ours = room.pending == Some((id, term));
+                drop(room);
+                if ours && !addrs.is_empty() {
+                    self.finish_handoff(addrs.into_iter().take(8).collect(), term);
+                }
+            }
+            ClientMsg::HostFailed { term, error } => {
+                if room.pending == Some((id, term)) {
+                    room.pending = None;
+                    let nick = room.members.get(&id).map(|c| c.member.nick.clone()).unwrap_or_default();
+                    drop(room);
+                    self.handoff.send_replace(HandoffState::Failed { error: format!("{nick} couldn't host: {error}") });
+                }
+            }
+            ClientMsg::Claim { .. } => self.reply(&mut room, id, &reject("handshake", "claim must be the first frame")),
         }
     }
 
@@ -647,6 +858,79 @@ impl ServerHandle {
         self.shared.info.lock().clone()
     }
 
+    pub fn room_id(&self) -> String {
+        self.shared.info.lock().room_id.clone()
+    }
+
+    pub fn term(&self) -> u64 {
+        self.shared.info.lock().term
+    }
+
+    /// Whether two handles are the same server.
+    pub fn same(&self, other: &ServerHandle) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// Ask a member to take over hosting. `to: None` picks the
+    /// longest-connected member whose app can host, other than `except`
+    /// (usually the host's own session). When they're ready, everyone is
+    /// sent to them; watch [`handoff_state`](Self::handoff_state).
+    pub fn hand_off(&self, to: Option<MemberId>, except: Option<MemberId>) -> anyhow::Result<Member> {
+        if matches!(*self.shared.handoff.borrow(), HandoffState::Moved { .. }) {
+            bail!("the room has already moved");
+        }
+        let term = self.term() + 1;
+        let mut room = self.shared.room.lock();
+        let target = match to {
+            Some(id) => room.members.get(&id).map(|c| c.member.clone()).with_context(|| format!("no member {id}"))?,
+            None => {
+                room.members().into_iter().find(|m| Some(m.id) != except && m.can_host).context("nobody else here can host the room")?
+            }
+        };
+        if !target.can_host {
+            bail!("{}'s app can't host rooms", target.nick);
+        }
+        room.pending = Some((target.id, term));
+        self.shared.reply(&mut room, target.id, &ServerMsg::HostRequest { term });
+        drop(room);
+        self.shared.handoff.send_replace(HandoffState::Asked { member: target.id, term });
+        tracing::info!("asked {} to host at term {term}", target.nick);
+        Ok(target)
+    }
+
+    pub fn handoff_state(&self) -> watch::Receiver<HandoffState> {
+        self.shared.handoff.subscribe()
+    }
+
+    /// Wait (up to `timeout`) for a handoff in progress to finish.
+    pub async fn wait_handoff(&self, timeout: Duration) -> HandoffState {
+        let mut rx = self.handoff_state();
+        let wait = rx.wait_for(|s| matches!(s, HandoffState::Moved { .. } | HandoffState::Failed { .. } | HandoffState::None));
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(Ok(s)) => s.clone(),
+            _ => HandoffState::Failed { error: "the new host didn't answer in time".into() },
+        }
+    }
+
+    /// Resolves when the room moves to another host (`Some((to, term))`) or
+    /// this server shuts down (`None`).
+    pub async fn moved(&self) -> Option<(Vec<String>, u64)> {
+        let mut handoff = self.handoff_state();
+        let mut stop = self.shared.shutdown.subscribe();
+        loop {
+            if let HandoffState::Moved { to, term } = &*handoff.borrow_and_update() {
+                return Some((to.clone(), *term));
+            }
+            if *stop.borrow_and_update() {
+                return None;
+            }
+            tokio::select! {
+                r = handoff.changed() => if r.is_err() { return None },
+                r = stop.changed() => if r.is_err() { return None },
+            }
+        }
+    }
+
     pub fn config(&self) -> &ServerConfig {
         &self.shared.cfg
     }
@@ -694,7 +978,7 @@ impl ServerHandle {
             }
         };
         let message = ChatMessage {
-            id: room.next_msg,
+            id: room.next_id(),
             channel,
             ts: crate::now_ms(),
             author_id: None,
@@ -703,7 +987,6 @@ impl ServerHandle {
             text: text.to_owned(),
             kind: MessageKind::Server,
         };
-        room.next_msg += 1;
         self.shared.publish(&mut room, message.clone());
         Ok(message)
     }
@@ -736,59 +1019,4 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         let _ = self.shared.shutdown.send(true);
     }
-}
-
-fn history_file(dir: &Path, channel: &str) -> PathBuf {
-    dir.join(format!("{channel}.jsonl"))
-}
-
-fn load_history(dir: &Path, channels: &[Channel], limit: usize) -> anyhow::Result<(HashMap<ChannelId, VecDeque<ChatMessage>>, u64)> {
-    let mut out = HashMap::new();
-    let mut max_id = 0;
-    for ch in channels.iter().filter(|c| c.kind == ChannelKind::Text) {
-        let path = history_file(dir, &ch.id);
-        let Ok(file) = std::fs::File::open(&path) else { continue };
-        let mut all: Vec<ChatMessage> =
-            std::io::BufReader::new(file).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str(&l).ok()).collect();
-        max_id = all.iter().map(|m| m.id).fold(max_id, u64::max);
-        let total = all.len();
-        let keep = all.split_off(total.saturating_sub(limit.max(1)));
-        // Compact files that have grown well past what we keep.
-        if total > keep.len() * 4 + 100 {
-            let tmp = path.with_extension("jsonl.tmp");
-            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-            for m in &keep {
-                serde_json::to_writer(&mut f, m)?;
-                f.write_all(b"\n")?;
-            }
-            f.flush()?;
-            drop(f);
-            std::fs::rename(&tmp, &path)?;
-        }
-        out.insert(ch.id.clone(), keep.into());
-    }
-    Ok((out, max_id))
-}
-
-fn spawn_persister(dir: PathBuf) -> mpsc::UnboundedSender<ChatMessage> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ChatMessage>();
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let path = history_file(&dir, &msg.channel);
-            let line = match serde_json::to_string(&msg) {
-                Ok(l) => l + "\n",
-                Err(_) => continue,
-            };
-            let res = async {
-                let mut f = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
-                f.write_all(line.as_bytes()).await?;
-                f.flush().await
-            }
-            .await;
-            if let Err(e) = res {
-                tracing::warn!("persisting history to {}: {e}", path.display());
-            }
-        }
-    });
-    tx
 }

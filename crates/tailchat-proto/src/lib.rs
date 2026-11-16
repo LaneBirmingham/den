@@ -11,6 +11,14 @@
 //!
 //! Everything here is plain data: no I/O, no async runtime. Any frontend or
 //! alternative implementation can speak the protocol from this crate alone.
+//!
+//! **Rooms move.** A room has a stable id and a `term` that goes up each time
+//! another member takes over hosting. Every member keeps a copy of the room
+//! (settings + recent history) and swaps message ids with the host on join
+//! ([`ClientMsg::Sync`]), so any of them can host it later. A planned change
+//! of host is [`ServerMsg::HostRequest`] → [`ClientMsg::HostReady`] →
+//! [`ServerMsg::Handoff`]; a peer that already hosts the room with a higher
+//! term takes it over with [`ClientMsg::Claim`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,13 +26,17 @@ use serde_json::Value;
 pub mod voice;
 
 /// Bumped on breaking wire changes. Servers reject mismatched majors.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Default TCP (control) and UDP (voice) port. "TAIL" on a phone keypad.
 pub const DEFAULT_PORT: u16 = 8245;
 /// Largest control frame either side will accept.
 pub const MAX_FRAME: usize = 1 << 20;
 /// Longest chat message accepted by the server, in bytes.
 pub const MAX_MESSAGE_LEN: usize = 4000;
+/// Most messages in one `history`, `backfill` or `upload` frame (keeps frames under [`MAX_FRAME`]).
+pub const MAX_BATCH: usize = 100;
+/// `hello` feature: this client can host the room if asked.
+pub const FEATURE_HOST: &str = "host";
 
 /// Session-scoped member id assigned by the server on connect.
 pub type MemberId = u32;
@@ -67,6 +79,9 @@ pub struct Member {
     /// Voice codecs this member can decode.
     #[serde(default)]
     pub codecs: Vec<voice::Codec>,
+    /// The member's app can take over hosting (sent `features: ["host"]`).
+    #[serde(default)]
+    pub can_host: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,7 +114,8 @@ pub enum MessageKind {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatMessage {
-    /// Monotonic per server, survives restarts when history is persisted.
+    /// Unique and time-ordered across hosts: `(unix ms << 10) | random`, and
+    /// always above the previous id in the room. `0` for local-only lines.
     pub id: u64,
     pub channel: ChannelId,
     /// Unix time in milliseconds (server clock).
@@ -126,6 +142,23 @@ pub struct ServerInfo {
     /// `"host"` for a peer hosting from the app, `"server"` for a headless server.
     #[serde(default)]
     pub mode: String,
+    /// Stable room id, the same whoever hosts it.
+    #[serde(default)]
+    pub room_id: String,
+    /// Bumped on every change of host. The highest term is the live room.
+    #[serde(default)]
+    pub term: u64,
+}
+
+/// Who may join. Travels with the room so the next host applies the same rules.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct Access {
+    /// Reject peers that cannot be identified through Tailscale.
+    #[serde(default)]
+    pub require_tailnet: bool,
+    /// If non-empty, only these tailnet logins may join.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
 }
 
 /// Where and how to send voice datagrams for this session.
@@ -163,6 +196,14 @@ pub enum ClientMsg {
     },
     /// Ask for public room info and close. Used by tailnet discovery.
     Probe,
+    /// First frame, instead of `hello`: "I host this room now, at a higher
+    /// term; send everyone to `addrs`". Answered with `handoff` (accepted) or
+    /// `error`, then closed. The claimant must pass the room's [`Access`].
+    Claim {
+        room: String,
+        term: u64,
+        addrs: Vec<String>,
+    },
     Send {
         channel: ChannelId,
         text: String,
@@ -197,6 +238,27 @@ pub enum ClientMsg {
     Ping {
         nonce: u64,
     },
+    /// "These are the message ids I hold for `channel`." The server answers
+    /// with `backfill` (what we lack) and `want` (what it lacks).
+    Sync {
+        channel: ChannelId,
+        have: Vec<u64>,
+    },
+    /// Messages the server asked for with `want`.
+    Upload {
+        channel: ChannelId,
+        messages: Vec<ChatMessage>,
+    },
+    /// Answer to `host_request`: we now host the room at `term` on `addrs`.
+    HostReady {
+        term: u64,
+        addrs: Vec<String>,
+    },
+    /// Answer to `host_request`: we could not host.
+    HostFailed {
+        term: u64,
+        error: String,
+    },
 }
 
 /// Server → client control messages.
@@ -210,6 +272,9 @@ pub enum ServerMsg {
         voice: VoiceSetup,
         channels: Vec<Channel>,
         members: Vec<Member>,
+        /// The room's join rules, so members can save and re-apply them.
+        #[serde(default)]
+        access: Access,
     },
     ProbeInfo {
         server: ServerInfo,
@@ -258,6 +323,26 @@ pub enum ServerMsg {
     /// Sent right before the server closes the connection.
     Bye {
         reason: String,
+    },
+    /// Messages for `channel` that the receiver lacks (answer to `sync`, or
+    /// history another member just uploaded). Not new: don't count as unread.
+    Backfill {
+        channel: ChannelId,
+        messages: Vec<ChatMessage>,
+    },
+    /// Message ids the server lacks; answer with `upload`.
+    Want {
+        channel: ChannelId,
+        ids: Vec<u64>,
+    },
+    /// "Please host this room from your copy at `term`"; answer `host_ready` or `host_failed`.
+    HostRequest {
+        term: u64,
+    },
+    /// The room moved: reconnect to the first of `to` that works.
+    Handoff {
+        to: Vec<String>,
+        term: u64,
     },
 }
 
@@ -325,6 +410,17 @@ mod tests {
     fn json_shape_is_tagged() {
         let v = serde_json::to_value(ServerMsg::MemberLeft { id: 7 }).unwrap();
         assert_eq!(v, serde_json::json!({"type": "member_left", "id": 7}));
+    }
+
+    #[test]
+    fn room_messages_shape() {
+        let v = serde_json::to_value(ServerMsg::Handoff { to: vec!["box:8245".into()], term: 3 }).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "handoff", "to": ["box:8245"], "term": 3}));
+        let back: ClientMsg = serde_json::from_value(serde_json::json!({"type": "sync", "channel": "general", "have": [1, 2]})).unwrap();
+        assert_eq!(back, ClientMsg::Sync { channel: "general".into(), have: vec![1, 2] });
+        // Older peers' server info still parses.
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({"name": "den", "version": "0.1.0"})).unwrap();
+        assert_eq!((info.room_id.as_str(), info.term), ("", 0));
     }
 
     #[test]

@@ -58,16 +58,20 @@ the connection streams events. The token is compared in constant time.
 | `ui.screenshot` | `path?` | PNG of the app window (GUI only) |
 | `mods.list` / `mods.reload` | | |
 | `mods.run` | `command, args?` | run a mod command |
-| `session.host` | `name?, bind?, port?, persist?` | host a room |
+| `session.host` | `name?, bind?, port?` | host a new room |
 | `session.join` | `addr` | |
-| `session.leave` | | |
+| `session.leave` | | leave; if you host, another member takes the room over |
+| `session.handoff` | `to?` | while hosting: hand the room to member `to` (default: the first who can host) |
+| `rooms.list` | | rooms saved on this machine |
+| `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
+| `rooms.forget` | `room` | delete a saved room and its history |
 | `tailnet.status` / `tailnet.discover` | | peers / find rooms |
 | `config.get` | | |
 | `api.methods`, `api.ping`, `events.subscribe` | | built in everywhere |
 
 ## Server methods
 
-`tailchat serve` exposes: `state.get`, `members.list`, `channels.list`,
+`tailchat serve` exposes: `state.get` (includes the room save), `members.list`, `channels.list`,
 `messages.list`, `message.send` (as the server), `notice.send`,
 `member.kick {id, reason?}`, `app.send`, `motd.set`, `mods.list`,
 `mods.reload`.

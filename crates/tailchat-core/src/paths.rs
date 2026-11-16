@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     /// `config.toml`, `server.toml`, `mods.toml`, `themes/`, `layouts/`, `mods/`.
     pub config: PathBuf,
-    /// Persistent data: server history, mod state.
+    /// Persistent data: saved rooms, mod state.
     pub data: PathBuf,
     /// Runtime state: control API instance files.
     pub state: PathBuf,
@@ -49,7 +49,12 @@ impl Paths {
     pub fn layouts_dir(&self) -> PathBuf {
         self.config.join("layouts")
     }
-    pub fn history_dir(&self) -> PathBuf {
+    /// Saved rooms, one folder per room id (see `rooms`).
+    pub fn rooms_dir(&self) -> PathBuf {
+        self.data.join("rooms")
+    }
+    /// Where `tailchat serve` kept history before rooms were saved per room.
+    pub fn legacy_history_dir(&self) -> PathBuf {
         self.data.join("history")
     }
     pub fn mod_state_dir(&self, mod_id: &str) -> PathBuf {

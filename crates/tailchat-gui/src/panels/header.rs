@@ -22,6 +22,9 @@ impl Panel for Header {
     fn show(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
         if cx.setting_str("style") == Some("pill") {
             pill(ui, cx);
+            if cx.state.host_lost() {
+                takeover_button(ui, cx);
+            }
         } else {
             bar(ui, cx);
         }
@@ -88,6 +91,9 @@ fn bar(ui: &mut Ui, cx: &mut PanelCx<'_>) {
         if let Some(motd) = cx.state.server.as_ref().and_then(|s| s.motd.clone()) {
             ui.label(cx.small(format!("· {motd}")));
         }
+        if cx.state.host_lost() {
+            takeover_button(ui, cx);
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let resp = kit::icon_button(ui, icons::CARET_DOWN, "Room menu", kit::Tone::Plain, 30.0, &p);
             room_menu(&resp, cx);
@@ -95,7 +101,17 @@ fn bar(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     });
 }
 
-/// Invite, theme / layout / panels, reload, leave.
+/// The host is gone: run the room from your own copy (or join whoever
+/// already took over).
+fn takeover_button(ui: &mut Ui, cx: &mut PanelCx<'_>) {
+    let Some(id) = cx.state.room_id().map(str::to_owned) else { return };
+    let tip = "Nobody is hosting right now. Host the room from your copy; everyone else finds it here.";
+    if kit::pill_button(ui, "Host this room", cx.palette).on_hover_text(tip).clicked() {
+        cx.actions.session(move |s| s.open_room(&id));
+    }
+}
+
+/// Invite, hand off, theme / layout / panels, reload, leave.
 fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
     let p = *cx.palette;
     egui::Popup::menu(resp).width(240.0).show(|ui| {
@@ -110,6 +126,28 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
                     ui.close();
                 }
             }
+            let others: Vec<(u32, String)> = cx.state.can_take_over().map(|m| (m.id, m.nick.clone())).collect();
+            if others.is_empty() {
+                ui.label(cx.small("Nobody else here can host yet"));
+            } else {
+                ui.menu_button(format!("{}  Hand off to…", icons::USERS), |ui| {
+                    for (id, nick) in others {
+                        if ui.button(nick).on_hover_text("they host the room from their copy; everyone moves over").clicked() {
+                            cx.actions.session(move |s| s.handoff(Some(id)));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            ui.separator();
+        } else if cx.state.host_lost() {
+            ui.label(cx.small("The host is gone"));
+            if let Some(id) = cx.state.room_id().map(str::to_owned)
+                && ui.button(format!("{}  Host this room", icons::ARROW_CLOCKWISE)).clicked()
+            {
+                cx.actions.session(move |s| s.open_room(&id));
+                ui.close();
+            }
             ui.separator();
         } else if let ConnState::Connected { addr } = &cx.state.conn {
             let ms = cx.state.latency_ms.map(|m| format!(" · {m} ms")).unwrap_or_default();
@@ -118,7 +156,11 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
         }
         view_items(ui, cx);
         ui.separator();
-        let leave = if cx.state.hosting.is_some() { "Stop hosting" } else { "Leave room" };
+        let leave = match &cx.state.hosting {
+            Some(_) if cx.state.can_take_over().next().is_some() => "Leave (someone else hosts)",
+            Some(_) => "Stop hosting",
+            None => "Leave room",
+        };
         if ui.button(RichText::new(format!("{}  {leave}", icons::SIGN_OUT)).color(p.danger)).clicked() {
             cx.actions.session(|s| s.leave());
             ui.close();

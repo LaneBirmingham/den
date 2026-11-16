@@ -3,6 +3,11 @@
 //! `tailchat serve` wraps this with a stdin admin console. Server-side mods
 //! are bots: their hooks see every room event and `output = "send"` posts as
 //! the server.
+//!
+//! The node is the room's always-on host. It runs a room save like any
+//! member would, and when it starts while someone else is hosting the room
+//! (because the server was down), it claims the room back: everyone is sent
+//! over and their copies fill in what the server missed.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,6 +23,7 @@ use crate::config::ServerConfig;
 use crate::events::{Event, names};
 use crate::mods::{ModHost, ModRuntime};
 use crate::paths::Paths;
+use crate::rooms::{self, RoomSave};
 use crate::server::{self, ServerEvent, ServerHandle, ServerMode, ServerOptions};
 use crate::tailscale::Tailscale;
 use crate::ui::UiStore;
@@ -25,12 +31,14 @@ use crate::ui::UiStore;
 pub struct NodeOptions {
     pub api: bool,
     pub mods: bool,
-    pub persist: bool,
     pub tailscale_bin: Option<PathBuf>,
 }
 
 struct NodeInner {
     server: ServerHandle,
+    save: RoomSave,
+    /// Where the room was being hosted when we took it back.
+    claimed_from: Option<String>,
     paths: Paths,
     events: broadcast::Sender<Event>,
     ui: Arc<UiStore>,
@@ -46,21 +54,44 @@ pub struct ServerNode {
 }
 
 impl ServerNode {
-    pub async fn start(cfg: ServerConfig, paths: Paths, opts: NodeOptions) -> anyhow::Result<ServerNode> {
+    /// Host `save` with the settings in `cfg`. If someone is hosting the
+    /// room right now, take it over from them.
+    pub async fn start(cfg: ServerConfig, mut save: RoomSave, paths: Paths, opts: NodeOptions) -> anyhow::Result<ServerNode> {
         let tailscale = Tailscale::locate(opts.tailscale_bin.as_deref());
         let bind = server::resolve_bind(&cfg.bind, cfg.port, tailscale.as_ref()).await?;
-        let persist = opts.persist || cfg.persist;
+        let live = rooms::find_live(&save.id, &save.addrs, cfg.port, tailscale.as_ref()).await;
+        let term = save.term.max(live.as_ref().map(|l| l.server.term).unwrap_or(0)) + 1;
+        let port = cfg.port;
+        save.apply_config(&cfg);
         let server = server::start(ServerOptions {
             config: cfg,
             mode: ServerMode::Headless,
             bind,
-            history_dir: persist.then(|| paths.history_dir()),
-            tailscale,
+            history_dir: Some(rooms::history_dir(&paths, &save.id)),
+            tailscale: tailscale.clone(),
+            room_id: save.id.clone(),
+            term,
         })
         .await?;
+        let share = rooms::share_addrs(server.local_addr(), tailscale.as_ref()).await;
+        save.term = term;
+        save.addrs = share.clone();
+        rooms::save(&paths, &save)?;
+        let mut claimed_from = None;
+        if let Some(live) = live {
+            match rooms::claim(&live.addr, port, &save.id, term, share).await {
+                Ok(()) => {
+                    tracing::info!("took the room back from {}", live.addr);
+                    claimed_from = Some(live.addr);
+                }
+                Err(e) => tracing::warn!("{} is hosting this room and didn't hand it over: {e:#}", live.addr),
+            }
+        }
         let (events, _) = broadcast::channel(1024);
         let inner = Arc::new(NodeInner {
             server: server.clone(),
+            save,
+            claimed_from,
             paths: paths.clone(),
             events: events.clone(),
             ui: Arc::new(UiStore::default()),
@@ -88,6 +119,7 @@ impl ServerNode {
                     ServerEvent::App { from, ns, channel, data } => {
                         Event::new(names::APP_MESSAGE, json!({"from": from, "ns": ns, "channel": channel, "data": data}))
                     }
+                    ServerEvent::Moved { to, term } => Event::new(names::ROOM_MOVED, json!({"to": to, "term": term})),
                 };
                 let _ = events.send(e);
             }
@@ -114,6 +146,16 @@ impl ServerNode {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.server.local_addr()
+    }
+
+    /// The room save this node hosts (as of start-up).
+    pub fn save(&self) -> &RoomSave {
+        &self.inner.save
+    }
+
+    /// Where the room was hosted when this node took it over, if it did.
+    pub fn claimed_from(&self) -> Option<&str> {
+        self.inner.claimed_from.as_deref()
     }
 
     pub fn api_addr(&self) -> Option<SocketAddr> {
@@ -237,6 +279,7 @@ impl ApiHandler for NodeApi {
         let res: api::ApiResult = match method {
             "state.get" => Ok(json!({
                 "server": srv.info(),
+                "room": node.save(),
                 "listen": srv.local_addr(),
                 "members": srv.members(),
                 "channels": srv.channels(),

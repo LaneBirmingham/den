@@ -7,6 +7,7 @@ tailnet. One Rust binary, three ways to run it:
 | --- | --- |
 | Hang out with friends, one of you hosts | `tailchat host` (others: `tailchat join <your-machine>`) |
 | A room that's always up | `tailchat serve` on a server, headless, with an admin console |
+| Keep a room going when its host leaves | nothing: everyone keeps a copy, and anyone can host it next |
 | Chat from a terminal / over SSH | `tailchat chat <machine>` |
 
 Tailscale does the hard parts: addressing (`join lanes-mac-mini`), encryption
@@ -42,6 +43,24 @@ Friends on your tailnet run `tailchat join <your-machine-name>` (or click your
 room under *On your tailnet* in the lobby). Default port is **8245** (TCP for
 chat, UDP for voice).
 
+### Rooms belong to everyone in them
+
+A room works like a shared save game. Everyone who joins keeps a copy
+(settings and the last 500 messages per channel, under `<data>/rooms/<id>/`),
+and their app swaps message ids with the host on every join, so all the
+copies fill each other's gaps. That means:
+
+* **The host can leave.** *Leave* (or closing the app) hands the room to
+  another member; everyone's app follows automatically. *Hand off to…* in
+  the room menu does the same on purpose.
+* **The host can vanish.** If the host drops, anyone can click
+  **Host this room** and carry on from their copy; the others find it on
+  the tailnet. Open a room later from *Your rooms* in the lobby (or
+  `tailchat host --room <name>`): it joins whoever hosts it now, or hosts
+  it from your copy.
+* Everyone in a room has the same rights: anyone can host it. Join rules
+  (`require_tailnet`, `allow`) travel with the room.
+
 ### Persistent server
 
 ```sh
@@ -49,20 +68,26 @@ cargo build --release -p tailchat --no-default-features   # headless: no GUI/aud
 tailchat serve --name "The Den" --channel general --channel lounge:voice --require-tailnet
 ```
 
-`serve` binds to the machine's tailnet IP, keeps history on disk, runs
-server-side mods, and gives you an admin console (`help`, `who`, `say`,
-`kick`, `motd`, `reload`, …). Settings live in `server.toml`
+`serve` binds to the machine's tailnet IP, saves the room like any member
+would, runs server-side mods, and gives you an admin console (`help`, `who`,
+`say`, `kick`, `motd`, `reload`, …). Settings live in `server.toml`
 (`tailchat serve --write-config` writes one). See [`deploy/`](deploy) for
 systemd and Docker (Tailscale sidecar) setups.
+
+A server is just the room's always-on host. If it was down and someone else
+hosted the room meanwhile, it takes the room back when it starts, and the
+members' copies fill in what it missed. To move a room you started in the
+app onto a server: `tailchat serve --adopt <your-machine>` (or copy
+`<data>/rooms/<id>/` over and run `tailchat serve --room <id>`).
 
 ### All commands
 
 ```
 tailchat [gui]                   desktop app
-tailchat host [--name --bind --port --persist] [--cli]
+tailchat host [--name | --room <saved>] [--bind --port] [--cli]
 tailchat join <addr> [--cli]
 tailchat chat <addr> | --host    terminal client
-tailchat serve [...]             headless room + admin console
+tailchat serve [--room <saved> | --adopt <addr>] [...]   always-on host + admin console
 tailchat discover [--json]       find rooms on your tailnet
 tailchat api <method> [params]   drive a running instance (see docs/API.md)
 tailchat mods list|new|link|unlink|enable|disable|path
@@ -120,7 +145,8 @@ More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 v0.1. Works: text channels with history, voice channels (Opus, SFU relay
 through the host), Tailscale identity, discovery, reconnect, mods, control
-API, themes/layouts with hot reload. Not yet: encryption beyond what
-WireGuard provides (rooms trust the tailnet), screen share, file transfer,
-mobile clients, handing a room to another member when its host leaves
-(see [docs/ROADMAP.md](docs/ROADMAP.md)).
+API, themes/layouts with hot reload, saved rooms that any member can host
+(planned handoff, manual takeover, servers that claim their room back). Not
+yet: encryption beyond what WireGuard provides (rooms trust the tailnet),
+screen share, file transfer, mobile clients, automatic takeover when a host
+vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).

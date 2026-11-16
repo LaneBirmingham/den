@@ -3,7 +3,7 @@
 //! * `tailchat` / `tailchat gui`        the desktop app (egui shell)
 //! * `tailchat host` / `join <addr>`    the app, hosting or joining straight away
 //! * `tailchat chat <addr>`             a line-based terminal client
-//! * `tailchat serve`                   a headless, persistent room with an admin console
+//! * `tailchat serve`                   an always-on host for a room, with an admin console
 //! * `tailchat api <method> [params]`   drive any running instance (mods, scripts, agents)
 //! * `tailchat discover | mods | config | devices | voice-test`
 
@@ -39,7 +39,8 @@ struct Cli {
 enum Cmd {
     /// Open the desktop app (default).
     Gui,
-    /// Host a room from this machine and join it (peer-to-peer mode).
+    /// Host a room from this machine and join it (peer-to-peer mode). Anyone
+    /// in it can host it later from their copy.
     Host {
         #[command(flatten)]
         room: HostArgs,
@@ -64,7 +65,7 @@ enum Cmd {
         #[arg(long)]
         host: bool,
     },
-    /// Run a persistent headless room with an admin console.
+    /// Run an always-on host for a room, with an admin console.
     Serve(serve::ServeArgs),
     /// Find rooms on your tailnet.
     Discover {
@@ -97,27 +98,30 @@ enum Cmd {
 
 #[derive(clap::Args, Clone)]
 struct HostArgs {
-    /// Room name.
+    /// Name for a new room.
     #[arg(long)]
     name: Option<String>,
+    /// Open a saved room instead (id or name): join whoever hosts it now, or
+    /// host it from your copy.
+    #[arg(long, conflicts_with = "name")]
+    room: Option<String>,
     /// tailnet (default), localhost, all, or an IP.
     #[arg(long, default_value = "tailnet")]
     bind: String,
     #[arg(long)]
     port: Option<u16>,
-    /// Keep history on disk between runs.
-    #[arg(long)]
-    persist: bool,
 }
 
 impl HostArgs {
-    fn options(&self, cfg: &AppConfig, nick: &str) -> HostOptions {
-        HostOptions {
+    fn start(&self, cfg: &AppConfig, nick: &str) -> Start {
+        if let Some(room) = &self.room {
+            return Start::Open(room.clone());
+        }
+        Start::Host(HostOptions {
             name: self.name.clone().unwrap_or_else(|| format!("{nick}'s room")),
             bind: self.bind.clone(),
             port: self.port.unwrap_or(cfg.port),
-            persist: self.persist,
-        }
+        })
     }
 }
 
@@ -125,6 +129,7 @@ impl HostArgs {
 pub enum Start {
     Lobby,
     Host(HostOptions),
+    Open(String),
     Join(String),
 }
 
@@ -144,7 +149,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Host { room, cli: term }) => {
             let cfg = load_config(&paths, cli.nick.clone())?;
             let nick = cfg.nick.clone().unwrap_or_else(config::os_username);
-            run_app(&rt, &paths, cli.nick, Start::Host(room.options(&cfg, &nick)), term)
+            run_app(&rt, &paths, cli.nick, room.start(&cfg, &nick), term)
         }
         Some(Cmd::Join { addr, cli: term }) => run_app(&rt, &paths, cli.nick, Start::Join(addr), term),
         Some(Cmd::Chat { addr, room, host }) => {
@@ -152,7 +157,7 @@ fn main() -> anyhow::Result<()> {
                 (_, true) => {
                     let cfg = load_config(&paths, cli.nick.clone())?;
                     let nick = cfg.nick.clone().unwrap_or_else(config::os_username);
-                    Start::Host(room.options(&cfg, &nick))
+                    room.start(&cfg, &nick)
                 }
                 (Some(a), false) => Start::Join(a),
                 (None, false) => anyhow::bail!("give a room address, or --host to host one"),
@@ -203,9 +208,12 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     if !terminal {
         let session = start_session(rt, paths, nick, "tailchat-gui")?;
         apply_start(&session, start);
-        let _guard = rt.enter();
-        let res = tailchat_gui::run(session.clone());
-        session.shutdown();
+        let res = {
+            let _guard = rt.enter();
+            tailchat_gui::run(session.clone())
+        };
+        // Hand the room on if we host it, then stop.
+        rt.block_on(session.close());
         return res;
     }
     #[cfg(not(feature = "gui"))]
@@ -218,7 +226,7 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     }
     apply_start(&session, start);
     let res = rt.block_on(term::run(session.clone()));
-    session.shutdown();
+    rt.block_on(session.close());
     res
 }
 
@@ -226,6 +234,7 @@ fn apply_start(session: &Session, start: Start) {
     match start {
         Start::Lobby => {}
         Start::Host(opts) => session.host(opts),
+        Start::Open(room) => session.open_room(&room),
         Start::Join(addr) => session.join(addr),
     }
 }

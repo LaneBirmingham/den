@@ -39,13 +39,52 @@ embeds it in the app and immediately joins it; `serve` wraps it in a
 control API. Both bind to the machine's **tailnet IPv4** by default, so a room
 is only reachable from your tailnet.
 
+## Rooms move between hosts (`rooms`)
+
+A room is a save that every member holds, not a process:
+
+* **Save** — `<data>/rooms/<id>/room.toml` (format, id, name, motd, term,
+  last host addresses, join rules, channels) plus `history/<channel>.jsonl`
+  (the host's history files and every member's copy use the same format).
+  A member's `Session` writes its copy as messages arrive (`rooms::Copy`);
+  when it is connected to its own hosted server, the server writes instead.
+* **Ids and terms** — the room id is stable; the `term` goes up by one on
+  every change of host and is carried in `ServerInfo` (so probes and
+  discovery show it). Message ids are `(unix ms << 10) | random`, above the
+  previous id, so they stay unique and time-ordered across hosts.
+* **Sync on join** — after `welcome`, the client sends `sync {channel, have}`
+  per text channel; the host answers `backfill` (what the client lacks) and
+  `want` (what it lacks), the client `upload`s those, and the host merges
+  them (sorted by id, trimmed to `history_limit`) and backfills everyone
+  else. History files are sorted and de-duplicated on load.
+* **Planned handoff** — the host sends `host_request {term}` to a member
+  that advertised `features: ["host"]`; that member hosts from its save and
+  answers `host_ready {term, addrs}`; the host broadcasts
+  `handoff {to, term}`, everyone (the old host's own session too)
+  reconnects there and syncs, and the old server stops a few seconds later.
+  Leaving while hosting does this with the first member who can host.
+* **Manual takeover** — "Host this room" (`Session::open_room`) probes the
+  room's last addresses and the tailnet for a live host with the same id;
+  if there is none it hosts from the save at `term + 1`.
+* **Claim** — a peer already hosting the room at a higher term sends
+  `claim {room, term, addrs}` as its first frame; the host checks it against
+  the room's join rules, broadcasts `handoff`, and steps down. This is how
+  `serve` takes its room back after downtime (`serve --adopt <addr>` uses it
+  to move an app-hosted room onto a server).
+* **Rejoining** — a member whose host has gone looks for the room on the
+  tailnet (by id) while it retries, so it follows a handoff it missed.
+
+Everyone has the same rights, so there are no roles to sync; join rules
+travel in `welcome` (`access`) and are enforced by whoever hosts.
+
 ## Wire protocol (`tailchat-proto`)
 
 * **TCP** — `u32` big-endian length + JSON body. `ClientMsg` / `ServerMsg`
   are tagged enums (`{"type": "send", …}`). A connection either sends
   `probe` (discovery: get room info, close) or `hello` (version, nick,
-  codecs, features) and receives `welcome` with members, channels and the
-  voice setup (UDP port + per-member token), followed by history.
+  codecs, features) and receives `welcome` with members, channels, join
+  rules and the voice setup (UDP port + per-member token), followed by
+  history. Room sync and handoff messages are described above.
 * **UDP** (same port) — binary voice packets: `REGISTER` (token keepalive),
   `AUDIO` (client → server: token, seq, codec, payload), `RELAY` (server →
   client: speaker id, seq, codec, payload), `ACK`. The server is a selective
@@ -79,8 +118,10 @@ The control API exposes the same three things to other processes
 ([API.md](API.md)), so a frontend in another language — or an agent — is a
 peer of the built-in one, not a second-class citizen.
 
-Connection handling lives here too: epoch-tagged connection tasks, reconnect
-with backoff, voice auto-rejoin, latency pings, recent addresses.
+Connection handling lives here too: epoch-tagged connection tasks over a
+list of addresses, reconnect with backoff, following a room to its new host,
+voice auto-rejoin, latency pings, recent addresses, and the member's room
+copy.
 
 ## UI store: declarative panels
 

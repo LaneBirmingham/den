@@ -28,7 +28,7 @@ services:
     depends_on: [tailscale]
     volumes:
       - ts-socket:/var/run/tailscale  # for `tailscale whois`
-      - data:/data                    # config, history, mods
+      - data:/data                    # config, saved room, mods
     command: ["serve", "--no-console", "--name", "tailchat", "--require-tailnet"]
     restart: unless-stopped           # retries until the tailnet IP is up
 

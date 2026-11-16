@@ -22,8 +22,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tailchat_proto::voice::Codec;
 use tailchat_proto::{
-    Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, Member, MemberId, MessageKind, NoticeLevel, PROTOCOL_VERSION, ServerInfo,
-    ServerMsg, VoiceSetup,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, Member, MemberId, MessageKind, NoticeLevel,
+    PROTOCOL_VERSION, ServerInfo, ServerMsg, VoiceSetup,
 };
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
@@ -36,7 +36,8 @@ use crate::events::{Event, names};
 use crate::mods::{ModHost, ModRuntime};
 use crate::net::{read_frame, resolve, write_frame};
 use crate::paths::Paths;
-use crate::server::{self, ServerHandle, ServerMode, ServerOptions};
+use crate::rooms::{self, RoomSave};
+use crate::server::{self, HandoffState, ServerHandle, ServerMode, ServerOptions};
 use crate::tailscale::{TailnetPeer, TailnetStatus, Tailscale};
 use crate::ui::{UiStore, Widget};
 
@@ -56,7 +57,9 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/deafen", "mute everything"),
     ("/undeafen", "hear again"),
     ("/connect <host[:port]>", "join another room"),
-    ("/disconnect", "leave the room"),
+    ("/disconnect", "leave the room (hands it off if you host it)"),
+    ("/handoff [nick]", "hand hosting to another member"),
+    ("/takeover", "host this room from your copy (when its host is gone)"),
     ("/mods", "list mods"),
 ];
 
@@ -78,6 +81,8 @@ impl ConnState {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct HostInfo {
     pub name: String,
+    pub room_id: String,
+    pub term: u64,
     pub listen: SocketAddr,
     /// Addresses friends can paste into *Join*, best first.
     pub share: Vec<String>,
@@ -158,6 +163,8 @@ pub struct SessionState {
     pub latency_ms: Option<u32>,
     pub tailnet: Option<TailnetStatus>,
     pub discovery: DiscoveryView,
+    /// Rooms saved on this machine (every room you've been in), newest first.
+    pub rooms: Vec<RoomSave>,
     /// Increments on every change.
     pub revision: u64,
 }
@@ -181,6 +188,7 @@ impl SessionState {
             latency_ms: None,
             tailnet: None,
             discovery: DiscoveryView::default(),
+            rooms: Vec::new(),
             revision: 0,
         }
     }
@@ -228,6 +236,31 @@ impl SessionState {
     fn first_text(&self) -> Option<ChannelId> {
         self.text_channels().next().map(|c| c.id.clone())
     }
+
+    /// Id of the room we're in (or were in, while reconnecting).
+    pub fn room_id(&self) -> Option<&str> {
+        self.server.as_ref().map(|s| s.room_id.as_str()).filter(|id| !id.is_empty())
+    }
+
+    /// The connection dropped and isn't back: offer "Host this room".
+    pub fn host_lost(&self) -> bool {
+        self.room_id().is_some()
+            && self.hosting.is_none()
+            && matches!(self.conn, ConnState::Connecting { attempt: 1.., .. } | ConnState::Failed { .. })
+    }
+
+    /// Members other than us whose app can take over hosting.
+    pub fn can_take_over(&self) -> impl Iterator<Item = &Member> {
+        self.members.values().filter(move |m| m.can_host && Some(m.id) != self.me)
+    }
+
+    /// Our own server is the one we're connected to.
+    fn serving_this_room(&self) -> bool {
+        match (&self.hosting, &self.server) {
+            (Some(h), Some(srv)) => h.room_id == srv.room_id && h.term == srv.term && self.conn.is_connected(),
+            _ => false,
+        }
+    }
 }
 
 pub struct SessionOptions {
@@ -237,13 +270,13 @@ pub struct SessionOptions {
     pub client_name: String,
 }
 
+/// A new room to host. Channels, motd and limits come from `server.toml`.
 #[derive(Clone, Debug)]
 pub struct HostOptions {
     pub name: String,
     /// `tailnet`, `localhost`, `all`, or an IP.
     pub bind: String,
     pub port: u16,
-    pub persist: bool,
 }
 
 struct ConnSlot {
@@ -273,6 +306,10 @@ struct Inner {
     api_env: RwLock<Vec<(String, String)>>,
     voice_wanted: Mutex<Option<ChannelId>>,
     ping: Mutex<Option<(u64, Instant)>>,
+    /// Our copy of the room we're in.
+    copy: Mutex<Option<rooms::Copy>>,
+    /// Our member id on the previous host, to keep "my messages" across reconnects.
+    prev_me: Mutex<Option<MemberId>>,
     #[cfg(feature = "voice")]
     voice: Mutex<Option<crate::voice::VoiceLink>>,
 }
@@ -288,6 +325,13 @@ enum End {
     Final(String),
     /// Reconnect if we had been connected.
     Retry(String),
+    /// The room moved to another host.
+    Moved { to: Vec<String>, term: u64 },
+}
+
+/// Where a room listening on `listen` can be reached from this machine.
+fn connect_addr(listen: SocketAddr) -> String {
+    if listen.ip().is_unspecified() { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port()) } else { listen }.to_string()
 }
 
 impl Session {
@@ -307,6 +351,7 @@ impl Session {
             .unwrap_or_else(config::os_username);
         let mut state = SessionState::new(tailchat_proto::clean_nick(&nick));
         state.tailnet = tailnet;
+        state.rooms = rooms::list(&opts.paths);
         state.voice.mode = opts.config.voice.mode.clone();
         let (events, _) = broadcast::channel(1024);
         let modules = opts.config.modules.clone();
@@ -328,6 +373,8 @@ impl Session {
             api_env: RwLock::new(Vec::new()),
             voice_wanted: Mutex::new(None),
             ping: Mutex::new(None),
+            copy: Mutex::new(None),
+            prev_me: Mutex::new(None),
             #[cfg(feature = "voice")]
             voice: Mutex::new(None),
         });
@@ -416,37 +463,121 @@ impl Session {
     /// Connect to a room (`host`, `host:port`, MagicDNS name, IP).
     pub fn join(&self, addr: impl Into<String>) {
         let addr = addr.into().trim().to_owned();
-        self.inner.stop_connection();
-        let epoch = self.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let inner = self.inner.clone();
-        let task = self.inner.rt.spawn(conn_task(inner, epoch, addr)).abort_handle();
-        self.inner.conn.lock().task = Some(task);
+        self.inner.connect(vec![addr]);
     }
 
-    /// Start a room in this process and join it.
+    /// Start a new room in this process and join it. Everyone who joins
+    /// keeps a copy, so any of them can host it later.
     pub fn host(&self, opts: HostOptions) {
         self.leave();
         let me = self.clone();
         self.inner.update(|s| s.conn = ConnState::Connecting { addr: "starting room…".into(), attempt: 0 });
         self.inner.rt.spawn(async move {
-            match me.inner.start_hosting(opts).await {
-                Ok(addr) => me.join(addr),
-                Err(e) => {
-                    let error = format!("{e:#}");
-                    me.inner.update(|s| s.conn = ConnState::Failed { addr: "host".into(), error: error.clone() });
-                    me.notice(NoticeLevel::Error, format!("could not host: {error}"));
-                }
+            let base: ServerConfig = config::load_or_default(&me.paths().server_config_file()).unwrap_or_default();
+            let save = RoomSave::new(&ServerConfig { name: opts.name.clone(), ..base });
+            match me.inner.start_hosting(save, 1, &opts.bind, opts.port).await {
+                Ok(info) => me.join(connect_addr(info.listen)),
+                Err(e) => me.inner.host_failed(e),
             }
         });
     }
 
-    /// Leave the room (and stop hosting, if we were).
+    /// Open a saved room (by id or name): join its live host if someone is
+    /// hosting it, otherwise host it from our copy. This is "Host this room"
+    /// when the host has gone.
+    pub fn open_room(&self, room: &str) {
+        let Some(save) = rooms::find(&self.inner.paths, room) else {
+            self.notice(NoticeLevel::Warn, format!("no saved room {room:?}"));
+            return;
+        };
+        let hosting = self.state().hosting.clone();
+        if let Some(h) = hosting.filter(|h| h.room_id == save.id) {
+            self.join(connect_addr(h.listen));
+            return;
+        }
+        // Stay on the room screen if this is the room we're already looking at.
+        if self.state().room_id() == Some(save.id.as_str()) {
+            self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+            self.inner.stop_connection();
+        } else {
+            self.leave();
+        }
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let name = save.name.clone();
+        self.inner.update(|s| s.conn = ConnState::Connecting { addr: name, attempt: 0 });
+        let me = self.clone();
+        self.inner.rt.spawn(async move {
+            let port = me.config().port;
+            let live = rooms::find_live(&save.id, &save.addrs, port, me.inner.tailscale.as_ref()).await;
+            if me.inner.stale(epoch) {
+                return;
+            }
+            if let Some(live) = live {
+                me.join(live.addr);
+                return;
+            }
+            let term = save.term + 1;
+            let (bind, port) = me.inner.default_bind();
+            match me.inner.start_hosting(save, term, &bind, port).await {
+                Ok(info) if !me.inner.stale(epoch) => {
+                    me.notice(NoticeLevel::Info, format!("you're hosting {} now", info.name));
+                    me.join(connect_addr(info.listen));
+                }
+                Ok(_) => {}
+                Err(e) => me.inner.host_failed(e),
+            }
+        });
+    }
+
+    /// Delete a saved room (not the one you're in).
+    pub fn forget_room(&self, room: &str) -> anyhow::Result<()> {
+        let save = rooms::find(&self.inner.paths, room).with_context(|| format!("no saved room {room:?}"))?;
+        if self.state().room_id() == Some(save.id.as_str()) {
+            bail!("leave the room before forgetting it");
+        }
+        rooms::forget(&self.inner.paths, &save.id)?;
+        self.inner.refresh_rooms();
+        Ok(())
+    }
+
+    /// While hosting: ask a member (`None`: the first who can) to take over.
+    /// Everyone, us included, moves to them once they're up.
+    pub fn handoff(&self, to: Option<MemberId>) {
+        let Some(h) = self.inner.hosted.lock().clone() else {
+            self.notice(NoticeLevel::Warn, "you're not hosting this room".into());
+            return;
+        };
+        let me = self.state().me;
+        if to.is_some() && to == me {
+            self.notice(NoticeLevel::Warn, "you're already the host".into());
+            return;
+        }
+        match h.hand_off(to, me) {
+            Ok(m) => self.notice(NoticeLevel::Info, format!("asking {} to take over hosting…", m.nick)),
+            Err(e) => self.notice(NoticeLevel::Warn, format!("{e:#}")),
+        }
+    }
+
+    /// Leave the room. If we host it and someone else can, they take it
+    /// over (in the background); otherwise the room stops.
     pub fn leave(&self) {
         self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        let me = self.state().me;
         self.inner.stop_connection();
-        if let Some(h) = self.inner.hosted.lock().take() {
-            h.shutdown();
+        let hosted = self.inner.hosted.lock().take();
+        if let Some(h) = hosted {
+            match h.hand_off(None, me) {
+                Ok(_) => {
+                    self.inner.rt.spawn(async move {
+                        h.wait_handoff(Duration::from_secs(10)).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        h.shutdown();
+                    });
+                }
+                Err(_) => h.shutdown(),
+            }
         }
+        *self.inner.copy.lock() = None;
         *self.inner.voice_wanted.lock() = None;
         self.inner.update(|s| {
             s.conn = ConnState::Idle;
@@ -600,6 +731,21 @@ impl Session {
             "undeafen" => self.set_deafened(false),
             "connect" if !arg.is_empty() => self.join(arg),
             "disconnect" => self.leave(),
+            "handoff" => {
+                let found = self.state().members.values().find(|m| m.nick.eq_ignore_ascii_case(arg)).map(|m| m.id);
+                match (arg.is_empty(), found) {
+                    (true, _) => self.handoff(None),
+                    (false, Some(id)) => self.handoff(Some(id)),
+                    (false, None) => self.notice(NoticeLevel::Warn, format!("nobody called {arg} here")),
+                }
+            }
+            "takeover" => {
+                let id = self.state().room_id().map(str::to_owned);
+                match id {
+                    Some(id) => self.open_room(&id),
+                    None => self.notice(NoticeLevel::Warn, "not in a room".into()),
+                }
+            }
             "mods" => {
                 let mods = self.mods();
                 let mut lines: Vec<String> = mods
@@ -773,6 +919,21 @@ impl Session {
         self.inner.changed();
     }
 
+    /// Like [`shutdown`](Self::shutdown), but if we host the room and someone
+    /// else can, wait (a few seconds at most) for them to take it over first.
+    /// Call this when the app is closing.
+    pub async fn close(&self) {
+        let hosted = self.inner.hosted.lock().clone();
+        let me = self.state().me;
+        if let Some(h) = hosted
+            && h.hand_off(None, me).is_ok()
+        {
+            h.wait_handoff(Duration::from_secs(6)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        self.shutdown();
+    }
+
     /// Stop everything: room, hosting, voice, mods, API.
     pub fn shutdown(&self) {
         self.leave();
@@ -839,20 +1000,28 @@ pub async fn discover_rooms(status: &TailnetStatus, port: u16) -> Vec<Discovered
     rooms
 }
 
-async fn conn_task(inner: Arc<Inner>, epoch: u64, addr: String) {
+/// Connect to the first of `addrs` that answers; reconnect with backoff;
+/// follow the room when it moves to another host.
+async fn conn_task(inner: Arc<Inner>, epoch: u64, mut addrs: Vec<String>) {
     let mut attempt = 0u32;
     let mut was_connected = false;
     loop {
         if inner.stale(epoch) {
             return;
         }
+        let addr = addrs.first().cloned().unwrap_or_default();
         inner.update(|s| s.conn = ConnState::Connecting { addr: addr.clone(), attempt });
-        let res = run_once(&inner, epoch, &addr, &mut was_connected).await;
+        let res = run_addrs(&inner, epoch, &addrs, &mut was_connected).await;
         if inner.stale(epoch) {
             return;
         }
         inner.teardown(epoch);
         let (reason, retry) = match res {
+            Ok(End::Moved { to, term }) => {
+                addrs = inner.moved(to, term);
+                attempt = 0;
+                continue;
+            }
             Ok(End::Final(r)) => (r, false),
             Ok(End::Retry(r)) => (r, was_connected),
             Err(e) => (format!("{e:#}"), was_connected),
@@ -864,13 +1033,42 @@ async fn conn_task(inner: Arc<Inner>, epoch: u64, addr: String) {
             return;
         }
         attempt += 1;
+        // The host may have handed the room on while we were away: look for it.
+        if attempt >= 2
+            && let Some(found) = inner.locate().await
+            && !addrs.contains(&found)
+        {
+            if inner.stale(epoch) {
+                return;
+            }
+            inner.notice(NoticeLevel::Info, format!("found the room at {found}"));
+            addrs = vec![found];
+            continue;
+        }
         let delay = Duration::from_secs((1u64 << attempt.min(5)).min(30));
         inner.notice(NoticeLevel::Warn, format!("connection lost ({reason}); retrying in {}s", delay.as_secs()));
+        inner.update(|s| s.conn = ConnState::Connecting { addr: addr.clone(), attempt });
         inner.emit(names::CONNECTION_CHANGED, json!({"state": "connecting", "addr": addr, "attempt": attempt}));
         tokio::time::sleep(delay).await;
     }
 }
 
+/// Try each address in turn until one connects.
+async fn run_addrs(inner: &Arc<Inner>, epoch: u64, addrs: &[String], was_connected: &mut bool) -> anyhow::Result<End> {
+    let mut last = None;
+    for addr in addrs {
+        match run_once(inner, epoch, addr, was_connected).await {
+            Err(e) => last = Some(e),
+            done => return done,
+        }
+        if inner.stale(epoch) {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no address to connect to")))
+}
+
+/// One connection. `Err` means we never got in (try the next address).
 async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mut bool) -> anyhow::Result<End> {
     let port = inner.config.read().port;
     let sock = resolve(addr, port).await?;
@@ -881,11 +1079,14 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
     let nick = inner.state.read().nick.clone();
-    write_frame(
-        &mut wr,
-        &ClientMsg::Hello { version: PROTOCOL_VERSION, nick, client: inner.client_name.clone(), codecs: codecs(), features: Vec::new() },
-    )
-    .await?;
+    let hello = ClientMsg::Hello {
+        version: PROTOCOL_VERSION,
+        nick,
+        client: inner.client_name.clone(),
+        codecs: codecs(),
+        features: vec![FEATURE_HOST.into()],
+    };
+    write_frame(&mut wr, &hello).await?;
     let first: ServerMsg = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd))
         .await
         .context("handshake timed out")??
@@ -893,6 +1094,7 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     match first {
         ServerMsg::Welcome { .. } => {}
         ServerMsg::Error { message, .. } => return Ok(End::Final(message)),
+        ServerMsg::Handoff { to, term } => return Ok(End::Moved { to, term }),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -922,17 +1124,54 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     let result = loop {
         match tokio::time::timeout(Duration::from_secs(45), read_frame::<_, ServerMsg>(&mut rd)).await {
             Err(_) => break Ok(End::Retry("server stopped responding".into())),
-            Ok(Err(e)) => break Err(e),
+            Ok(Err(e)) => break Ok(End::Retry(format!("{e:#}"))),
             Ok(Ok(None)) => break Ok(End::Retry("server closed the connection".into())),
             Ok(Ok(Some(ServerMsg::Bye { reason }))) => {
                 break Ok(if reason.starts_with("kicked") { End::Final(reason) } else { End::Retry(reason) });
             }
+            Ok(Ok(Some(ServerMsg::Handoff { to, term }))) => break Ok(End::Moved { to, term }),
             Ok(Ok(Some(msg))) => inner.apply(epoch, msg),
         }
     };
     writer.abort();
     pinger.abort();
     result
+}
+
+/// Report failed handoffs, and once the room has moved off our server, stop it
+/// (after a moment, so everyone gets the handoff) and stop showing "hosting".
+async fn watch_hosted(inner: Weak<Inner>, handle: ServerHandle) {
+    let mut rx = handle.handoff_state();
+    let watch_failures = async {
+        while rx.changed().await.is_ok() {
+            let state = rx.borrow_and_update().clone();
+            if let (HandoffState::Failed { error }, Some(i)) = (state, inner.upgrade()) {
+                i.notice(NoticeLevel::Warn, format!("handoff failed: {error}"));
+            }
+        }
+    };
+    let moved = tokio::select! {
+        m = handle.moved() => m,
+        _ = watch_failures => None,
+    };
+    if moved.is_none() {
+        return;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    handle.shutdown();
+    let Some(inner) = inner.upgrade() else { return };
+    let ours = {
+        let mut hosted = inner.hosted.lock();
+        let ours = hosted.as_ref().is_some_and(|h| h.same(&handle));
+        if ours {
+            hosted.take();
+        }
+        ours
+    };
+    if ours {
+        inner.update(|s| s.hosting = None);
+        inner.emit(names::HOSTING_CHANGED, json!({"hosting": null}));
+    }
 }
 
 fn codecs() -> Vec<Codec> {
@@ -970,6 +1209,140 @@ fn push_capped(list: &mut Vec<ChatMessage>, m: ChatMessage) {
 impl Inner {
     fn stale(&self, epoch: u64) -> bool {
         self.epoch.load(Ordering::SeqCst) != epoch
+    }
+
+    /// Start a fresh connection task for `addrs`.
+    fn connect(self: &Arc<Self>, addrs: Vec<String>) {
+        self.stop_connection();
+        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let task = self.rt.spawn(conn_task(self.clone(), epoch, addrs)).abort_handle();
+        self.conn.lock().task = Some(task);
+    }
+
+    fn host_failed(&self, e: anyhow::Error) {
+        let error = format!("{e:#}");
+        self.update(|s| s.conn = ConnState::Failed { addr: "host".into(), error: error.clone() });
+        self.notice(NoticeLevel::Error, format!("could not host: {error}"));
+    }
+
+    /// Where to host when someone hands us the room: the tailnet if we're on
+    /// one, else this machine only.
+    fn default_bind(&self) -> (String, u16) {
+        let on_tailnet = self.state.read().tailnet.as_ref().and_then(|t| t.me.as_ref()?.ipv4()).is_some();
+        let bind = if self.tailscale.is_some() && on_tailnet { "tailnet" } else { "localhost" };
+        (bind.into(), self.config.read().port)
+    }
+
+    fn refresh_rooms(&self) {
+        let list = rooms::list(&self.paths);
+        self.update(|s| s.rooms = list);
+    }
+
+    /// The room moved to `to` at `term`: remember it, and return where to connect.
+    fn moved(&self, to: Vec<String>, term: u64) -> Vec<String> {
+        let (room_id, local) = {
+            let s = self.state.read();
+            let id = s.room_id().map(str::to_owned);
+            let local =
+                s.hosting.as_ref().filter(|h| h.term == term && Some(h.room_id.as_str()) == id.as_deref()).map(|h| connect_addr(h.listen));
+            (id, local)
+        };
+        if let Some(id) = &room_id
+            && local.is_none()
+            && let Ok(mut save) = rooms::load(&self.paths, id)
+        {
+            save.term = save.term.max(term);
+            save.addrs = to.clone();
+            save.updated = crate::now_ms();
+            let _ = rooms::save(&self.paths, &save);
+        }
+        let first = to.first().cloned().unwrap_or_default();
+        self.emit(names::ROOM_MOVED, json!({"to": to, "term": term}));
+        match local {
+            Some(addr) => vec![addr],
+            None => {
+                self.notice(NoticeLevel::Info, format!("the room moved to {first}"));
+                to
+            }
+        }
+    }
+
+    /// Look for the live host of the room we were in (by room id).
+    async fn locate(&self) -> Option<String> {
+        let ts = self.tailscale.as_ref()?;
+        let id = self.state.read().room_id()?.to_owned();
+        let saved = rooms::load(&self.paths, &id).map(|s| s.addrs).unwrap_or_default();
+        let port = self.config.read().port;
+        rooms::find_live(&id, &saved, port, Some(ts)).await.map(|h| h.addr)
+    }
+
+    /// Save what the host told us about the room and open our copy of it.
+    fn remember_room(&self, server: &ServerInfo, channels: &[Channel], access: &Access, addr: &str) {
+        if !rooms::valid_id(&server.room_id) {
+            *self.copy.lock() = None;
+            return;
+        }
+        let mut save = rooms::load(&self.paths, &server.room_id).unwrap_or_else(|_| RoomSave::empty(&server.room_id));
+        save.update_from(server, channels, Some(access));
+        // Our own server already recorded its share addresses.
+        let ours = self.state.read().hosting.as_ref().is_some_and(|h| h.room_id == server.room_id && h.term == server.term);
+        if !ours {
+            save.addrs = vec![addr.to_owned()];
+        }
+        if let Err(e) = rooms::save(&self.paths, &save) {
+            tracing::warn!("saving room: {e:#}");
+        }
+        let mut copy = self.copy.lock();
+        if copy.as_ref().is_none_or(|c| c.id != save.id) {
+            *copy = rooms::Copy::open(&self.paths, &save).map_err(|e| tracing::warn!("opening room copy: {e:#}")).ok();
+        }
+        drop(copy);
+        self.refresh_rooms();
+    }
+
+    /// Keep messages in our copy. When our own server is the one we're in,
+    /// it writes the files, so only remember them.
+    fn keep(&self, msgs: &[ChatMessage]) {
+        let write = !self.state.read().serving_this_room();
+        if let Some(c) = self.copy.lock().as_mut() {
+            for m in msgs {
+                c.add(m, write);
+            }
+        }
+    }
+
+    /// The host asked us to take the room over.
+    fn on_host_request(self: &Arc<Self>, term: u64) {
+        let me = self.clone();
+        self.rt.spawn(async move {
+            let res: anyhow::Result<Vec<String>> = async {
+                let (id, current) = {
+                    let s = me.state.read();
+                    (s.room_id().map(str::to_owned).context("not in a room")?, s.server.as_ref().map(|x| x.term).unwrap_or(0))
+                };
+                let old = me.hosted.lock().clone();
+                if let Some(old) = old {
+                    if old.room_id() == id && old.term() == current {
+                        bail!("already hosting");
+                    }
+                    // A server we handed on earlier and haven't stopped yet.
+                    me.hosted.lock().take();
+                    old.shutdown();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let save = rooms::load(&me.paths, &id).context("no saved copy of this room")?;
+                let (bind, port) = me.default_bind();
+                Ok(me.start_hosting(save, term, &bind, port).await?.share)
+            }
+            .await;
+            match res {
+                Ok(addrs) => me.send(ClientMsg::HostReady { term, addrs }),
+                Err(e) => {
+                    me.notice(NoticeLevel::Warn, format!("couldn't take over hosting: {e:#}"));
+                    me.send(ClientMsg::HostFailed { term, error: format!("{e:#}") });
+                }
+            }
+        });
     }
 
     fn changed(&self) {
@@ -1068,7 +1441,7 @@ impl Inner {
         msg: ServerMsg,
         tx: mpsc::UnboundedSender<ClientMsg>,
     ) -> bool {
-        let ServerMsg::Welcome { server, you, voice, channels, members, .. } = msg else {
+        let ServerMsg::Welcome { server, you, voice, channels, members, access, .. } = msg else {
             return false;
         };
         {
@@ -1082,7 +1455,23 @@ impl Inner {
         }
         let motd = server.motd.clone();
         let room = server.name.clone();
+        self.remember_room(&server, &channels, &access, addr);
+        let prev_me = self.prev_me.lock().replace(you);
         self.update(|s| {
+            // Same room (reconnect, or the room moved host): keep what's on
+            // screen. Member ids are per host, so only ours carries over.
+            let same_room = !server.room_id.is_empty() && s.room_id() == Some(server.room_id.as_str());
+            if same_room {
+                for m in s.messages.values_mut().flatten() {
+                    m.author_id = match m.author_id {
+                        Some(a) if Some(a) == prev_me => Some(you),
+                        _ => None,
+                    };
+                }
+            } else {
+                s.messages.clear();
+                s.clear_unread();
+            }
             s.conn = ConnState::Connected { addr: addr.to_owned() };
             s.server = Some(server);
             s.me = Some(you);
@@ -1091,12 +1480,21 @@ impl Inner {
                 s.nick = me.nick.clone();
             }
             s.channels = channels;
-            s.messages.clear();
-            s.clear_unread();
             if s.focus.as_ref().is_none_or(|f| s.channel(f).is_none()) {
                 s.focus = s.first_text();
             }
         });
+        // Swap message ids with the host: it sends what we lack and asks for what it lacks.
+        let syncs: Vec<ClientMsg> = {
+            let copy = self.copy.lock();
+            let s = self.state.read();
+            s.text_channels()
+                .map(|c| ClientMsg::Sync { channel: c.id.clone(), have: copy.as_ref().map(|k| k.ids(&c.id)).unwrap_or_default() })
+                .collect()
+        };
+        for m in syncs {
+            self.send(m);
+        }
         let hosting = self.state.read().hosting.is_some();
         if !hosting {
             let addr = addr.to_owned();
@@ -1120,12 +1518,13 @@ impl Inner {
         true
     }
 
-    fn apply(&self, epoch: u64, msg: ServerMsg) {
+    fn apply(self: &Arc<Self>, epoch: u64, msg: ServerMsg) {
         if self.stale(epoch) {
             return;
         }
         match msg {
             ServerMsg::Message { message } => {
+                self.keep(std::slice::from_ref(&message));
                 let data = json!({"message": message});
                 self.update(|s| {
                     let counts = message.kind != MessageKind::System && s.focus.as_deref() != Some(message.channel.as_str());
@@ -1140,14 +1539,26 @@ impl Inner {
                 });
                 self.emit(names::MESSAGE_CREATED, data);
             }
-            ServerMsg::History { channel, messages, .. } => self.update(|s| {
-                let list = s.messages.entry(channel).or_default();
-                let known: std::collections::HashSet<u64> = list.iter().map(|m| m.id).filter(|id| *id != 0).collect();
-                let mut merged: Vec<ChatMessage> = messages.into_iter().filter(|m| !known.contains(&m.id)).collect();
-                merged.append(list);
-                merged.sort_by_key(|m| m.ts);
-                *list = merged;
-            }),
+            ServerMsg::History { channel, messages, .. } | ServerMsg::Backfill { channel, messages } => {
+                self.keep(&messages);
+                self.update(|s| {
+                    let list = s.messages.entry(channel).or_default();
+                    let known: std::collections::HashSet<u64> = list.iter().map(|m| m.id).filter(|id| *id != 0).collect();
+                    let mut merged: Vec<ChatMessage> = messages.into_iter().filter(|m| !known.contains(&m.id)).collect();
+                    merged.append(list);
+                    merged.sort_by_key(|m| m.ts);
+                    let excess = merged.len().saturating_sub(MAX_LOCAL_MESSAGES);
+                    merged.drain(..excess);
+                    *list = merged;
+                });
+            }
+            ServerMsg::Want { channel, ids } => {
+                let found = self.copy.lock().as_ref().map(|c| c.get(&channel, &ids)).unwrap_or_default();
+                for chunk in found.chunks(MAX_BATCH) {
+                    self.send(ClientMsg::Upload { channel: channel.clone(), messages: chunk.to_vec() });
+                }
+            }
+            ServerMsg::HostRequest { term } => self.on_host_request(term),
             ServerMsg::MemberJoined { member } => {
                 let line = format!("{} joined", member.nick);
                 let data = json!({"member": member});
@@ -1220,54 +1631,53 @@ impl Inner {
                     self.update(|s| s.latency_ms = Some(ms));
                 }
             }
-            ServerMsg::Welcome { .. } | ServerMsg::ProbeInfo { .. } | ServerMsg::Bye { .. } => {}
+            ServerMsg::Welcome { .. } | ServerMsg::ProbeInfo { .. } | ServerMsg::Bye { .. } | ServerMsg::Handoff { .. } => {}
         }
     }
 
-    async fn start_hosting(&self, opts: HostOptions) -> anyhow::Result<String> {
-        let bind = server::resolve_bind(&opts.bind, opts.port, self.tailscale.as_ref()).await?;
-        // Room settings (channels, motd, limits) come from server.toml when present.
+    /// Run `save` in this process at `term`, and keep the save up to date.
+    async fn start_hosting(self: &Arc<Self>, mut save: RoomSave, term: u64, bind: &str, port: u16) -> anyhow::Result<HostInfo> {
+        let bind_addr = server::resolve_bind(bind, port, self.tailscale.as_ref()).await?;
+        // Limits come from server.toml; name, channels and rules from the room.
         let base: ServerConfig = config::load_or_default(&self.paths.server_config_file()).unwrap_or_default();
-        let config = ServerConfig { name: opts.name.clone(), bind: opts.bind.clone(), port: opts.port, persist: opts.persist, ..base };
+        let config = save.server_config(ServerConfig { bind: bind.to_owned(), port, ..base });
         let handle = server::start(ServerOptions {
             config,
             mode: ServerMode::Host,
-            bind,
-            history_dir: opts.persist.then(|| self.paths.history_dir().join(&opts.name)),
+            bind: bind_addr,
+            history_dir: Some(rooms::history_dir(&self.paths, &save.id)),
             tailscale: self.tailscale.clone(),
+            room_id: save.id.clone(),
+            term,
         })
         .await
         .map_err(|e| {
             if format!("{e:#}").contains("in use") {
-                anyhow::anyhow!("port {} is already in use — is another room running here? ({e:#})", opts.port)
+                anyhow::anyhow!("port {port} is already in use — is another room running here? ({e:#})")
             } else {
                 e
             }
         })?;
         let listen = handle.local_addr();
-        let mut share = Vec::new();
-        if let Some(ts) = &self.tailscale
-            && let Ok(st) = ts.status().await
-            && let Some(me) = &st.me
-        {
-            let suffix = |h: String| if listen.port() == tailchat_proto::DEFAULT_PORT { h } else { format!("{h}:{}", listen.port()) };
-            share.push(suffix(me.short_name()));
-            if let Some(d) = &me.dns_name {
-                share.push(suffix(d.clone()));
-            }
-            if let Some(ip) = me.ipv4() {
-                share.push(format!("{ip}:{}", listen.port()));
-            }
+        let share = rooms::share_addrs(listen, self.tailscale.as_ref()).await;
+        save.term = term;
+        save.addrs = share.clone();
+        save.updated = crate::now_ms();
+        if let Err(e) = rooms::save(&self.paths, &save) {
+            tracing::warn!("saving room: {e:#}");
         }
-        if share.is_empty() || !listen.ip().is_unspecified() && !crate::tailscale::is_tailnet_ip(listen.ip()) {
-            share.insert(0, listen.to_string());
+        if let Some(old) = self.hosted.lock().replace(handle.clone()) {
+            old.shutdown();
         }
-        *self.hosted.lock() = Some(handle);
-        let info = HostInfo { name: opts.name, listen, share };
+        let info = HostInfo { name: save.name.clone(), room_id: save.id.clone(), term, listen, share };
         self.emit(names::HOSTING_CHANGED, json!({"hosting": info}));
-        self.update(|s| s.hosting = Some(info));
-        let connect = if listen.ip().is_unspecified() { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port()) } else { listen };
-        Ok(connect.to_string())
+        let saved = rooms::list(&self.paths);
+        self.update(|s| {
+            s.hosting = Some(info.clone());
+            s.rooms = saved;
+        });
+        self.rt.spawn(watch_hosted(Arc::downgrade(self), handle));
+        Ok(info)
     }
 
     fn set_voice_flags(&self, muted: bool, deafened: bool) {
@@ -1464,9 +1874,13 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("mods.list", "{}", "Installed mods and their status"),
     doc("mods.run", "{command, args?}", "Run a mod slash command"),
     doc("mods.reload", "{}", "Rescan mods and restart their processes"),
-    doc("session.host", "{name?, bind?, port?, persist?}", "Host a room from this app"),
+    doc("session.host", "{name?, bind?, port?}", "Host a new room from this app"),
     doc("session.join", "{addr}", "Join a room"),
-    doc("session.leave", "{}", "Leave the room / stop hosting"),
+    doc("session.leave", "{}", "Leave the room (hands it to another member if you host it)"),
+    doc("session.handoff", "{to?}", "While hosting: hand the room to member `to` (default: the first who can host)"),
+    doc("rooms.list", "{}", "Rooms saved on this machine"),
+    doc("rooms.open", "{room}", "Join a saved room's live host, or host it from your copy (\"Host this room\")"),
+    doc("rooms.forget", "{room}", "Delete a saved room and its history"),
     doc("tailnet.status", "{}", "Tailnet peers"),
     doc("tailnet.discover", "{}", "Probe peers for rooms (async; see state.get discovery)"),
     doc("config.get", "{}", "Current config.toml values"),
@@ -1619,13 +2033,25 @@ impl ApiHandler for SessionApi {
             }
             "session.host" => {
                 let cfg = s.config();
+                let nick = s.state().nick.clone();
                 s.host(HostOptions {
-                    name: param_str(&p, "name").unwrap_or_else(|| format!("{}'s room", s.state().nick)),
+                    name: param_str(&p, "name").unwrap_or_else(|| format!("{nick}'s room")),
                     bind: param_str(&p, "bind").unwrap_or_else(|| "tailnet".into()),
                     port: p["port"].as_u64().map(|v| v as u16).unwrap_or(cfg.port),
-                    persist: p["persist"].as_bool().unwrap_or(false),
                 });
                 Ok(json!({"starting": true}))
+            }
+            "session.handoff" => {
+                s.handoff(p["to"].as_u64().map(|v| v as MemberId));
+                Ok(json!({"requested": true}))
+            }
+            "rooms.list" => ok(rooms::list(s.paths())),
+            "rooms.open" => require_str(&p, "room").map(|r| {
+                s.open_room(&r);
+                json!({"opening": true})
+            }),
+            "rooms.forget" => {
+                require_str(&p, "room").and_then(|r| s.forget_room(&r).map(|_| json!({"forgotten": true})).map_err(|e| format!("{e:#}")))
             }
             "session.join" => require_str(&p, "addr").map(|a| {
                 s.join(a);

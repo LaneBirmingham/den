@@ -11,8 +11,10 @@ use tailchat_core::net::{read_frame, write_frame};
 use tailchat_core::paths::Paths;
 use tailchat_core::proto::voice::{Codec, Packet};
 use tailchat_core::proto::{ClientMsg, MessageKind, PROTOCOL_VERSION, ServerMsg};
+use tailchat_core::rooms;
 use tailchat_core::server::{self, ServerHandle, ServerMode, ServerOptions};
-use tailchat_core::session::{Session, SessionOptions};
+use tailchat_core::server_node::{NodeOptions, ServerNode};
+use tailchat_core::session::{HostOptions, Session, SessionOptions};
 use tokio::net::{TcpStream, UdpSocket};
 
 fn tmp(name: &str) -> PathBuf {
@@ -23,6 +25,10 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 async fn start_server(history: Option<PathBuf>) -> ServerHandle {
+    start_room(history, "test-room", 1).await
+}
+
+async fn start_room(history: Option<PathBuf>, room_id: &str, term: u64) -> ServerHandle {
     let config = ServerConfig { name: "test room".into(), rate_limit: 100, ..ServerConfig::default() };
     server::start(ServerOptions {
         config,
@@ -30,6 +36,8 @@ async fn start_server(history: Option<PathBuf>) -> ServerHandle {
         bind: "127.0.0.1:0".parse().unwrap(),
         history_dir: history,
         tailscale: None,
+        room_id: room_id.into(),
+        term,
     })
     .await
     .unwrap()
@@ -40,13 +48,15 @@ async fn session(name: &str, home: &std::path::Path) -> Session {
         nick: Some(name.into()),
         // Never touch the real tailnet from tests.
         tailscale_bin: Some("/nonexistent/tailscale".into()),
+        // When asked to host, pick any free port (on localhost, without Tailscale).
+        port: 0,
         ..AppConfig::default()
     };
     Session::start(SessionOptions { paths: Paths::under(home), config, client_name: "test".into() }).await.unwrap()
 }
 
 async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
+    for _ in 0..400 {
         if cond() {
             return;
         }
@@ -132,6 +142,8 @@ async fn unread_mentions_and_new_divider() {
         bind: "127.0.0.1:0".parse().unwrap(),
         history_dir: None,
         tailscale: None,
+        room_id: "unread".into(),
+        term: 1,
     })
     .await
     .unwrap();
@@ -355,4 +367,172 @@ async fn voice_relay_and_moderation() {
     assert!(matches!(info, ServerMsg::ProbeInfo { members: 1, .. }));
     drop(b);
     srv.shutdown();
+}
+
+fn term_of(s: &Session) -> u64 {
+    s.state().server.as_ref().map(|x| x.term).unwrap_or(0)
+}
+
+fn on_term(s: &Session, term: u64) -> bool {
+    s.state().conn.is_connected() && term_of(s) == term
+}
+
+/// Host a new room from `s` on localhost and return the address to join.
+async fn host(s: &Session, name: &str) -> String {
+    s.host(HostOptions { name: name.into(), bind: "localhost".into(), port: 0 });
+    wait_for("hosting", || s.state().hosting.is_some() && s.state().conn.is_connected()).await;
+    s.state().hosting.as_ref().unwrap().share[0].clone()
+}
+
+fn member_id(viewer: &Session, nick: &str) -> u32 {
+    viewer.state().members.values().find(|m| m.nick == nick).map(|m| m.id).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_fills_gaps_both_ways() {
+    let home = tmp("sync");
+    let alice = session("alice", &home.join("a")).await;
+    let srv = start_room(None, "room-sync", 1).await;
+    alice.join(srv.local_addr().to_string());
+    wait_for("connected", || alice.state().conn.is_connected()).await;
+    alice.submit(None, "said on the first host");
+    wait_for("echo", || has_text(&alice, "general", "said on the first host")).await;
+    let file = rooms::history_dir(&Paths::under(&home.join("a")), "room-sync").join("general.jsonl");
+    wait_for("alice's copy on disk", || std::fs::read_to_string(&file).is_ok_and(|t| t.contains("said on the first host"))).await;
+    let save = rooms::load(&Paths::under(&home.join("a")), "room-sync").unwrap();
+    assert_eq!((save.name.as_str(), save.term), ("test room", 1));
+    alice.leave();
+    srv.shutdown();
+
+    // A later host of the same room that never saw that message.
+    let srv2 = start_room(Some(home.join("h2")), "room-sync", 2).await;
+    srv2.say(None, "only the new host has this").unwrap();
+    alice.join(srv2.local_addr().to_string());
+    wait_for("host got alice's copy", || srv2.history("general", 50).iter().any(|m| m.text == "said on the first host")).await;
+    wait_for("alice got the host's", || has_text(&alice, "general", "only the new host has this")).await;
+    let bob = session("bob", &home.join("b")).await;
+    bob.join(srv2.local_addr().to_string());
+    wait_for("bob sees both", || {
+        has_text(&bob, "general", "said on the first host") && has_text(&bob, "general", "only the new host has this")
+    })
+    .await;
+    // Ids stay time-ordered across hosts.
+    let ids: Vec<u64> = srv2.history("general", 50).iter().map(|m| m.id).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    srv2.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planned_handoff_moves_everyone() {
+    let home = tmp("handoff");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let carol = session("carol", &home.join("c")).await;
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    carol.join(&addr);
+    wait_for("all in", || alice.state().members.len() == 3).await;
+    assert!(alice.state().members.values().all(|m| m.can_host));
+    alice.submit(None, "before the move");
+    wait_for("seen", || has_text(&carol, "general", "before the move") && has_text(&bob, "general", "before the move")).await;
+
+    let bob_id = member_id(&alice, "bob");
+    alice.handoff(Some(bob_id));
+    wait_for("bob hosts", || bob.state().hosting.as_ref().is_some_and(|h| h.term == 2)).await;
+    wait_for("everyone moved", || on_term(&alice, 2) && on_term(&bob, 2) && on_term(&carol, 2)).await;
+    wait_for("all in again", || bob.state().members.len() == 3).await;
+    assert_eq!(bob.state().server.as_ref().unwrap().name, "den");
+    wait_for("old host stops", || alice.state().hosting.is_none()).await;
+
+    carol.submit(None, "after the move");
+    wait_for("alice hears carol", || has_text(&alice, "general", "after the move")).await;
+    assert!(has_text(&carol, "general", "before the move"), "history stays on screen across the move");
+    // Someone new sees the history from before the move.
+    let dave = session("dave", &home.join("d")).await;
+    dave.join(bob.state().hosting.as_ref().unwrap().share[0].clone());
+    wait_for("dave sees history", || has_text(&dave, "general", "before the move") && has_text(&dave, "general", "after the move")).await;
+    // Everyone saved the room with the new term.
+    for (who, dir) in [("alice", "a"), ("carol", "c")] {
+        let save = rooms::list(&Paths::under(&home.join(dir))).into_iter().next().unwrap_or_else(|| panic!("{who} has no save"));
+        assert_eq!((save.name.as_str(), save.term), ("den", 2), "{who}");
+    }
+    bob.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaving_host_hands_the_room_on() {
+    let home = tmp("leave");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2).await;
+    alice.submit(None, "bye all");
+    wait_for("seen", || has_text(&bob, "general", "bye all")).await;
+    alice.leave();
+    wait_for("bob took over", || on_term(&bob, 2) && bob.state().hosting.is_some()).await;
+    assert!(has_text(&bob, "general", "bye all"));
+    assert!(alice.state().server.is_none());
+    bob.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_this_room_after_the_host_vanishes() {
+    let home = tmp("takeover");
+    let srv = start_room(Some(home.join("srv")), "room-gone", 1).await;
+    let addr = srv.local_addr().to_string();
+    let alice = session("alice", &home.join("a")).await;
+    let carol = session("carol", &home.join("c")).await;
+    alice.join(&addr);
+    carol.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2).await;
+    alice.submit(None, "remember this");
+    wait_for("carol has it", || has_text(&carol, "general", "remember this")).await;
+
+    // The host disappears without handing over.
+    srv.shutdown();
+    wait_for("carol notices", || carol.state().host_lost()).await;
+    carol.open_room("room-gone");
+    wait_for("carol hosts", || carol.state().hosting.as_ref().is_some_and(|h| h.term == 2) && on_term(&carol, 2)).await;
+    assert!(has_text(&carol, "general", "remember this"));
+    alice.join(carol.state().hosting.as_ref().unwrap().share[0].clone());
+    wait_for("alice back", || on_term(&alice, 2) && carol.state().members.len() == 2).await;
+    carol.submit(None, "still here");
+    wait_for("alice hears", || has_text(&alice, "general", "still here")).await;
+    assert!(has_text(&alice, "general", "remember this"));
+    carol.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_takes_the_room_back() {
+    let home = tmp("claim");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2).await;
+    alice.submit(None, "made in the app");
+    wait_for("seen", || has_text(&bob, "general", "made in the app")).await;
+
+    // An always-on server starts with (a copy of) the room's save: it finds
+    // the room being hosted at its last address and claims it.
+    let save = rooms::list(&Paths::under(&home.join("a"))).remove(0);
+    let base = ServerConfig { bind: "localhost".into(), port: 0, rate_limit: 100, ..ServerConfig::default() };
+    let node = ServerNode::start(
+        save.server_config(base),
+        save,
+        Paths::under(&home.join("srv")),
+        NodeOptions { api: false, mods: false, tailscale_bin: Some("/nonexistent/tailscale".into()) },
+    )
+    .await
+    .unwrap();
+    assert!(node.claimed_from().is_some());
+    wait_for("everyone on the server", || on_term(&alice, 2) && on_term(&bob, 2)).await;
+    assert_eq!(alice.state().server.as_ref().unwrap().mode, "server");
+    wait_for("server has the app's history", || node.server().history("general", 50).iter().any(|m| m.text == "made in the app")).await;
+    wait_for("alice stops hosting", || alice.state().hosting.is_none()).await;
+    // A stale term can't take it back.
+    let err = rooms::claim(&node.local_addr().to_string(), 0, &node.save().id, 2, vec!["127.0.0.1:1".into()]).await.unwrap_err();
+    assert!(err.to_string().contains("term"), "{err}");
+    node.shutdown();
 }

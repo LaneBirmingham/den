@@ -93,6 +93,7 @@ fn print_event(session: &Session, ev: &Event) {
                 }
             }
         }
+        "room.moved" => println!("== the room moved to {} (term {})", d["to"][0].as_str().unwrap_or("?"), d["term"]),
         "voice.joined" => println!("== in voice ~{}", d["channel"].as_str().unwrap_or("")),
         "voice.left" => println!("== left voice"),
         _ => {}

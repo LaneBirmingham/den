@@ -34,6 +34,8 @@ pub mod names {
     pub const UI_ACTION: &str = "ui.action";
     pub const UI_CHANGED: &str = "ui.changed";
     pub const HOSTING_CHANGED: &str = "hosting.changed";
+    /// The room moved to another host (`{to, term}`).
+    pub const ROOM_MOVED: &str = "room.moved";
     pub const COMMAND_RUN: &str = "command.run";
 
     /// Every name, for docs and `api.methods`.
@@ -50,6 +52,7 @@ pub mod names {
         UI_ACTION,
         UI_CHANGED,
         HOSTING_CHANGED,
+        ROOM_MOVED,
         COMMAND_RUN,
     ];
 }
