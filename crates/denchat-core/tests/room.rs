@@ -912,3 +912,67 @@ async fn handoff_prefers_members_others_can_reach() {
     bob.shutdown();
     srv.shutdown();
 }
+
+/// Voice end to end with the built-in test devices: alice's app sends a tone, bob's app
+/// records what it would play. No audio hardware is touched.
+#[cfg(feature = "voice")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_between_two_sessions_on_test_devices() {
+    use denchat_core::audio::testdev::read_wav;
+    use denchat_core::config::VoiceConfig;
+
+    async fn voice_session(name: &str, home: &std::path::Path, input: &str, output: &str) -> Session {
+        let voice = VoiceConfig {
+            input_device: Some(input.into()),
+            output_device: Some(output.into()),
+            mode: "open".into(),
+            ..VoiceConfig::default()
+        };
+        let config = AppConfig {
+            nick: Some(name.into()),
+            bind: "localhost".into(),
+            port: 0,
+            net: NetConfig::direct_only(),
+            voice,
+            ..AppConfig::default()
+        };
+        Session::start(SessionOptions { paths: Paths::under(home), config, client_name: "test".into() }).await.unwrap()
+    }
+
+    let home = tmp("voice-devices");
+    let capture = home.join("bob-hears.wav");
+    let srv = start_server(None).await;
+    let addr = link(&srv).await;
+    let alice = voice_session("alice", &home.join("a"), "test:sine:440", "test:null").await;
+    let bob = voice_session("bob", &home.join("b"), "test:silence", &format!("test:capture:{}", capture.display())).await;
+    alice.join(&addr);
+    bob.join(&addr);
+    wait_for("both connected", || alice.state().conn.is_connected() && bob.state().conn.is_connected()).await;
+    alice.voice_join(Some("lounge".into()));
+    bob.voice_join(Some("lounge".into()));
+
+    wait_for("bob hears alice", || {
+        bob.voice_stats().is_some_and(|v| v.rx_packets >= 50 && v.speakers.iter().any(|s| s.speaking && s.level > 0.1))
+    })
+    .await;
+    let a = alice.voice_stats().unwrap();
+    assert_eq!(a.input_device.as_deref(), Some("test:sine:440"));
+    assert!(a.tx_packets >= 50 && a.input_level > 0.15, "{a:?}");
+    let b = bob.voice_stats().unwrap();
+    assert!(b.input_level < 1e-3, "silence in: {b:?}");
+
+    // The recording is readable while voice runs, and holds the tone.
+    wait_for("tone recorded", || {
+        read_wav(&capture).is_ok_and(|w| {
+            let tail = &w.samples[w.samples.len().saturating_sub(9600)..];
+            tail.len() == 9600 && (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt() > 0.1
+        })
+    })
+    .await;
+
+    alice.voice_leave();
+    bob.voice_leave();
+    alice.shutdown();
+    bob.shutdown();
+    srv.shutdown();
+}
