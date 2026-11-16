@@ -202,7 +202,10 @@ fn apply_join_rules(cfg: &mut ServerConfig, open: bool, allow: Vec<String>) {
     }
 }
 
-/// SIGINT (Ctrl-C) or SIGTERM.
+/// SIGINT (Ctrl-C) or SIGTERM; on Windows, Ctrl-C, Ctrl-Break, closing the
+/// console window, logoff or shutdown. For the last three Windows ends the
+/// process a few seconds after the event (tokio holds it until then), which
+/// is enough to hand the room on.
 pub(crate) async fn wait_for_signal() {
     #[cfg(unix)]
     {
@@ -212,7 +215,22 @@ pub(crate) async fn wait_for_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut brk = windows::ctrl_break().expect("signal handler");
+        let mut close = windows::ctrl_close().expect("signal handler");
+        let mut logoff = windows::ctrl_logoff().expect("signal handler");
+        let mut shutdown = windows::ctrl_shutdown().expect("signal handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+            _ = logoff.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
