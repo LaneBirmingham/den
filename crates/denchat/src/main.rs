@@ -19,7 +19,7 @@ mod term;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use denchat_core::config::{self, AppConfig};
 use denchat_core::paths::Paths;
 use denchat_core::session::{HostOptions, Session, SessionOptions};
@@ -118,7 +118,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Wait for an event from the running app and print it (`den wait message.created --where text=hi`).
+    /// Wait for an event from the running app and print it (`den wait message.created --where message.text=hi`).
     Wait(agent::WaitArgs),
     /// Throwaway Dens in the background, each with its own home, for testing mods and rooms end to end.
     Sandbox {
@@ -179,7 +179,15 @@ pub enum Start {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // An explicit profile (`-S a`, `--home`) wins over `$DEN_API`, which every
+    // mod process inherits and which points at the app that started it.
+    let explicit = |id: &str| matches!(matches.value_source(id), Some(clap::parser::ValueSource::CommandLine));
+    let pick_profile = cli.sandbox.is_some() || explicit("home");
     // The user's own profile, before a sandbox replaces it (`sandbox start --copy-config`).
     let user_paths = Paths::detect();
     if let Some(name) = &cli.sandbox
@@ -191,6 +199,10 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         if let Some(home) = &cli.home {
             std::env::set_var("DEN_HOME", home);
+        }
+        if pick_profile {
+            std::env::remove_var("DEN_API");
+            std::env::remove_var("DEN_API_TOKEN");
         }
         for (key, value) in
             [("DEN_WINDOW", cli.window.clone()), ("DEN_SIZE", cli.size.clone()), ("DEN_SCALE", cli.scale.map(|s| s.to_string()))]

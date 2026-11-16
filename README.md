@@ -145,7 +145,7 @@ den discover [--json]       which of your saved rooms are live
 den api <method> [params]   drive a running instance (see docs/API.md)
 den ui tree|click|type|key|scroll|hover|wait|shot|window|scale|clip|quit
                             use the app in the background, like a person would (agents, tests)
-den status | den wait <event> [--where k=v]   state summary / block until an event
+den status | den wait <event> [--where k=v] [-- cmd]   state summary / block until an event
 den sandbox start|list|stop|path   throwaway headless Dens for testing mods and rooms
 den doctor [--json]         network self-check: reach, port mapping, relays, firewall
 den mods list|new|link|unlink|enable|disable|path

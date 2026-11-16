@@ -19,7 +19,7 @@ den ui key Escape | ctrl+a | cmd+k
 den ui scroll 300 --over <target> · den ui hover <target> · den ui wait <target> [--gone]
 den ui shot [path] [--panel id] [--scale 0.5]    # PNG (works hidden/minimised/headless)
 den ui window [--size 900x600 --minimize …] · den ui scale 1.5 · den ui clip · den ui quit
-den wait message.created --where message.text=hi # block until an event
+den wait message.created --where message.text=hi -- den ui type hi --enter   # listen, act, wait
 ```
 
 On the **user's own app** these never move the mouse or take focus. Still,

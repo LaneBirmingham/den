@@ -32,4 +32,10 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # Leave the console window Windows opens when the app is started from Explorer,
 # turn on colour in the console, and let an already-running app take the foreground.
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

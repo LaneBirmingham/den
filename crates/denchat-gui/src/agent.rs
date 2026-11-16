@@ -383,6 +383,8 @@ enum State {
     Settle(u32, Value),
     /// Answer once this time has passed (tooltips appear after a delay).
     Until(Instant, Value),
+    /// Start over after `frames` more frames (the target was scrolled into view).
+    Retry(u32),
     Wait {
         deadline: Instant,
         since: Instant,
@@ -404,6 +406,10 @@ struct Job {
     done: Value,
     /// …and how long to keep going after that before answering.
     hold: Duration,
+    /// Its target was out of view and has been scrolled to; when the steps
+    /// are done, start the job again so it aims at where the target is now.
+    retry: bool,
+    scrolled: bool,
     started: Instant,
 }
 
@@ -420,6 +426,23 @@ impl Job {
 
     fn str(&self, key: &str) -> Option<String> {
         self.param(key).as_str().map(str::to_owned).filter(|s| !s.is_empty())
+    }
+
+    /// Whoever asked stopped waiting (the API call timed out, the CLI was
+    /// interrupted): don't act on the app for them any more.
+    fn abandoned(&self) -> bool {
+        self.call.as_ref().is_some_and(FrontendCall::abandoned)
+    }
+
+    /// The pointer can't aim at a widget that's scrolled out of view (it would
+    /// land on whatever is drawn there): scroll it into view, then start again.
+    fn bring_into_view(&mut self, n: &Node) -> Result<VecDeque<Vec<Event>>, String> {
+        if self.scrolled {
+            return Err(format!("{} is out of view, and scrolling to it didn't bring it into view", n.short()));
+        }
+        self.scrolled = true;
+        self.retry = true;
+        Ok(VecDeque::from([vec![action(n.id, Action::ScrollIntoView)]]))
     }
 }
 
@@ -438,11 +461,20 @@ pub struct AgentPlugin {
     clipboard_file: Option<PathBuf>,
     last_call: Option<Instant>,
     pointer: Option<Pos2>,
+    /// Accessibility was on before any agent call (a screen reader).
+    screen_reader: bool,
     title: String,
 }
 
 /// Window mode keeps the accessibility tree switched on this long after the last call.
 const TREE_IDLE: Duration = Duration::from_secs(120);
+/// The longest `ui.wait` (an hour).
+const MAX_WAIT_MS: u64 = 3_600_000;
+
+/// The call gives an explicit point (`x`, `y`) to aim at.
+fn has_point(job: &Job) -> bool {
+    job.param("x").is_number() && job.param("y").is_number()
+}
 
 impl AgentPlugin {
     pub fn new(ui: Arc<UiStore>, kind: Kind) -> AgentPlugin {
@@ -458,13 +490,22 @@ impl AgentPlugin {
             clipboard_file: std::env::var_os("DEN_CLIPBOARD").map(PathBuf::from),
             last_call: None,
             pointer: None,
+            screen_reader: false,
             title: "Den".into(),
         }
     }
 
     /// Queue a call from inside the app (e.g. `DEN_SCREENSHOT`).
     pub fn submit(&mut self, call: FrontendCall) {
-        self.jobs.push_back(Job { call: Some(call), state: State::New, done: Value::Null, hold: Duration::ZERO, started: Instant::now() });
+        self.jobs.push_back(Job {
+            call: Some(call),
+            state: State::New,
+            done: Value::Null,
+            hold: Duration::ZERO,
+            retry: false,
+            scrolled: false,
+            started: Instant::now(),
+        });
     }
 
     pub fn set_title(&mut self, title: &str) {
@@ -525,7 +566,7 @@ impl AgentPlugin {
             "ui.tree" => Ok(State::Tree),
             "ui.click" | "ui.hover" | "ui.scroll" | "ui.type" | "ui.key" => self.input_job(ctx, &method, job).map(State::Steps),
             "ui.wait" => {
-                let ms = job.param("timeout_ms").as_u64().unwrap_or(10_000);
+                let ms = job.param("timeout_ms").as_u64().unwrap_or(10_000).min(MAX_WAIT_MS);
                 if job.str("target").is_none() {
                     Err("ui.wait needs a target".into())
                 } else {
@@ -597,6 +638,7 @@ impl AgentPlugin {
                         steps.push_back(vec![action(n.id, Action::Click)]);
                         job.done = json!({"clicked": n.short(), "via": "accesskit"});
                     }
+                    Some(n) if n.hidden && !has_point(job) => return job.bring_into_view(n),
                     _ => {
                         let pos = self.point(ctx, job, node.as_ref());
                         self.pointer = Some(pos);
@@ -615,6 +657,9 @@ impl AgentPlugin {
                 if node.is_none() && (job.param("x").is_null() || job.param("y").is_null()) {
                     return Err("ui.hover needs a target or x and y".into());
                 }
+                if let Some(n) = node.as_ref().filter(|n| n.hidden && !has_point(job)) {
+                    return job.bring_into_view(n);
+                }
                 let pos = self.point(ctx, job, node.as_ref());
                 self.pointer = Some(pos);
                 steps.push_back(vec![Event::PointerMoved(pos)]);
@@ -624,6 +669,9 @@ impl AgentPlugin {
             }
             "ui.scroll" => {
                 let node = self.target(job, false)?;
+                if let Some(n) = node.as_ref().filter(|n| n.hidden && !has_point(job)) {
+                    return job.bring_into_view(n);
+                }
                 let pos = self.point(ctx, job, node.as_ref());
                 self.pointer = Some(pos);
                 let dy = job.param("dy").as_f64().unwrap_or(0.0) as f32;
@@ -652,6 +700,8 @@ impl AgentPlugin {
                     Some(n) => {
                         if n.focusable {
                             steps.push_back(vec![action(n.id, Action::Focus)]);
+                        } else if n.hidden {
+                            return job.bring_into_view(&n);
                         } else {
                             let pos = n.center();
                             steps.push_back(vec![Event::PointerMoved(pos)]);
@@ -758,7 +808,12 @@ impl AgentPlugin {
                 }
             }
         } else {
-            self.target(job, false)?.map(|n| n.rect.expand(4.0))
+            match self.target(job, false)? {
+                Some(n) if n.hidden => {
+                    return Err(format!("{} is out of view; scroll to it first (`den ui scroll … --over …`)", n.short()));
+                }
+                n => n.map(|n| n.rect.expand(4.0)),
+            }
         };
         let scale = job.param("scale").as_f64().map(|s| s as f32).unwrap_or(1.0).clamp(0.05, 1.0);
         let renderer = job.str("renderer").unwrap_or_else(|| "auto".into());
@@ -892,17 +947,24 @@ impl egui::Plugin for AgentPlugin {
         for call in self.ui.take_frontend_calls() {
             self.submit(call);
         }
+        // Calls nobody waits for any more never touch the app, except input
+        // already half sent (a button pressed but not yet released).
+        self.jobs.retain(|j| !j.abandoned() || matches!(j.state, State::Steps(_)));
         if self.jobs.is_empty() {
             if self.kind == Kind::Window && self.last_call.is_some_and(|t| t.elapsed() > TREE_IDLE) {
-                ctx.disable_accesskit();
+                // Leave it on if a screen reader turned it on: it needs the
+                // updates too. (One that starts while agents are driving the
+                // app is told apart only by asking again: eframe re-enables it.)
+                if !self.screen_reader {
+                    ctx.disable_accesskit();
+                }
                 self.last_call = None;
                 self.tree = None;
             }
             return;
         }
-        if self.last_call.is_none() {
-            ctx.enable_accesskit();
-        }
+        // Every frame: eframe switches it off when a screen reader goes away.
+        ctx.enable_accesskit();
         self.last_call = Some(Instant::now());
 
         // GPU screenshots that arrived (or never will).
@@ -942,7 +1004,13 @@ impl egui::Plugin for AgentPlugin {
                     let done = std::mem::take(&mut job.done);
                     // Answer once what the input caused (a menu opening) is
                     // laid out, so the next call already sees it.
-                    job.state = if job.hold.is_zero() { State::Settle(2, done) } else { State::Until(Instant::now() + job.hold, done) };
+                    job.state = if std::mem::take(&mut job.retry) {
+                        State::Retry(2)
+                    } else if job.hold.is_zero() {
+                        State::Settle(2, done)
+                    } else {
+                        State::Until(Instant::now() + job.hold, done)
+                    };
                 }
             }
         }
@@ -991,6 +1059,11 @@ impl egui::Plugin for AgentPlugin {
                 }
             }
         }
+        // Tree updates that we didn't ask for: something else (a screen
+        // reader) switched accessibility on.
+        if self.kind == Kind::Window && self.last_call.is_none() && output.platform_output.accesskit_update.is_some() {
+            self.screen_reader = true;
+        }
         if let Some(update) = &output.platform_output.accesskit_update
             && (!self.jobs.is_empty() || self.tree.is_some() || self.kind == Kind::Headless)
         {
@@ -1003,7 +1076,12 @@ impl egui::Plugin for AgentPlugin {
         let mut cpu: Option<Arc<ColorImage>> = None;
         let mut jobs = std::mem::take(&mut self.jobs);
         for job in &mut jobs {
+            let mut restart = false;
             match &mut job.state {
+                State::Retry(n) => {
+                    *n = n.saturating_sub(1);
+                    restart = *n == 0;
+                }
                 State::Answer(v) => {
                     let v = if v.is_null() { self.window_info(ctx) } else { std::mem::take(v) };
                     job.answer(Ok(v));
@@ -1059,7 +1137,11 @@ impl egui::Plugin for AgentPlugin {
                 }
                 _ => {}
             }
-            if job.started.elapsed() > Duration::from_secs(60) {
+            if restart {
+                job.state = State::New;
+            }
+            // Waits have their own deadline.
+            if !matches!(job.state, State::Wait { .. }) && job.started.elapsed() > Duration::from_secs(60) {
                 job.answer(Err("gave up after 60 s".into()));
             }
         }

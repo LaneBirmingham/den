@@ -249,7 +249,7 @@ pub async fn ui(cmd: UiCmd, paths: &Paths) -> anyhow::Result<()> {
             wait_after(&mut c, &pick).await?;
         }
         UiCmd::Wait { target, gone, timeout, panel } => {
-            let ms = (timeout * 1000.0) as u64;
+            let ms = timeout_secs(timeout)?.as_millis() as u64;
             let r = c.call("ui.wait", json!({"target": target, "gone": gone, "timeout_ms": ms, "panel": panel})).await?;
             match r["found"].as_str() {
                 Some(f) => println!("found {f} after {} ms", r["after_ms"]),
@@ -373,6 +373,18 @@ pub struct WaitArgs {
     timeout: f64,
     #[arg(long)]
     server: bool,
+    /// A command to run once listening, so nothing it causes is missed:
+    /// `den -S a wait message.created -- den -S b ui type hi --enter`.
+    #[arg(last = true, value_name = "COMMAND")]
+    then: Vec<String>,
+}
+
+/// `--timeout` seconds as a duration (an hour at most).
+fn timeout_secs(s: f64) -> anyhow::Result<Duration> {
+    if !(s.is_finite() && s >= 0.0) {
+        bail!("--timeout wants seconds (0 or more), got {s}");
+    }
+    Ok(Duration::from_secs_f64(s.min(3600.0)))
 }
 
 fn lookup<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
@@ -399,10 +411,19 @@ pub async fn wait(args: WaitArgs, paths: &Paths) -> anyhow::Result<()> {
             f.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).with_context(|| format!("--where wants PATH=VALUE, got {f:?}"))
         })
         .collect::<anyhow::Result<_>>()?;
+    let limit = timeout_secs(args.timeout)?;
     let kind = if args.server { "server" } else { "client" };
     let (c, _) = ApiClient::discover(paths, Some(kind)).await?;
     let mut stream = c.subscribe(&args.events).await?;
-    let deadline = Instant::now() + Duration::from_secs_f64(args.timeout);
+    if let Some((prog, rest)) = args.then.split_first() {
+        // `den` is this den, even when it isn't on PATH (`cargo run`).
+        let exe = if prog == "den" { std::env::current_exe()? } else { PathBuf::from(prog) };
+        let status = tokio::process::Command::new(&exe).args(rest).status().await.with_context(|| format!("running {prog}"))?;
+        if !status.success() {
+            bail!("{prog} failed ({status})");
+        }
+    }
+    let deadline = Instant::now() + limit;
     let mut seen = 0;
     while seen < args.count {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -557,6 +578,12 @@ pub enum SandboxCmd {
         /// Delete what an earlier sandbox of this name left behind first.
         #[arg(long)]
         fresh: bool,
+        /// Test microphone: test:silence (default), test:sine:<hz> or test:file:<wav>.
+        #[arg(long, value_name = "DEVICE")]
+        input: Option<String>,
+        /// Test speakers: test:null (default) or test:capture:<wav>.
+        #[arg(long, value_name = "DEVICE")]
+        output: Option<String>,
     },
     /// Sandboxes and whether they run.
     List,
@@ -581,7 +608,7 @@ async fn live_instance(home: &Path) -> Option<(ApiClient, InstanceInfo)> {
             continue;
         }
         if let Ok(Ok(mut c)) = tokio::time::timeout(Duration::from_secs(1), ApiClient::connect(&info.addr, &info.token)).await
-            && c.call("api.ping", json!({})).await.is_ok()
+            && matches!(tokio::time::timeout(Duration::from_secs(2), c.call("api.ping", json!({}))).await, Ok(Ok(_)))
         {
             return Some((c, info));
         }
@@ -609,12 +636,17 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
                 let home = root.join(&name);
                 match live_instance(&home).await {
                     Some((mut c, info)) => {
-                        let s = c.call("state.get", json!({})).await.unwrap_or_default();
+                        let s = tokio::time::timeout(Duration::from_secs(3), c.call("state.get", json!({})))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default();
                         let room = s["server"]["name"].as_str().map(|r| format!("in {r:?}")).unwrap_or_else(|| "in the lobby".into());
                         let host = if s["is_host"].as_bool() == Some(true) { ", hosting" } else { "" };
                         println!("{name:<10} pid {:<7} {} {room}{host}", info.pid, s["frontend"].as_str().unwrap_or("?"));
                     }
-                    None => println!("{name:<10} stopped"),
+                    None if profile_free(&home) => println!("{name:<10} stopped"),
+                    None => println!("{name:<10} running, not answering (`den sandbox stop {name}` kills it)"),
                 }
             }
         }
@@ -632,28 +664,29 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
             } else {
                 names
             };
+            let mut stuck = Vec::new();
             for name in names {
                 let home = sandbox_home(&name)?;
-                match live_instance(&home).await {
-                    Some((mut c, info)) => {
-                        let _ = c.call("app.quit", json!({})).await;
-                        // Gone once it lets go of its profile (after handing the room on).
-                        let stopped = wait_until(Duration::from_secs(10), || async { profile_free(&home) }).await;
-                        if !stopped {
-                            kill(info.pid);
-                            wait_until(Duration::from_secs(3), || async { profile_free(&home) }).await;
-                        }
-                        println!("stopped {name} (pid {}){}", info.pid, if stopped { "" } else { ", forcibly" });
-                    }
-                    None => println!("{name} wasn't running"),
+                if !stop_sandbox(&name, &home).await {
+                    stuck.push(name);
+                    continue;
                 }
                 if rm && home.exists() {
-                    std::fs::remove_dir_all(&home).with_context(|| format!("removing {}", home.display()))?;
+                    remove_dir(&home).await?;
                     println!("removed {}", home.display());
                 }
             }
+            if !stuck.is_empty() {
+                bail!("couldn't stop {}; left in place", stuck.join(", "));
+            }
         }
-        SandboxCmd::Start { name, mods, join, lobby, room, copy_config, theme, layout, size, window, fresh } => {
+        SandboxCmd::Start { name, mods, join, lobby, room, copy_config, theme, layout, size, window, fresh, input, output } => {
+            let test_device = |d: &Option<String>| d.as_deref().is_some_and(|d| d.to_ascii_lowercase().starts_with("test:"));
+            for (flag, dev) in [("--input", &input), ("--output", &output)] {
+                if dev.is_some() && !test_device(dev) {
+                    bail!("{flag} takes a test device (test:…); a sandbox never opens real audio devices");
+                }
+            }
             let home = sandbox_home(&name)?;
             if let Some((_, info)) = live_instance(&home).await {
                 bail!("sandbox {name} is already running (pid {}); `den sandbox stop {name}` first, or pick another name", info.pid);
@@ -672,11 +705,14 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
             // Its own config: never the user's devices, never the user's clipboard.
             let mut cfg: AppConfig = config::load_or_default(&paths.config_file())?;
             cfg.nick = Some(name.clone());
-            let test_device = |d: &Option<String>| d.as_deref().is_some_and(|d| d.starts_with("test:"));
-            if !test_device(&cfg.voice.input_device) {
+            if input.is_some() {
+                cfg.voice.input_device = input;
+            } else if !test_device(&cfg.voice.input_device) {
                 cfg.voice.input_device = Some("test:silence".into());
             }
-            if !test_device(&cfg.voice.output_device) {
+            if output.is_some() {
+                cfg.voice.output_device = output;
+            } else if !test_device(&cfg.voice.output_device) {
                 cfg.voice.output_device = Some("test:null".into());
             }
             if let Some(t) = theme {
@@ -722,6 +758,8 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
                 .env_remove("DEN_SIZE")
                 .env("DEN_HOME", &home)
                 .env("DEN_CLIPBOARD", home.join("clipboard.txt"))
+                // Never the user's microphone or speakers, whatever is picked in the app.
+                .env("DEN_TEST_AUDIO", "1")
                 .env("DEN_WINDOW", if window { "normal" } else { "headless" })
                 .env("DEN_LOG", std::env::var("DEN_LOG").unwrap_or_else(|_| "info,iroh=warn".into()))
                 .stdin(Stdio::null())
@@ -733,43 +771,15 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
             detach(&mut cmd);
             let mut child = cmd.spawn().context("starting den")?;
             let pid = child.id();
-            // Up, and (when hosting or joining) in the room.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut api = loop {
-                if let Some(status) = child.try_wait()? {
-                    bail!("sandbox {name} exited ({status}) while starting:\n{}", tail(&log_path, 15));
+            let (mut api, state) = match until_ready(&name, &home, &log_path, &mut child, lobby).await {
+                Ok(ready) => ready,
+                Err(e) => {
+                    // Don't leave a half-started sandbox behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
                 }
-                if Instant::now() > deadline {
-                    kill(pid);
-                    bail!("sandbox {name} didn't come up in 30 s:\n{}", tail(&log_path, 15));
-                }
-                if let Some((c, info)) = live_instance(&home).await
-                    && info.pid == pid
-                {
-                    break c;
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
             };
-            let mut state = Value::Null;
-            if !lobby {
-                loop {
-                    state = api.call("state.get", json!({})).await?;
-                    if state["conn"]["state"] == "connected" && !state["server"].is_null() {
-                        break;
-                    }
-                    if state["conn"]["state"] == "failed" {
-                        bail!("sandbox {name} couldn't get into the room: {}", state["conn"]["error"].as_str().unwrap_or("?"));
-                    }
-                    if Instant::now() > deadline {
-                        bail!(
-                            "sandbox {name} started but isn't in the room after 30 s (state {}); see {}",
-                            state["conn"],
-                            log_path.display()
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-            }
             let shown = if window { "window" } else { "headless" };
             match state["server"]["name"].as_str() {
                 Some(room) => {
@@ -821,6 +831,130 @@ fn copy_user_config(from: &Paths, to: &Paths) -> anyhow::Result<()> {
     }
     ours.disabled = theirs.disabled;
     config::save(&to.mods_file(), &ours)
+}
+
+/// Wait until a sandbox that was just started is up and (unless it stays in
+/// the lobby) in its room, for up to 30 s.
+async fn until_ready(
+    name: &str,
+    home: &Path,
+    log_path: &Path,
+    child: &mut std::process::Child,
+    lobby: bool,
+) -> anyhow::Result<(ApiClient, Value)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let pid = child.id();
+    let mut api = loop {
+        if let Some(status) = child.try_wait()? {
+            bail!("sandbox {name} exited ({status}) while starting:\n{}", tail(log_path, 15));
+        }
+        if Instant::now() > deadline {
+            bail!("sandbox {name} didn't come up in 30 s:\n{}", tail(log_path, 15));
+        }
+        if let Some((c, info)) = live_instance(home).await
+            && info.pid == pid
+        {
+            break c;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+    if lobby {
+        return Ok((api, Value::Null));
+    }
+    loop {
+        let state = tokio::time::timeout(Duration::from_secs(5), api.call("state.get", json!({})))
+            .await
+            .context("the sandbox stopped answering")??;
+        if state["conn"]["state"] == "connected" && !state["server"].is_null() {
+            return Ok((api, state));
+        }
+        if state["conn"]["state"] == "failed" {
+            bail!("sandbox {name} couldn't get into the room: {}", state["conn"]["error"].as_str().unwrap_or("?"));
+        }
+        if Instant::now() > deadline {
+            bail!("sandbox {name} started but isn't in the room after 30 s (state {}); see {}", state["conn"], log_path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Stop the sandbox in `home`: ask it to quit, else kill it. True once no
+/// process uses its folder any more.
+async fn stop_sandbox(name: &str, home: &Path) -> bool {
+    let gone = |pid: u32| move || async move { profile_free(home) && !alive(pid) };
+    match live_instance(home).await {
+        Some((mut c, info)) => {
+            let _ = tokio::time::timeout(Duration::from_secs(5), c.call("app.quit", json!({}))).await;
+            // Gone once it lets go of its profile (after handing the room on) and exits.
+            let quit = wait_until(Duration::from_secs(10), gone(info.pid)).await;
+            if !quit {
+                kill(info.pid);
+            }
+            let stopped = quit || wait_until(Duration::from_secs(3), gone(info.pid)).await;
+            println!("stopped {name} (pid {}){}", info.pid, if quit { "" } else { ", forcibly" });
+            stopped
+        }
+        None if profile_free(home) => {
+            println!("{name} wasn't running");
+            true
+        }
+        None => {
+            // It holds its profile but doesn't answer: stop it by the pid in its instance file.
+            let newest = list_instances(&Paths::under(home)).into_iter().map(|(_, i)| i).max_by_key(|i| i.started);
+            let Some(info) = newest else {
+                println!("{name} is in use by a process that doesn't answer and left no pid");
+                return false;
+            };
+            kill(info.pid);
+            let stopped = wait_until(Duration::from_secs(5), gone(info.pid)).await;
+            println!("stopped {name} (pid {}), forcibly: it wasn't answering", info.pid);
+            stopped
+        }
+    }
+}
+
+/// Remove a stopped sandbox's folder. Windows can hold a file open for a
+/// moment after its process exits, so try for a few seconds.
+async fn remove_dir(dir: &Path) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if Instant::now() > deadline => return Err(e).with_context(|| format!("removing {}", dir.display())),
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+/// The process is still running.
+fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else { return false };
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+        // SAFETY: plain Win32 calls on a handle we open and close here.
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+            CloseHandle(h);
+            running
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// No process holds this home's profile.

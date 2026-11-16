@@ -77,11 +77,16 @@ pub(crate) struct IoRequest {
 /// Body of the io thread: open both streams, report, then hold them until told to stop.
 ///
 /// `test:…` names open a virtual device ([`crate::testdev`]) instead: no real device (nor
-/// the audio host, if neither side needs one) is touched for that direction.
+/// the audio host, if neither side needs one) is touched for that direction. With
+/// `DEN_TEST_AUDIO=1` (sandboxes) only those open: any other choice, the system default
+/// included, gets `test:silence` / `test:null`.
 pub(crate) fn run_io(req: IoRequest) {
-    let IoRequest { input_device, output_device, shared, capture_tx, recycle_rx, ready_tx, stop_rx } = req;
+    let IoRequest { mut input_device, mut output_device, shared, capture_tx, recycle_rx, ready_tx, stop_rx } = req;
     let mut host = None;
     let mut notes = Vec::new();
+    if std::env::var("DEN_TEST_AUDIO").is_ok_and(|v| v.trim() == "1") {
+        only_test_devices(&mut input_device, &mut output_device, &mut notes);
+    }
 
     let input = match input_device.as_deref().and_then(|n| testdev::parse_input(n).map(|d| (n, d))) {
         Some((name, dev)) => dev.and_then(|d| {
@@ -114,6 +119,18 @@ pub(crate) fn run_io(req: IoRequest) {
     let _ = stop_rx.recv();
     drop(input_stream);
     drop(output_stream);
+}
+
+/// `DEN_TEST_AUDIO=1`: anything but a test device (the system default included) becomes
+/// `test:silence` / `test:null`.
+fn only_test_devices(input: &mut Option<String>, output: &mut Option<String>, notes: &mut Vec<String>) {
+    for (dev, fallback, dir) in [(input, "test:silence", "input"), (output, "test:null", "output")] {
+        if !dev.as_deref().is_some_and(testdev::is_test_device) {
+            let wanted = dev.as_deref().map_or("the system default".to_owned(), |d| format!("\"{d}\""));
+            notes.push(format!("{dir}: {wanted} isn't a test device; using {fallback} (DEN_TEST_AUDIO=1)"));
+            *dev = Some(fallback.into());
+        }
+    }
 }
 
 /// What the io thread holds open: a real stream, or a virtual test device's thread.
@@ -293,4 +310,25 @@ fn open_output(host: &cpal::Host, wanted: Option<&str>, shared: &Arc<Shared>, no
     stream.play().map_err(|e| format!("\"{name}\": {e}"))?;
 
     Ok((StreamInfo { name, sample_rate: config.sample_rate, channels: config.channels, format }, stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_only_keeps_real_devices_shut() {
+        let mut notes = Vec::new();
+        let (mut input, mut output) = (None, Some("MacBook Pro Speakers".to_owned()));
+        only_test_devices(&mut input, &mut output, &mut notes);
+        assert_eq!((input.as_deref(), output.as_deref()), (Some("test:silence"), Some("test:null")));
+        assert_eq!(notes.len(), 2);
+
+        let mut notes = Vec::new();
+        let (mut input, mut output) = (Some("test:sine:440".to_owned()), Some("Test:capture:/tmp/x.wav".to_owned()));
+        only_test_devices(&mut input, &mut output, &mut notes);
+        assert_eq!(input.as_deref(), Some("test:sine:440"));
+        assert_eq!(output.as_deref(), Some("Test:capture:/tmp/x.wav"));
+        assert!(notes.is_empty());
+    }
 }

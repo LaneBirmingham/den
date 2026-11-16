@@ -2245,7 +2245,8 @@ fn frontend_call(s: &Session, method: &str, mut p: Value) -> ApiFuture {
         return ready(Ok(json!({"quitting": true})));
     }
     let wait_ms = match method {
-        "ui.wait" => p["timeout_ms"].as_u64().unwrap_or(10_000) + 3_000,
+        // An hour at most, as the frontend allows.
+        "ui.wait" => p["timeout_ms"].as_u64().unwrap_or(10_000).min(3_600_000) + 3_000,
         _ => 20_000,
     };
     let method = method.to_owned();

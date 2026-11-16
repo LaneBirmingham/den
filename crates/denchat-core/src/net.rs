@@ -460,7 +460,9 @@ pub struct PortMapCheck {
 /// How long a TCP connection to `url`'s host and port takes (relays speak
 /// HTTP(S) over TCP), or why it failed. Says nothing about its token.
 pub async fn tcp_rtt(url: &RelayUrl, timeout: Duration) -> Result<Duration, String> {
-    let host = url.host_str().ok_or("no host")?.trim_end_matches('.').to_owned();
+    let host = url.host_str().ok_or("no host")?.trim_end_matches('.');
+    // An IPv6 literal comes bracketed (`[::1]`); connect wants it bare.
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host).to_owned();
     let port = url.port_or_known_default().ok_or("no port")?;
     let start = tokio::time::Instant::now();
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host.as_str(), port))).await {

@@ -26,9 +26,12 @@ pub fn run(session: Session, registry: Registry, size: egui::Vec2) -> anyhow::Re
     let ctx = egui::Context::default();
     // Same fallback fonts as the windowed app, so screenshots match it.
     ctx.add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
-    let (wake_tx, wake) = mpsc::channel::<()>();
-    ctx.set_request_repaint_callback(move |_| {
-        let _ = wake_tx.send(());
+    // Each repaint request carries when it wants the frame. A request made
+    // during a frame (the app polling every 800 ms) mustn't wake the loop
+    // straight away, or it spins a core.
+    let (wake_tx, wake) = mpsc::channel::<Instant>();
+    ctx.set_request_repaint_callback(move |info| {
+        let _ = wake_tx.send(Instant::now() + info.delay);
     });
     let mut app = DenApp::create(&ctx, None, session.clone(), registry, Kind::Headless);
     let started = Instant::now();
@@ -36,15 +39,23 @@ pub fn run(session: Session, registry: Registry, size: egui::Vec2) -> anyhow::Re
     window.sync();
     tracing::info!("running headless ({}x{}); drive it with `den ui …`", size.x, size.y);
     let mut next = Instant::now();
-    loop {
-        let now = Instant::now();
-        if next > now {
-            match wake.recv_timeout(next - now) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    let mut earliest = Instant::now();
+    'frames: loop {
+        loop {
+            while let Ok(at) = wake.try_recv() {
+                next = next.min(at);
+            }
+            let now = Instant::now();
+            let at = next.max(earliest);
+            if at <= now {
+                break;
+            }
+            match wake.recv_timeout(at - now) {
+                Ok(at) => next = next.min(at),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'frames,
             }
         }
-        while wake.try_recv().is_ok() {}
         let frame_start = Instant::now();
         let mut raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, window.size)),
@@ -68,6 +79,7 @@ pub fn run(session: Session, registry: Registry, size: egui::Vec2) -> anyhow::Re
         if close {
             break;
         }
+        earliest = frame_start + MIN_FRAME;
         next = frame_start + delay.clamp(MIN_FRAME, MAX_IDLE);
     }
     ctx.on_exit();

@@ -582,7 +582,10 @@ async fn check_reach(shared: Arc<Shared>, id: MemberId, seq: u64, delay: Duratio
     let loopback = shared.net.bound().iter().all(|a| a.ip().is_loopback());
     let targets: Vec<std::net::SocketAddr> =
         link.addr.ip_addrs().filter(|a| crate::relay::is_public(a.ip()) || (loopback && a.ip().is_loopback())).copied().collect();
-    let reach = if net::reachable(link.addr.id, targets, Duration::from_secs(4)).await { Reach::Open } else { claimed.min(Reach::Nat) };
+    // A relay-only host opens no UDP and shows nobody its address, so it
+    // doesn't dial members to check: their claim stands, at most `nat`.
+    let open = shared.net.direct_enabled() && net::reachable(link.addr.id, targets, Duration::from_secs(4)).await;
+    let reach = if open { Reach::Open } else { claimed.min(Reach::Nat) };
     let mut room = shared.room.lock();
     if room.members.get(&id).is_none_or(|c| c.reach_seq != seq) {
         return;

@@ -71,7 +71,7 @@ example.dice/history
 
 | Command | |
 | --- | --- |
-| `den ui click <target \| X,Y> [--right] [--double] [--pointer]` | Click through the widget's accessibility action, or with a synthetic pointer at its centre. |
+| `den ui click <target \| X,Y> [--right] [--double] [--pointer]` | Click through the widget's accessibility action, or with a synthetic pointer at its centre (a widget scrolled out of view is scrolled to first). |
 | `den ui type <text> [--into T] [--enter]` | Type into the focused text box (or focus `T` first). `--enter` sends it. |
 | `den ui key <keys…>` | Press keys and chords in order: `Escape`, `Tab`, `ctrl+a Backspace`, `cmd+k`. |
 | `den ui scroll <dy> [--dx N] [--over T]` | Scroll by points over a widget. A positive `dy` scrolls down. |
@@ -90,10 +90,12 @@ listed.
 * `den ui wait <target> [--gone] [--timeout 10]` waits until a widget
   appears (or, with `--gone`, disappears). It exits 1 on timeout.
 * Every action takes `--wait <target>`: `den ui click Mute --wait Unmute`.
-* `den wait <event…> [--where path=value] [--count N]` waits for events
-  from the app and prints them. Example:
-  `den wait message.created --where message.text=rolled`. Event names are
-  listed in [API.md](API.md#events).
+* `den wait <event…> [--where path=value] [--count N] [-- <command>]`
+  waits for events from the app and prints them. It only sees events from
+  after it starts listening, so put the action that causes the event after
+  `--`. Den runs it once it's listening:
+  `den wait message.created --where message.text=rolled -- den ui type /roll --enter`.
+  Event names are listed in [API.md](API.md#events).
 
 ## Sandboxes
 
@@ -103,8 +105,10 @@ until the room is up and prints the invite link. A sandbox:
 
 * runs **headless**, with no window, no GPU and no focus. Add `--window` to
   see a real one.
-* uses the **test audio devices** `test:silence` → `test:null`, so it never
-  touches the user's microphone or speakers.
+* uses the **test audio devices** `test:silence` → `test:null` (or
+  `--input test:sine:440`, `--output test:capture:<wav>`). It never opens
+  the user's microphone or speakers: a real device picked in its Voice
+  settings gets a test device instead (`DEN_TEST_AUDIO=1`).
 * sends anything it **copies** to `<home>/clipboard.txt`, never to the
   user's clipboard.
 * hosts a room, joins one (`--join b`, or `--join '<invite>'`), or stays in
@@ -128,8 +132,7 @@ in for "a second machine":
 ```sh
 den sandbox start a
 den sandbox start b --join a
-den -S b ui type "hi from b" --enter
-den -S a wait message.created --where message.text=hi
+den -S a wait message.created --where message.text=hi -- den -S b ui type "hi from b" --enter
 den -S b ui click "Join lounge" --wait "Leave voice"
 den -S a status                         # members a (you), b [voice:lounge]
 ```
@@ -141,6 +144,7 @@ Without sandboxes, the same switches work on any instance:
 * `DEN_SIZE=WxH` sets the window size (and doesn't save it).
 * `DEN_SCALE=1.5` sets the UI zoom.
 * `DEN_CLIPBOARD=<file>` sends copies to a file.
+* `DEN_TEST_AUDIO=1` opens only `test:` audio devices.
 
 ## Testing a mod end to end
 
@@ -150,8 +154,7 @@ den sandbox start t --mod ./my-mod --fresh
 den -S t status | tail -1                    # mods my.mod · panels my.mod/status
 den -S t ui tree --panel my.mod              # does the panel show what it should?
 den -S t ui click "Say hello" --panel my.mod
-den -S t ui type "/hello agent" --enter
-den -S t wait message.created --where message.text=agent
+den -S t wait message.created --where message.text=agent -- den -S t ui type "/hello agent" --enter
 den -S t ui shot /tmp/panel.png --panel my.mod
 # edit den-mod.toml / mod.py, then:
 den -S t api mods.reload
@@ -179,7 +182,8 @@ readers get, too.
 ## Voice without real devices
 
 Set these in a home's `config.toml` (`[voice] input_device` /
-`output_device`). Sandboxes already use `test:silence` and `test:null`.
+`output_device`), or start a sandbox with `--input` / `--output`.
+Sandboxes use `test:silence` and `test:null` by default.
 
 | Device | |
 | --- | --- |
@@ -187,11 +191,11 @@ Set these in a home's `config.toml` (`[voice] input_device` /
 | `test:sine:<hz>` | Input: a steady tone, e.g. `test:sine:440`. |
 | `test:file:<wav>` | Input: a WAV file, looped. |
 | `test:null` | Output: discards everything. |
-| `test:capture:<wav>` | Output: writes what it hears to a WAV file. |
+| `test:capture:<wav>` | Output: writes what it hears to a WAV file. It starts over each time voice starts. |
 
 ```sh
-den sandbox start a && den sandbox start b --join a
-# give a a tone: [voice] input_device = "test:sine:440" in $(den sandbox path a)/config/config.toml, then restart a
+den sandbox start a --input test:sine:440
+den sandbox start b --join a --output test:capture:/tmp/b.wav
 den -S a api voice.join channel=lounge; den -S b api voice.join channel=lounge
 den -S b api voice.stats                     # rx_packets climbing, level > 0
 ```
@@ -222,6 +226,7 @@ den -S b api voice.stats                     # rx_packets climbing, level > 0
 | Gap | Status |
 | --- | --- |
 | Clicking the GUI in the background | **Fixed**: `den ui click/type/key/scroll/hover`, which inject egui input or accesskit actions. No focus, no real mouse. |
+| Acting, then waiting for the event it causes | **Fixed**: `den wait <event> -- <command>` listens first, then runs the command. |
 | The clipboard is the user's | **Fixed**: `den ui clip`, and `DEN_CLIPBOARD=<file>` (always on in sandboxes and headless). Clicking "Copy" in the user's own app still copies to their clipboard, as it should. |
 | Voice needs real devices | **Fixed**: `test:` devices (above). |
 | Can't force a relay path | **Fixed**: `[net] direct = false` / `DEN_NO_DIRECT=1`. |
@@ -231,5 +236,5 @@ den -S b api voice.stats                     # rx_packets climbing, level > 0
 | Firewall prompt can't be observed | `den doctor` reports the rules and the network profile; the prompt itself still can't be seen. The Windows check is untested. |
 | Console Ctrl+C / close on Windows | Still needs hand-made helpers (`AttachConsole` + `GenerateConsoleCtrlEvent`). `den ui quit` and `den sandbox stop` cover the normal close path. |
 | A real second machine | Still manual. Sandboxes cover same-machine rooms (direct and relay-only); real NAT and firewall need another host. |
-| `den serve` with direct off | Needs `--relay-url`. The reach probe in `server.rs` still sends direct UDP. |
+| `den serve` with direct off | Needs `--relay-url` (or `[relay] url`, or `[net] relays`); it now refuses to start without one. A relay-only host no longer dials members to check their reach. |
 | Headless and windowed driving on Windows/Linux | Built and tested on macOS. The code is portable; it hasn't been run there yet. |

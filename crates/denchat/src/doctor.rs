@@ -10,6 +10,26 @@ use denchat_core::paths::Paths;
 use serde_json::{Value, json};
 
 pub async fn run(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
+    let out = match report(paths).await {
+        Ok(out) => out,
+        Err(e) => {
+            // The setups that can't even start an endpoint are the ones worth
+            // diagnosing: still give the script its JSON.
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&json!({"version": denchat_core::VERSION, "error": format!("{e:#}")}))?);
+            }
+            return Err(e);
+        }
+    };
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print_text(&out);
+    }
+    Ok(())
+}
+
+async fn report(paths: &Paths) -> anyhow::Result<Value> {
     let cfg: AppConfig = config::load_or_default(&paths.config_file())?;
     let direct = cfg.net.direct_enabled();
     // Port mapping is checked on its own below; the endpoint shouldn't map too.
@@ -22,7 +42,17 @@ pub async fn run(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let portmap = if cfg.net.port_mapping && direct { Some(net::check_port_mapping(port, Duration::from_secs(4)).await) } else { None };
 
     let mut facts = net.facts();
-    facts.mapped |= portmap.as_ref().is_some_and(|p| p.mapped.is_some());
+    // Only a mapping to a public address helps (not one behind CGNAT or a second router).
+    facts.mapped |= portmap
+        .as_ref()
+        .and_then(|p| p.mapped.as_deref())
+        .is_some_and(|m| m.parse::<std::net::SocketAddr>().is_ok_and(|a| denchat_core::relay::is_public(a.ip())));
+    // No relay answered address discovery: UDP may be blocked, or the relays
+    // (a self-hosted `den relay`) don't offer it. Either way, not measured.
+    let udp_probed = report.as_ref().is_some_and(|r| r.udp_v4 || r.udp_v6);
+    if !udp_probed {
+        facts.measured = false;
+    }
     let reach = if direct { facts.reach() } else { net.reach() };
 
     // The home relay connects shortly after it's picked.
@@ -60,7 +90,7 @@ pub async fn run(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
         },
         "direct": direct,
         "reach": reach,
-        "udp": report.as_ref().map(|r| json!({"v4": r.udp_v4, "v6": r.udp_v6})),
+        "udp": report.as_ref().map(|r| json!({"v4": r.udp_v4, "v6": r.udp_v6, "probed": udp_probed})),
         "public": report.as_ref().map(|r| json!({"v4": r.global_v4, "v6": r.global_v6})),
         "nat_varies": report.as_ref().map(|r| json!({"v4": r.varies_v4, "v6": r.varies_v6})),
         "captive_portal": report.as_ref().and_then(|r| r.captive_portal),
@@ -72,12 +102,7 @@ pub async fn run(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
         "relays": relays,
         "firewall": firewall,
     });
-    if as_json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        print_text(&out);
-    }
-    Ok(())
+    Ok(out)
 }
 
 fn print_text(o: &Value) {
@@ -93,6 +118,9 @@ fn print_text(o: &Value) {
     }
     let udp = match &o["udp"] {
         Value::Null => "no network report (no relays to measure against)".to_owned(),
+        u if u["probed"] != true => {
+            "udp not measured: no relay answered address discovery (UDP blocked, or the relays don't offer it)".to_owned()
+        }
         u => format!("udp v4 {}, v6 {}", yes(&u["v4"]), yes(&u["v6"])),
     };
     println!("reach     {} ({udp})", s(&o["reach"]));
@@ -175,8 +203,8 @@ async fn firewall() -> Value {
         let run = |args: &'static [&'static str]| async move {
             let out = tokio::time::timeout(Duration::from_secs(15), tokio::process::Command::new("netsh").args(args).output()).await;
             match out {
-                Ok(Ok(o)) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-                Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stdout).trim().to_owned()),
+                Ok(Ok(o)) if o.status.success() => Ok(console_text(&o.stdout)),
+                Ok(Ok(o)) => Err(console_text(&o.stdout).trim().to_owned()),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("netsh took too long".to_owned()),
             }
@@ -193,6 +221,32 @@ async fn firewall() -> Value {
     }
     #[cfg(not(windows))]
     json!({"checked": false, "note": "only on Windows"})
+}
+
+/// netsh writes in the console's code page (the OEM one unless `chcp` changed
+/// it), not UTF-8: decode it so a path like `C:\Users\José\…` still matches.
+#[cfg(windows)]
+fn console_text(b: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+    if b.is_ascii() {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let Ok(len) = i32::try_from(b.len()) else { return String::from_utf8_lossy(b).into_owned() };
+    // SAFETY: the buffers and lengths passed are the slices' own.
+    unsafe {
+        let cp = match GetConsoleOutputCP() {
+            0 => CP_OEMCP,
+            cp => cp,
+        };
+        let n = MultiByteToWideChar(cp, 0, b.as_ptr(), len, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return String::from_utf8_lossy(b).into_owned();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(cp, 0, b.as_ptr(), len, wide.as_mut_ptr(), n);
+        String::from_utf16_lossy(&wide[..n.max(0) as usize])
+    }
 }
 
 /// The rules in `netsh advfirewall firewall show rule name=all verbose`

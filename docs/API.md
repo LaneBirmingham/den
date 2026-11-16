@@ -19,7 +19,8 @@ den api --server state.get          # pick the headless server when both run
 
 `den api` finds an instance via `$DEN_API`/`$DEN_API_TOKEN`
 (set for mods), else `<state>/instances/<pid>.json` (newest first; stale files
-are pruned). Instance files are `0600` and contain the token.
+are pruned). Instance files are `0600` and contain the token. A profile named
+on the command line (`-S <sandbox>`, `--home`) wins over `$DEN_API`.
 
 ## Wire format
 
@@ -75,13 +76,13 @@ candidates.
 
 | Method | Params | |
 | --- | --- | --- |
-| `ui.tree` | `panel?, all?, rects?, format?` | widgets on screen: `{nodes: [{ref, role, text, value?, panel, rect, focused, disabled, toggled?, selected, clickable}], window}`; `format: "text"` gives `{text}`, one line per widget grouped by panel. Scrolled-away widgets only with `all` |
-| `ui.click` | `target \| x,y, panel?, index?, button?, double?, pointer?` | click: the widget's accessibility action, or a pointer click at its centre (`pointer`, `button: "right"`, `double`, or a point) |
+| `ui.tree` | `panel?, all?, rects?, format?` | widgets on screen: `{nodes: [{ref, role, text, value, panel, toggled, flags, rect}], panels, window}`. `flags` lists any of `focused`, `disabled`, `selected`, `hidden`, `clickable`; `rect` is `[x, y, w, h]` in points; `toggled` is null for widgets that don't toggle. `format: "text"` gives `{text}`, one line per widget grouped by panel. Scrolled-away widgets only with `all` |
+| `ui.click` | `target \| x,y, panel?, index?, button?, double?, pointer?` | click: the widget's accessibility action, or a pointer click at its centre (`pointer`, `button: "right"`, `double`, or a point). Pointer actions (`click`, `hover`, `scroll`, `type` into a target) scroll a target that's out of view into view first |
 | `ui.type` | `text, target?, enter?` | type into the focused text box, or focus `target` first; `enter` presses Enter after |
 | `ui.key` | `key` | a key or chord: `Enter`, `Escape`, `Tab`, `ctrl+a`, `cmd+k`, `shift+F2` (`cmd` is Ctrl off macOS) |
 | `ui.scroll` | `dy?, dx?, target? \| x,y` | scroll by points (dy > 0 scrolls down) over a widget or point |
 | `ui.hover` | `target \| x,y` | move the pointer there; answers after the tooltip delay |
-| `ui.wait` | `target, gone?, timeout_ms?, panel?` | until a widget matching `target` is on screen (or, with `gone`, isn't): `{found, after_ms}`; an error on timeout (default 10 s) |
+| `ui.wait` | `target, gone?, timeout_ms?, panel?` | until a widget matching `target` is on screen (or, with `gone`, isn't): `{found, after_ms}`; an error on timeout (default 10 s, at most an hour) |
 | `ui.screenshot` | `path?, panel?, target?, scale?, renderer?` | PNG of the window, a panel or a widget: `{path, width, height, renderer}`. A visible window is captured from the GPU; a hidden, minimised or headless one is drawn on the CPU (`renderer: "cpu"` forces that). Default path: `<state>/screenshots/<ms>.png` |
 | `ui.window` | `size?, pos?, minimized?, maximized?, fullscreen?, visible?, focus?` | window state (`size`, `pos`, `title`, `pixels_per_point`, `zoom`, flags, `renderer`); params change it first. `size`/`pos` as `"800x600"` / `"40,40"` or `[w, h]` |
 | `ui.scale` | `scale` | UI zoom, like display scaling (1.0 = 100 %) |

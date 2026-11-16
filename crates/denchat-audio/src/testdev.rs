@@ -45,9 +45,15 @@ pub const TEST_OUTPUTS: &[(&str, &str)] =
 /// Amplitude of `test:sine` (RMS ≈ 0.21: well above the default VAD threshold).
 pub const SINE_AMPLITUDE: f32 = 0.3;
 
-/// Whether `name` is a virtual device (`test:…`).
+/// Whether `name` is a virtual device (`test:…`, in any case).
 pub fn is_test_device(name: &str) -> bool {
-    name.starts_with(PREFIX)
+    without_prefix(name).is_some()
+}
+
+/// What follows `test:` (matched in any case, so `Test:sine` never falls back to a real device).
+fn without_prefix(name: &str) -> Option<&str> {
+    let head = name.get(..PREFIX.len())?;
+    head.eq_ignore_ascii_case(PREFIX).then(|| &name[PREFIX.len()..])
 }
 
 /// How often a virtual device runs its callback.
@@ -73,9 +79,9 @@ pub(crate) enum TestOutput {
 
 /// `None` if `name` isn't a test device; otherwise the parsed device or why it's invalid.
 pub(crate) fn parse_input(name: &str) -> Option<Result<TestInput, String>> {
-    let rest = name.strip_prefix(PREFIX)?;
+    let rest = without_prefix(name)?;
     let (kind, arg) = rest.split_once(':').map_or((rest, None), |(k, a)| (k, Some(a)));
-    Some(match (kind, arg) {
+    Some(match (kind.to_ascii_lowercase().as_str(), arg) {
         ("silence", None) => Ok(TestInput::Silence),
         ("sine", None) => Ok(TestInput::Sine(440.0)),
         ("sine", Some(hz)) => match hz.trim().parse::<f32>() {
@@ -89,9 +95,9 @@ pub(crate) fn parse_input(name: &str) -> Option<Result<TestInput, String>> {
 
 /// `None` if `name` isn't a test device; otherwise the parsed device or why it's invalid.
 pub(crate) fn parse_output(name: &str) -> Option<Result<TestOutput, String>> {
-    let rest = name.strip_prefix(PREFIX)?;
+    let rest = without_prefix(name)?;
     let (kind, arg) = rest.split_once(':').map_or((rest, None), |(k, a)| (k, Some(a)));
-    Some(match (kind, arg) {
+    Some(match (kind.to_ascii_lowercase().as_str(), arg) {
         ("null", None) => Ok(TestOutput::Null),
         ("capture", Some(p)) if !p.is_empty() => Ok(TestOutput::Capture(PathBuf::from(p))),
         _ => Err(format!("unknown test output \"{name}\" (try test:null or test:capture:<path.wav>)")),
@@ -269,9 +275,18 @@ fn parse_wav(b: &[u8]) -> Result<Wav, String> {
         let id = &b[i..i + 4];
         let size = u32_at(i + 4) as usize;
         let body = i + 8;
-        // A capture still being written may claim less data than the file holds; one
-        // whose header was never updated claims none. Take what's there.
-        let end = if id == b"data" { b.len() } else { (body + size).min(b.len()) };
+        // A capture still being written may claim less data than the file holds, and one
+        // whose header was never updated claims none: then take what's there. Otherwise
+        // the size is right, and chunks after the data (LIST, id3, cue) aren't audio.
+        let end = if id == b"data" {
+            let claimed = body + size;
+            let next = claimed + (size & 1);
+            let chunk_follows = next + 8 <= b.len() && b[next..next + 4].iter().all(|c| c.is_ascii_alphanumeric() || *c == b' ');
+            let exact = size != 0 && size != u32::MAX as usize && claimed <= b.len() && (next >= b.len() || chunk_follows);
+            if exact { claimed } else { b.len() }
+        } else {
+            (body + size).min(b.len())
+        };
         if id == b"fmt " {
             if end - body < 16 {
                 return Err("short fmt chunk".into());
@@ -357,7 +372,12 @@ impl WavWriter {
         f.write_all(&self.data_bytes.saturating_add(36).to_le_bytes())?;
         f.seek(SeekFrom::Start(40))?;
         f.write_all(&self.data_bytes.to_le_bytes())?;
-        f.seek(SeekFrom::End(0))?;
+        // Back to the end of *our* data, and cut anything past it: when voice
+        // restarts, the old engine's writer of this path can still be flushing
+        // its last buffer as the new one starts over.
+        let end = 44 + u64::from(self.data_bytes);
+        f.set_len(end)?;
+        f.seek(SeekFrom::Start(end))?;
         f.flush()
     }
 }
@@ -439,6 +459,37 @@ mod tests {
         assert_eq!(parse_wav(&wav(3, 1, 32, &float)).unwrap().samples, vec![0.5, -0.25]);
         assert!(parse_wav(b"nope").is_err());
         assert!(parse_wav(&wav(2, 1, 16, &[0, 0])).is_err(), "ADPCM isn't supported");
+
+        // Chunks after the data, and an odd-sized 8-bit data chunk's pad byte, aren't audio.
+        let mut tagged = wav(1, 1, 8, &[128, 192, 64]);
+        tagged.push(0);
+        tagged.extend_from_slice(b"id3 \x04\0\0\0\xff\xff\xff\xff");
+        assert_eq!(parse_wav(&tagged).unwrap().samples, vec![0.0, 0.5, -0.5]);
+    }
+
+    #[test]
+    fn a_restarted_capture_drops_the_old_tail() {
+        let path = tmp("restart.wav");
+        let mut old = WavWriter::create(&path, 16_000).unwrap();
+        old.write(&[0.5; 1000]).unwrap();
+        old.sync().unwrap();
+        // Voice restarts: a new writer starts over while the old one still flushes.
+        let mut new = WavWriter::create(&path, 16_000).unwrap();
+        old.write(&[0.5; 500]).unwrap();
+        old.sync().unwrap();
+        new.write(&[-0.25; 300]).unwrap();
+        new.sync().unwrap();
+        let back = read_wav(&path).unwrap();
+        assert_eq!(back.samples.len(), 300);
+        assert!(back.samples.iter().all(|s| (s + 0.25).abs() < 1e-3));
+    }
+
+    #[test]
+    fn test_prefix_in_any_case() {
+        assert!(is_test_device("Test:Sine:440"));
+        assert_eq!(parse_input("TEST:Sine:1000"), Some(Ok(TestInput::Sine(1000.0))));
+        assert_eq!(parse_output("Test:NULL"), Some(Ok(TestOutput::Null)));
+        assert_eq!(parse_input("tes"), None);
     }
 
     /// RMS and frequency (from upward zero crossings) of the audible part of a recording,

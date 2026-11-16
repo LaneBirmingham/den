@@ -124,6 +124,11 @@ impl FrontendCall {
     pub fn answer(self, result: Result<Value, String>) {
         let _ = self.reply.send(result);
     }
+
+    /// The caller stopped waiting for the answer.
+    pub fn abandoned(&self) -> bool {
+        self.reply.is_closed()
+    }
 }
 
 struct Frontend {
