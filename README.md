@@ -1,17 +1,44 @@
-# tailchat
+# Den
 
-Minimal voice + text chat for people on the same [Tailscale](https://tailscale.com)
-tailnet. One Rust binary, three ways to run it:
+Minimal peer-to-peer voice + text chat. No accounts, no service to sign up
+for, nothing to install but the app. One Rust binary, three ways to run it:
 
 | You want to… | Run |
 | --- | --- |
-| Hang out with friends, one of you hosts | `tailchat host` (others: `tailchat join <your-machine>`) |
-| A room that's always up | `tailchat serve` on a server, headless, with an admin console |
-| Chat from a terminal / over SSH | `tailchat chat <machine>` |
+| Hang out with friends, one of you hosts | `den host`, then share the invite link (others: `den join '<link>'`) |
+| A room that's always up | `den serve` on a server, headless, with an admin console |
+| Keep a room going when its host leaves | nothing: everyone keeps a copy, and anyone can host it next |
+| Chat from a terminal / over SSH | `den chat '<link>'` |
 
-Tailscale does the hard parts: addressing (`join lanes-mac-mini`), encryption
-(WireGuard), NAT traversal, and identity — the room checks every connection
-with `tailscale whois`, so members show up as who they really are.
+[iroh](https://iroh.computer) does the networking: every app is a QUIC
+endpoint named by a public key, connections are end-to-end encrypted, and NAT
+hole-punching gets most peers a direct connection. Peers that can't reach
+each other directly (strict NATs, some mobile networks) go through a relay,
+which only ever sees encrypted traffic:
+
+* **Rooms with a `serve`** use the server's own relay (built in, same port
+  number over TCP). Nothing from a third party.
+* **Rooms hosted from an app** use n0's free public relays by default, or
+  your own: run `den relay` on any machine with a forwarded port and
+  put the URL it prints (token included) in the host's `[net] relays`. Members need no setup either way:
+  the invite link says which relay to use.
+
+A relay has to be reachable from outside (a forwarded port or a public IP);
+that's what lets two peers behind routers find each other. Your own relays
+aren't open to the internet: each has a token, carried in invite links, and
+admits only apps that present it.
+
+**Port forwarding.** If your router offers it (UPnP, NAT-PMP or PCP), the app
+asks it to forward one UDP port while it runs, so others can connect straight
+in. Only Den listens there, and rooms still need their invite key. To
+never open ports on your router, set `port_mapping = false` under `[net]` in
+`config.toml` (or `server.toml`); peers then hole-punch or use the relay.
+
+**Identity is per room.** There are no global profiles. The first time you
+join a room, your app makes a key for that room and keeps it; the room
+remembers the public half next to your nick. Signing in is signing a
+challenge with that key, so nobody else can show up as you in that room, and
+nothing links your profiles across rooms.
 
 The app is deliberately bare. Every visible piece of the UI is a removable
 panel placed by a TOML **layout**, colours and shapes come from a TOML
@@ -35,57 +62,111 @@ scripts and AI agents can drive and reshape the app without touching Rust.
 
 ```sh
 cargo build --release              # GUI + voice (default features)
-./target/release/tailchat          # opens the lobby: host, join, or pick a discovered room
+./target/release/den          # opens the lobby: host, join, or reopen a saved room
 ```
 
-Friends on your tailnet run `tailchat join <your-machine-name>` (or click your
-room under *On your tailnet* in the lobby). Default port is **8245** (TCP for
-chat, UDP for voice).
+Host a room, then *room menu → Copy invite link* and send it to your friends;
+they paste it into *Join*. A link looks like
+`den://<endpoint-id>?room=<id>&invite=<key>&relay=…&ip=…`.
+
+**The invite link is the key to the room.** New rooms are invite-only: the
+link carries the room's invite key, and the host admits only apps that prove
+they have it. Your app saves it with the room, so you can come back without
+the link, and any member can copy it again. Tick *Open room* (or
+`den host --open`) for a room anyone with the address can join.
+
+### Rooms belong to everyone in them
+
+A room works like a shared save game. Everyone who joins keeps a copy
+(settings and the last 500 messages per channel, under `<data>/rooms/<id>/`),
+and their app swaps message ids with the host on every join, so all the
+copies fill each other's gaps. That means:
+
+* **The host can leave.** *Leave* (or closing the app, or stopping it with
+  Ctrl-C / SIGTERM) hands the room to another member; everyone's app
+  follows automatically. *Hand off to…* in the room menu does the same on
+  purpose. The header says "you host" while the room runs on your machine.
+* **The host can vanish.** If the host drops, anyone can click
+  **Host this room** and carry on from their copy; the others find it by
+  asking every member's app they know of. Open a room later from *Your rooms* in the lobby (or
+  `den host --room <name>`): it joins whoever hosts it now, or hosts
+  it from your copy.
+* **The best placed member hosts next.** Apps measure how easily others can
+  reach them, and the host double-checks by connecting to each member
+  directly. A handoff goes to whoever others can reach most easily (they
+  need no relay to host), and when the host has vanished, *Host this room*
+  says if someone else is better placed. The lobby shows your own network
+  (*behind a router*, *strict network*, …).
+* Everyone in a room has the same rights: anyone can host it. The invite
+  key, members' profiles (key → nick) and join rules (`allow`) travel with
+  the room. If a host refuses you, there's no *Host this room*: the host is
+  up, and would refuse you again.
 
 ### Persistent server
 
 ```sh
-cargo build --release -p tailchat --no-default-features   # headless: no GUI/audio deps
-tailchat serve --name "The Den" --channel general --channel lounge:voice --require-tailnet
+cargo build --release -p denchat --no-default-features   # headless: no GUI/audio deps
+den serve --name "The Den" --channel general --channel lounge:voice
 ```
 
-`serve` binds to the machine's tailnet IP, keeps history on disk, runs
-server-side mods, and gives you an admin console (`help`, `who`, `say`,
-`kick`, `motd`, `reload`, …). Settings live in `server.toml`
-(`tailchat serve --write-config` writes one). See [`deploy/`](deploy) for
-systemd and Docker (Tailscale sidecar) setups.
+`serve` prints the room's invite link, saves the room like any member would,
+runs server-side mods, and gives you an admin console (`help`, `who`, `say`,
+`kick`, `motd`, `reload`, …). It listens on **UDP 8245** (the room) and
+**TCP 8245** (its relay); forward both on your router. It works out its
+public IP at start and puts its relay in the invite link; on a dynamic IP,
+give it a DNS name instead: `--relay-url box.example.com:8245` (or
+`[relay] url` in `server.toml`).
+Settings live in `server.toml` (`den serve --write-config` writes one).
+See [`deploy/`](deploy) for systemd and Docker setups.
+
+A server is just the room's always-on host. Stopping it (Ctrl-C, SIGTERM,
+`quit`) hands the room to a member whose app can host, so nobody is
+stranded. If it was down and someone else hosted the room meanwhile, it
+takes the room back when it starts, and the members' copies fill in what it
+missed.
+
+Join rules are saved with the room, so `--allow` sticks across restarts.
+`--allow <key>` (repeatable; the first 8+ characters of a member's key, see
+`who`) admits only those members, on top of the invite; it replaces the
+saved list, and `--open` clears it. To move a room you started in the app
+onto a server: `den serve --adopt '<invite link>'` (or copy
+`<data>/rooms/<id>/` over and run `den serve --room <id>`).
 
 ### All commands
 
 ```
-tailchat [gui]                   desktop app
-tailchat host [--name --bind --port --persist] [--cli]
-tailchat join <addr> [--cli]
-tailchat chat <addr> | --host    terminal client
-tailchat serve [...]             headless room + admin console
-tailchat discover [--json]       find rooms on your tailnet
-tailchat api <method> [params]   drive a running instance (see docs/API.md)
-tailchat mods list|new|link|unlink|enable|disable|path
-tailchat config path|init        where files live / write editable defaults
-tailchat devices | voice-test    audio checks
+den [gui]                   desktop app
+den host [--name | --room <saved>] [--open] [--cli]
+den join <link> [--cli]
+den chat <link> | --host    terminal client
+den serve [--room <saved> | --adopt <link>] [...]   always-on host + admin console + relay
+den relay [--port 3340]     a relay on its own, for rooms hosted from apps
+den discover [--json]       which of your saved rooms are live
+den api <method> [params]   drive a running instance (see docs/API.md)
+den mods list|new|link|unlink|enable|disable|path
+den config path|init        where files live / write editable defaults
+den devices | voice-test    audio checks
 ```
 
-Global flags: `--home <dir>` (or `TAILCHAT_HOME`) keeps config/data/state in
+Global flags: `--home <dir>` (or `DEN_HOME`) keeps config/data/state in
 one folder — handy for running several instances on one machine.
+
+In the chat box, `/invite` prints the room's invite link and `/whoami` your
+key for the room.
 
 ## Customising
 
 * **Theme / layout:** *View* menu in the app, or `config.toml` → `[ui]`.
-  `tailchat config init` exports the built-ins to your config folder; edit
+  `den config init` exports the built-ins to your config folder; edit
   and save — the app hot-reloads. → [docs/CUSTOMIZING.md](docs/CUSTOMIZING.md)
-* **Mods:** `tailchat mods new my.mod` scaffolds one. Examples in
+* **Mods:** `den mods new my.mod` scaffolds one. Examples in
   [`mods/`](mods). → [docs/MODS.md](docs/MODS.md)
 * **Turn things off:** delete a panel from the layout, or switch whole
   modules off in `config.toml` → `[modules]` (`voice`, `mods`, `api`,
   `discovery`, `slash_commands`).
 * **Using an AI agent:** point it at [AGENTS.md](AGENTS.md). It can edit
   themes/layouts/mods, apply them live, and screenshot the result
-  (`tailchat api ui.screenshot`).
+  (`den api ui.screenshot`).
 
 ## Platforms
 
@@ -96,18 +177,18 @@ the GUI; the headless build (`--no-default-features`) needs none of them.
 
 | Feature | Default | What it pulls in |
 | --- | --- | --- |
-| `gui` | on | egui/eframe desktop shell (`tailchat-gui`) |
-| `voice` | on | cpal + Opus (`tailchat-audio`) |
+| `gui` | on | egui/eframe desktop shell (`denchat-gui`) |
+| `voice` | on | cpal + Opus (`denchat-audio`) |
 
 ## Layout of the repo
 
 ```
 crates/
-  tailchat-proto   wire protocol (TCP JSON frames + UDP voice packets)
-  tailchat-audio   capture, Opus, jitter buffers, mixing, VAD
-  tailchat-core    server, session, Tailscale, mods, control API, UI store
-  tailchat-gui     egui shell: layouts, themes, panel registry
-  tailchat         the binary (app, terminal client, serve, CLI tools)
+  denchat-proto   wire protocol (JSON frames on a QUIC stream + voice datagrams)
+  denchat-audio   capture, Opus, jitter buffers, mixing, VAD
+  denchat-core    server, session, P2P transport (iroh), mods, control API, UI store
+  denchat-gui     egui shell: layouts, themes, panel registry
+  den         the binary (app, terminal client, serve, CLI tools)
 assets/            built-in themes and layouts (compiled in)
 mods/              example mods
 deploy/            systemd, Docker, compose
@@ -119,8 +200,10 @@ More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Status
 
 v0.1. Works: text channels with history, voice channels (Opus, SFU relay
-through the host), Tailscale identity, discovery, reconnect, mods, control
-API, themes/layouts with hot reload. Not yet: encryption beyond what
-WireGuard provides (rooms trust the tailnet), screen share, file transfer,
-mobile clients, handing a room to another member when its host leaves
-(see [docs/ROADMAP.md](docs/ROADMAP.md)).
+through the host), P2P transport with relay fallback, invite links,
+per-room keys, reconnect, mods, control API, themes/layouts with hot reload,
+saved rooms that any member can host (planned handoff, manual takeover,
+servers that claim their room back), a relay built into `serve`. Not yet:
+signed messages (today the host relays what members say, and a malicious
+host could alter it), screen share, file transfer, mobile clients, automatic
+takeover when a host vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).

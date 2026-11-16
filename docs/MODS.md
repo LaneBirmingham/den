@@ -1,19 +1,19 @@
 # Mods
 
-A mod is a folder containing `tailchat-mod.toml` and whatever it runs. Mods
-are separate processes in any language — tailchat never loads code into
+A mod is a folder containing `den-mod.toml` and whatever it runs. Mods
+are separate processes in any language — Den never loads code into
 itself — so a broken mod can't crash the app, and the same mod works with any
 frontend.
 
 ```sh
-tailchat mods new my.notes          # scaffold into <config>/mods/my.notes
-tailchat mods link ./path/to/mod    # use a mod from anywhere
-tailchat mods list                  # status, problems, where each came from
-tailchat mods disable my.notes      # or enable; running apps reload
+den mods new my.notes          # scaffold into <config>/mods/my.notes
+den mods link ./path/to/mod    # use a mod from anywhere
+den mods list                  # status, problems, where each came from
+den mods disable my.notes      # or enable; running apps reload
 ```
 
 Mods are found in `<config>/mods/*`, linked folders (`mods.toml`), and
-`$TAILCHAT_MODS_PATH` (path list; a mod folder or a folder of mods).
+`$DEN_MODS_PATH` (path list; a mod folder or a folder of mods).
 Turn the whole system off with `[modules] mods = false` in `config.toml`.
 
 ## Manifest
@@ -24,9 +24,9 @@ name = "Dice"
 version = "0.1.0"
 description = "…"
 author = "…"
-min_tailchat_version = "0.1.0"
+min_den_version = "0.1.0"
 platforms = ["macos", "linux", "windows"]   # omit = everywhere
-runs_on = ["client"]                         # client (app/terminal) and/or server (`tailchat serve`)
+runs_on = ["client"]                         # client (app/terminal) and/or server (`den serve`)
 
 [[commands]]                     # /roll 2d6
 name = "roll"
@@ -61,16 +61,16 @@ layouts = ["focus.toml"]         # appear in View → Layout
 
 | Variable | Set for | Value |
 | --- | --- | --- |
-| `TAILCHAT_BIN` | all | path to the running tailchat binary (`$TAILCHAT_BIN api …`) |
-| `TAILCHAT_API`, `TAILCHAT_API_TOKEN` | all | control API address and token of *this* instance |
-| `TAILCHAT_NODE` | all | `client` or `server` |
-| `TAILCHAT_MOD_ID`, `TAILCHAT_MOD_ROOT` | all | the mod's id and folder |
-| `TAILCHAT_MOD_STATE_DIR`, `TAILCHAT_MOD_CONFIG_DIR` | all | per-mod writable folders |
-| `TAILCHAT_VERSION` | all | tailchat version |
-| `TAILCHAT_COMMAND`, `TAILCHAT_ARGS`, `TAILCHAT_CONTEXT_JSON` | commands | command name, raw args, `{channel, nick, …}` |
-| `TAILCHAT_EVENT`, `TAILCHAT_EVENT_JSON` | hooks | event name and JSON (also on **stdin**) |
-| `TAILCHAT_CHANNEL` | commands, hooks | channel the command/event relates to |
-| `TAILCHAT_PANEL_ID` | panel commands | full panel id |
+| `DEN_BIN` | all | path to the running Den binary (`$DEN_BIN api …`) |
+| `DEN_API`, `DEN_API_TOKEN` | all | control API address and token of *this* instance |
+| `DEN_NODE` | all | `client` or `server` |
+| `DEN_MOD_ID`, `DEN_MOD_ROOT` | all | the mod's id and folder |
+| `DEN_MOD_STATE_DIR`, `DEN_MOD_CONFIG_DIR` | all | per-mod writable folders |
+| `DEN_VERSION` | all | Den version |
+| `DEN_COMMAND`, `DEN_ARGS`, `DEN_CONTEXT_JSON` | commands | command name, raw args, `{channel, nick, …}` |
+| `DEN_EVENT`, `DEN_EVENT_JSON` | hooks | event name and JSON (also on **stdin**) |
+| `DEN_CHANNEL` | commands, hooks | channel the command/event relates to |
+| `DEN_PANEL_ID` | panel commands | full panel id |
 
 ## Widgets
 
@@ -102,8 +102,12 @@ Buttons run one of the mod's commands (`command` + `args`) and/or emit a
 
 `connection.changed`, `message.created`, `member.joined`, `member.left`,
 `member.updated`, `voice.joined`, `voice.left`, `app.message`, `notice`,
-`ui.action`, `ui.changed`, `hosting.changed`, `command.run`.
-Payloads are what `tailchat api events.subscribe` prints — the easiest way to
+`ui.action`, `ui.changed`, `hosting.changed`, `room.moved` (`{to, term}`: the
+room changed host), `command.run`, `history.loaded` (`{channel, count}`:
+history arrived from the host or was merged from your copy on join).
+`connection.changed` with `state: "failed"` carries `refused: true` when the
+host turned you away (join rules, full room, version).
+Payloads are what `den api events.subscribe` prints — the easiest way to
 see them is to run that while you chat.
 
 ## Talking back
@@ -111,10 +115,10 @@ see them is to run that while you chat.
 Everything goes through the control API ([API.md](API.md)):
 
 ```sh
-$TAILCHAT_BIN api message.send text="hello"
-$TAILCHAT_BIN api ui.panel.set '{"panel":"my.mod/main","widgets":[{"type":"text","text":"hi"}]}'
-$TAILCHAT_BIN api events.subscribe '{"events":["message.*"]}'    # streams JSON lines
-$TAILCHAT_BIN api app.send '{"ns":"my.mod","data":{"move":"e4"}}' # custom room-wide messages
+$DEN_BIN api message.send text="hello"
+$DEN_BIN api ui.panel.set '{"panel":"my.mod/main","widgets":[{"type":"text","text":"hi"}]}'
+$DEN_BIN api events.subscribe '{"events":["message.*"]}'    # streams JSON lines
+$DEN_BIN api app.send '{"ns":"my.mod","data":{"move":"e4"}}' # custom room-wide messages
 ```
 
 `app.send` + an `app.message` hook is how mods build their own multiplayer
@@ -122,10 +126,10 @@ features (games, reactions, presence) without changing the server.
 
 ## Server-side mods
 
-`tailchat serve` loads mods with `runs_on = ["server"]`. Their `send` output
-is posted by the server, `TAILCHAT_NODE=server`, and the API they talk to is
+`den serve` loads mods with `runs_on = ["server"]`. Their `send` output
+is posted by the server, `DEN_NODE=server`, and the API they talk to is
 the server's ([API.md](API.md#server-methods)). Use them for bots, welcome
-messages, bridges, logging. The in-app host (`tailchat host`) doesn't run
+messages, bridges, logging. The in-app host (`den host`) doesn't run
 server mods — client mods on the host machine cover that case.
 
 ## Examples

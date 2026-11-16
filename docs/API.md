@@ -1,23 +1,23 @@
 # Control API
 
-Every running tailchat — the app, the terminal client, a headless server —
+Every running Den — the app, the terminal client, a headless server —
 listens on a random **loopback** port for newline-delimited JSON. It's how
-mods, scripts and agents drive tailchat, and it exposes the same surface the
+mods, scripts and agents drive Den, and it exposes the same surface the
 built-in UI uses.
 
 ## Using it
 
 ```sh
-tailchat api api.methods                 # what this instance supports
-tailchat api state.get
-tailchat api message.send text="hi"      # key=value params (values parsed as JSON when possible)
-tailchat api input.submit '{"text":"/roll 2d6"}'
-tailchat api events.subscribe            # stream events until ^C
-tailchat api --list                      # running instances
-tailchat api --server state.get          # pick the headless server when both run
+den api api.methods                 # what this instance supports
+den api state.get
+den api message.send text="hi"      # key=value params (values parsed as JSON when possible)
+den api input.submit '{"text":"/roll 2d6"}'
+den api events.subscribe            # stream events until ^C
+den api --list                      # running instances
+den api --server state.get          # pick the headless server when both run
 ```
 
-`tailchat api` finds an instance via `$TAILCHAT_API`/`$TAILCHAT_API_TOKEN`
+`den api` finds an instance via `$DEN_API`/`$DEN_API_TOKEN`
 (set for mods), else `<state>/instances/<pid>.json` (newest first; stale files
 are pruned). Instance files are `0600` and contain the token.
 
@@ -39,7 +39,7 @@ the connection streams events. The token is compared in constant time.
 
 | Method | Params | |
 | --- | --- | --- |
-| `state.get` | | connection, room, members, channels, voice, focus, discovery |
+| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away |
 | `messages.list` | `channel?, limit?` | recent messages (default: focused channel) |
 | `message.send` | `text, channel?` | send plain text |
 | `input.submit` | `text, channel?` | as if typed: slash commands work |
@@ -47,7 +47,7 @@ the connection streams events. The token is compared in constant time.
 | `nick.set` | `nick` | |
 | `voice.join` / `voice.leave` | `channel?` | |
 | `voice.mute` / `voice.deafen` | `muted` / `deafened` | |
-| `voice.stats` | | mic level, speakers, devices, codec |
+| `voice.stats` | | mic level, speakers, devices, codec, `tx_packets` / `rx_packets` (counted since voice started; `open` mode sends even when silent) |
 | `app.send` | `ns, data, channel?, to?` | relay a mod-defined payload |
 | `ui.panel.set` | `panel, widgets, title?` | create/update a panel ([widgets](MODS.md#widgets)) |
 | `ui.panel.clear` | `panel` | |
@@ -55,19 +55,25 @@ the connection streams events. The token is compared in constant time.
 | `ui.notify` | `text, level?` | toast (`info`, `warn`, `error`) |
 | `ui.action` | `panel, action, value?` | emit a `ui.action` event |
 | `ui.theme.set` / `ui.layout.set` | `name` | switch look; the app follows within a second |
-| `ui.screenshot` | `path?` | PNG of the app window (GUI only) |
+| `ui.screenshot` | `path?` | PNG of the app window (GUI only). Written on the next frame the window draws; with the display off or the window hidden the OS may not draw one, and the file never appears |
 | `mods.list` / `mods.reload` | | |
 | `mods.run` | `command, args?` | run a mod command |
-| `session.host` | `name?, bind?, port?, persist?` | host a room |
-| `session.join` | `addr` | |
-| `session.leave` | | |
-| `tailnet.status` / `tailnet.discover` | | peers / find rooms |
+| `session.host` | `name?, open?` | host a new room (invite-only unless `open`) |
+| `session.join` | `addr` | an invite link, or a room's address (uses the saved invite) |
+| `session.invite` | | `{invite}`: the invite link for the room you're in |
+| `session.leave` | | leave; if you host, another member takes the room over |
+| `session.handoff` | `to?` | while hosting: hand the room to member `to` (default: the best placed member who can host, by `reach`) |
+| `rooms.list` | | rooms saved on this machine |
+| `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
+| `rooms.forget` | `room` | delete a saved room and its history |
+| `net.status` | | this app's endpoint: `id`, `short`, `relay`, `direct` addresses, `reach` (`strict`/`unknown`/`nat`/`public`: how easily others could connect to it; see ARCHITECTURE.md) |
+| `rooms.discover` | | look for live hosts of your saved rooms; results in `state.get` → `discovery` (`addr` is the link to join; show `host` to people) |
 | `config.get` | | |
 | `api.methods`, `api.ping`, `events.subscribe` | | built in everywhere |
 
 ## Server methods
 
-`tailchat serve` exposes: `state.get`, `members.list`, `channels.list`,
+`den serve` exposes: `state.get` (includes the room save), `members.list`, `channels.list`,
 `messages.list`, `message.send` (as the server), `notice.send`,
 `member.kick {id, reason?}`, `app.send`, `motd.set`, `mods.list`,
 `mods.reload`.

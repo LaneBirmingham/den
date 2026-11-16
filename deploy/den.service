@@ -1,0 +1,28 @@
+# systemd unit for a persistent room on a Linux machine.
+#
+#   sudo useradd --system --home /var/lib/den --create-home den
+#   sudo install -m755 target/release/den /usr/local/bin/
+#   sudo cp deploy/den.service /etc/systemd/system/ && sudo systemctl enable --now den
+#   journalctl -u den | grep "join with"     # the invite link
+#
+# Open UDP 8245 (the room) and TCP 8245 (its relay) in the firewall, and
+# forward both on the router.
+[Unit]
+Description=Den room
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=den
+Environment=DEN_HOME=/var/lib/den
+ExecStart=/usr/local/bin/den serve --no-console
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/den
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""/roll for tailchat. Output of `roll` is posted to the channel (output = "send")."""
+"""/roll for Den. Output of `roll` is posted to the channel (output = "send")."""
 import json, os, random, re, subprocess, sys
 from pathlib import Path
 
-STATE = Path(os.environ.get("TAILCHAT_MOD_STATE_DIR", ".")) / "rolls.json"
+STATE = Path(os.environ.get("DEN_MOD_STATE_DIR", ".")) / "rolls.json"
 
 
 def load():
@@ -28,7 +28,7 @@ def widgets(rolls):
 
 def push_panel(rolls):
     """Refresh our panel right away instead of waiting for a poll."""
-    exe = os.environ.get("TAILCHAT_BIN")
+    exe = os.environ.get("DEN_BIN")
     if not exe:
         return
     params = {"panel": "example.dice/history", "widgets": widgets(rolls)}

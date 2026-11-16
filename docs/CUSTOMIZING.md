@@ -3,8 +3,8 @@
 Everything here is plain TOML in your config folder and hot-reloads on save.
 
 ```sh
-tailchat config path   # where things live
-tailchat config init   # write editable copies of the built-in themes/layouts
+den config path   # where things live
+den config init   # write editable copies of the built-in themes/layouts
 ```
 
 Pick themes and layouts from **View** in the app, or set them in
@@ -117,7 +117,7 @@ Settings go in `[panel."<id>"]`. Every panel also accepts `fill = true|false`.
 | `core.header` | room name, online count; click for invite, View menu, leave | `style = "pill"` (a card for a sidebar) \| `"bar"` (a strip for the top slot, default) |
 | `core.channels` | text channels with unread / mention badges, voice channels with who's in them, the voice card for your channel | `style = "list" \| "conversations"` (previews), `voice` (true), `orientation = "horizontal"` (a tab strip for top/bottom slots) |
 | `core.voice` | you: mic, deafen, hang up, settings (mode, meter, gate, volume, devices) | `show_devices`, `show_meter` |
-| `core.members` | people with status lines, Tailscale identity, voice state | `group_voice` (true: fold your voice channel into one row) |
+| `core.members` | people with status lines, room key (hover), voice state | `group_voice` (true: fold your voice channel into one row) |
 | `core.messages` | message list with day and "new" dividers | `style = "cozy" \| "bubbles" \| "compact" \| "irc"`, `row = ["time","author","text"]` (compact), `time_format`, `group`, `show_system`, `header` |
 | `core.stage` | voice channels as speaker tiles with join/leave | `tile_size` (84), `show_empty` (true) |
 | `core.composer` | input with history (↑), `/command` completion (Tab) and a send button | `placeholder` (`{channel}` is substituted), `style = "field" \| "pill"`, `send_button` (true) |
@@ -139,19 +139,19 @@ reload = "Ctrl+Shift+R"  # reload theme + layout
 ## Scripting the look
 
 ```sh
-tailchat api ui.theme.set name=rose-pine-dawn
-tailchat api ui.layout.set name=messenger
-tailchat api ui.screenshot path=/tmp/look.png
+den api ui.theme.set name=rose-pine-dawn
+den api ui.layout.set name=messenger
+den api ui.screenshot path=/tmp/look.png
 ```
 
-`TAILCHAT_SCREENSHOT=out.png TAILCHAT_SCREENSHOT_EXIT=1 tailchat` renders the
-lobby, saves a PNG and quits (`TAILCHAT_SCREENSHOT_DELAY_MS` to wait longer).
+`DEN_SCREENSHOT=out.png DEN_SCREENSHOT_EXIT=1 den` renders the
+lobby, saves a PNG and quits (`DEN_SCREENSHOT_DELAY_MS` to wait longer).
 
 ## Going further
 
 * Ship a theme or layout to friends as a mod: `themes = ["x.toml"]`,
   `layouts = ["y.toml"]` in a manifest (see `mods/sakura`).
-* Write a Rust panel: implement `tailchat_gui::Panel`, register it on a
-  `Registry`, call `tailchat_gui::run_with(session, registry)`.
+* Write a Rust panel: implement `denchat_gui::Panel`, register it on a
+  `Registry`, call `denchat_gui::run_with(session, registry)`.
 * Replace the GUI entirely: see "Writing another frontend" in
   [ARCHITECTURE.md](ARCHITECTURE.md).

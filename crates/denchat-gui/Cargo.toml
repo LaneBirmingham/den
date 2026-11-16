@@ -1,0 +1,22 @@
+[package]
+name = "denchat-gui"
+description = "Default egui shell for Den: data-driven layout, themes, and panel registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+voice = ["denchat-core/voice"]
+
+[dependencies]
+denchat-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+egui.workspace = true
+png = "0.18"
