@@ -95,8 +95,8 @@ impl Lobby {
             ui.horizontal(|ui| {
                 Face::new(&self.nick, 36.0, p.panel).presence(if cx.state.net.is_some() { p.ok } else { p.muted }).show(ui, &p);
                 ui.add_space(4.0);
-                ui.label(RichText::new("Nick").font(kit::font(14.0, W::Medium)));
-                let r = ui.add(TextEdit::singleline(&mut self.nick).desired_width(200.0));
+                let label = ui.label(RichText::new("Nick").font(kit::font(14.0, W::Medium)));
+                let r = ui.add(TextEdit::singleline(&mut self.nick).desired_width(200.0)).labelled_by(label.id);
                 if r.lost_focus() && self.nick.trim() != cx.state.nick {
                     let n = self.nick.clone();
                     cx.actions.session(move |s| s.set_nick(&n));
@@ -182,8 +182,8 @@ impl Lobby {
                 "Runs the room on this computer; friends join with its invite link. Everyone keeps a copy, so anyone can host it later.",
             ));
             egui::Grid::new("host-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Name");
-                ui.add(TextEdit::singleline(&mut self.room).desired_width(240.0));
+                let label = ui.label("Name");
+                ui.add(TextEdit::singleline(&mut self.room).desired_width(240.0)).labelled_by(label.id);
                 ui.end_row();
             });
             ui.checkbox(&mut self.open, "Open room (no invite key: anyone who finds the address can join)");

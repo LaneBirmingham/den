@@ -163,6 +163,8 @@ pub struct NetView {
     pub direct: Vec<String>,
     /// Relays are configured (otherwise direct connections only).
     pub relays_on: bool,
+    /// Direct (IP) paths are allowed; false with `[net] direct = false` / `DEN_NO_DIRECT=1`.
+    pub direct_enabled: bool,
     /// How easily others could connect to this app, as far as it can tell
     /// (a host's check can say more: see the member list).
     pub reach: Reach,
@@ -482,7 +484,7 @@ impl Session {
                 if net.endpoint().is_closed() {
                     break;
                 }
-                let view = net_view(&net.addr(), net.relays_on(), net.reach());
+                let view = net_view(&net.addr(), net.relays_on(), net.direct_enabled(), net.reach());
                 if inner.state.read().net.as_ref() != Some(&view) {
                     inner.update(|s| s.net = Some(view));
                 }
@@ -1467,7 +1469,7 @@ impl Inner {
             .await?
             .clone();
         if self.state.read().net.is_none() {
-            let view = net_view(&net.ready_addr().await, net.relays_on(), net.reach());
+            let view = net_view(&net.ready_addr().await, net.relays_on(), net.direct_enabled(), net.reach());
             self.update(|s| s.net = Some(view));
         }
         Ok(net)
@@ -2183,8 +2185,27 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("ui.action", "{panel, action, value?}", "Emit a ui.action event"),
     doc("ui.theme.set", "{name}", "Switch theme (desktop app follows within a second)"),
     doc("ui.layout.set", "{name}", "Switch layout (desktop app follows within a second)"),
-    doc("ui.screenshot", "{path?}", "Save a PNG of the app window; returns the path it will be written to"),
+    doc(
+        "ui.screenshot",
+        "{path?, panel?, target?, scale?, renderer?}",
+        "Save a PNG of the window, a panel or one widget; returns once written",
+    ),
     doc("ui.raise", "{}", "Bring the app window to the front"),
+    doc("ui.tree", "{panel?, all?, rects?, format?}", "Widgets on screen: @ref, role, text, panel (format=text: one line each)"),
+    doc(
+        "ui.click",
+        "{target | x,y, button?, double?, pointer?}",
+        "Click a widget (@ref, text, or role:text) or a point, like a real click",
+    ),
+    doc("ui.type", "{text, target?, enter?}", "Type into the focused text box (or `target`); enter=true presses Enter after"),
+    doc("ui.key", "{key}", "Press a key or chord: Enter, Escape, Tab, ctrl+a, cmd+k, F2"),
+    doc("ui.scroll", "{dy?, dx?, target?}", "Scroll by points (dy>0 scrolls down) over a widget or the pointer"),
+    doc("ui.hover", "{target | x,y}", "Move the pointer over a widget or point (tooltips, hover states)"),
+    doc("ui.wait", "{target, gone?, timeout_ms?}", "Wait until a widget matching `target` is on screen (or gone)"),
+    doc("ui.window", "{size?, pos?, minimized?, maximized?, fullscreen?, focus?, visible?}", "Window state; with params, change it first"),
+    doc("ui.scale", "{scale}", "UI zoom, like display scaling (1.0 = 100%)"),
+    doc("ui.clipboard", "{}", "Text the app last copied (copies go to $DEN_CLIPBOARD, not the system clipboard, when set)"),
+    doc("app.quit", "{}", "Close the app like its close button (hands the room on first)"),
     doc("mods.list", "{}", "Installed mods and their status"),
     doc("mods.run", "{command, args?}", "Run a mod slash command"),
     doc("mods.reload", "{}", "Rescan mods and restart their processes"),
@@ -2200,6 +2221,46 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("rooms.discover", "{}", "Look for live hosts of saved rooms (async; see state.get discovery)"),
     doc("config.get", "{}", "Current config.toml values"),
 ];
+
+/// `ui.*` calls answered by the graphical frontend (windowed or headless).
+const FRONTEND_METHODS: &[&str] =
+    &["ui.tree", "ui.click", "ui.type", "ui.key", "ui.scroll", "ui.hover", "ui.wait", "ui.window", "ui.screenshot", "ui.scale", "app.quit"];
+
+/// Forward a call to the frontend and wait for its answer.
+fn frontend_call(s: &Session, method: &str, mut p: Value) -> ApiFuture {
+    if !p.is_object() {
+        p = json!({});
+    }
+    if method == "ui.screenshot" && p["path"].as_str().is_none() {
+        p["path"] = json!(s.paths().state.join("screenshots").join(format!("{}.png", crate::now_ms())));
+    }
+    if method == "app.quit" && s.ui().frontend_kind().is_none() {
+        // Terminal client: close like Ctrl-C would, after answering.
+        let s = s.clone();
+        s.runtime().clone().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            s.close().await;
+            std::process::exit(0);
+        });
+        return ready(Ok(json!({"quitting": true})));
+    }
+    let wait_ms = match method {
+        // An hour at most, as the frontend allows.
+        "ui.wait" => p["timeout_ms"].as_u64().unwrap_or(10_000).min(3_600_000) + 3_000,
+        _ => 20_000,
+    };
+    let method = method.to_owned();
+    match s.ui().call_frontend(&method, p) {
+        Err(e) => ready(Err(e)),
+        Ok(rx) => Box::pin(async move {
+            match tokio::time::timeout(Duration::from_millis(wait_ms), rx).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(_)) => Err("the window closed".into()),
+                Err(_) => Err(format!("{method}: the app didn't answer within {} s (is it frozen?)", wait_ms / 1000)),
+            }
+        }),
+    }
+}
 
 fn ok<T: Serialize>(v: T) -> api::ApiResult {
     serde_json::to_value(v).map_err(|e| e.to_string())
@@ -2230,6 +2291,12 @@ impl ApiHandler for SessionApi {
             return ready(Err("session closed".into()));
         };
         let s = Session { inner };
+        if (FRONTEND_METHODS.contains(&method) || method == "ui.clipboard") && !s.config().modules.agent_control {
+            return ready(Err(format!("{method}: agent control is off in this app ([modules] agent_control = false in config.toml)")));
+        }
+        if FRONTEND_METHODS.contains(&method) {
+            return frontend_call(&s, method, p);
+        }
         let ch = param_str(&p, "channel");
         let res: api::ApiResult = match method {
             "state.get" => {
@@ -2239,6 +2306,8 @@ impl ApiHandler for SessionApi {
                 v["mods"] = json!(s.mods().active().map(|m| m.manifest.id.clone()).collect::<Vec<_>>());
                 v["panels"] = json!(s.ui().panel_ids().into_iter().map(|(id, _)| id).collect::<Vec<_>>());
                 v["is_host"] = json!(st.is_host());
+                v["frontend"] = json!(s.ui().frontend_kind());
+                v["agent_control"] = json!(s.config().modules.agent_control);
                 Ok(v)
             }
             "messages.list" => {
@@ -2320,15 +2389,7 @@ impl ApiHandler for SessionApi {
                 s.inner.changed();
                 json!({"layout": n})
             }),
-            "ui.screenshot" => {
-                let path = match p["path"].as_str() {
-                    Some(x) => std::path::PathBuf::from(x),
-                    None => s.paths().state.join("screenshots").join(format!("{}.png", crate::now_ms())),
-                };
-                s.ui().request_screenshot(path.clone());
-                s.inner.changed();
-                ok(json!({"path": path, "queued": true, "note": "written by the desktop app on its next frame; poll for the file"}))
-            }
+            "ui.clipboard" => ok(json!({"copied": s.ui().copied()})),
             "ui.raise" => {
                 s.ui().request_raise();
                 s.inner.changed();
@@ -2405,13 +2466,14 @@ struct Welcome<'a> {
     profiles: &'a [denchat_proto::Profile],
 }
 
-fn net_view(addr: &net::EndpointAddr, relays_on: bool, reach: Reach) -> NetView {
+fn net_view(addr: &net::EndpointAddr, relays_on: bool, direct_enabled: bool, reach: Reach) -> NetView {
     NetView {
         id: addr.id.to_z32(),
         short: addr.id.fmt_short().to_string(),
         relay: addr.relay_urls().next().map(crate::relay::without_token),
         direct: addr.ip_addrs().map(|a| a.to_string()).collect(),
         relays_on,
+        direct_enabled,
         reach,
     }
 }

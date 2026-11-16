@@ -311,6 +311,13 @@ async fn use_own_relay(net: &Net, relay: LocalRelay, cfg: &ServerConfig) -> anyh
         None => relay::discover_public_url(net, relay.addr.port(), Duration::from_secs(5)).await,
     };
     let Some(url) = url else {
+        if !net.direct_enabled() && cfg.net.effective_relays().is_empty() {
+            relay.shutdown().await;
+            anyhow::bail!(
+                "direct paths are off ([net] direct = false), and without a public address for the room's relay \
+                 nothing could reach this server: set [relay] url in server.toml (or pass --relay-url), or add [net] relays"
+            );
+        }
         tracing::warn!(
             "couldn't work out this machine's public address, so the room's relay is off; set [relay] url in server.toml \
              (e.g. \"http://box.example.com:{}\") to turn it on",

@@ -7,12 +7,14 @@
 //! terminal client can print them, a future web UI can map them to HTML.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use denchat_proto::NoticeLevel;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -103,26 +105,108 @@ pub struct Toast {
     pub ts: i64,
 }
 
+/// A control-API call only a graphical frontend can answer: the widget
+/// tree, injected input, the window, screenshots (`ui.tree`, `ui.click`, …).
+/// The frontend answers through `reply`.
+pub struct FrontendCall {
+    pub method: String,
+    pub params: Value,
+    pub reply: oneshot::Sender<Result<Value, String>>,
+}
+
+impl FrontendCall {
+    /// A call made from inside the app; await the receiver for the answer.
+    pub fn new(method: &str, params: Value) -> (FrontendCall, oneshot::Receiver<Result<Value, String>>) {
+        let (reply, rx) = oneshot::channel();
+        (FrontendCall { method: method.to_owned(), params, reply }, rx)
+    }
+
+    pub fn answer(self, result: Result<Value, String>) {
+        let _ = self.reply.send(result);
+    }
+
+    /// The caller stopped waiting for the answer.
+    pub fn abandoned(&self) -> bool {
+        self.reply.is_closed()
+    }
+}
+
+struct Frontend {
+    /// `window` or `headless`.
+    kind: String,
+    /// Wakes the frontend so it runs a frame (even with its window hidden).
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Text the app put on the clipboard, newest last.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Copied {
+    pub text: String,
+    pub ts: i64,
+}
+
 #[derive(Default)]
 pub struct UiStore {
     panels: RwLock<BTreeMap<String, PanelContent>>,
     toasts: RwLock<VecDeque<Toast>>,
     revision: AtomicU64,
     next_toast: AtomicU64,
-    screenshot: Mutex<Option<PathBuf>>,
     raise: AtomicBool,
+    frontend: RwLock<Option<Frontend>>,
+    calls: Mutex<Vec<FrontendCall>>,
+    copied: Mutex<Option<Copied>>,
 }
 
 impl UiStore {
-    /// Ask the graphical frontend (if any) to save a PNG of its window.
-    pub fn request_screenshot(&self, path: PathBuf) {
-        *self.screenshot.lock() = Some(path);
-        self.bump();
+    /// A graphical frontend registers itself so `ui.*` calls reach it.
+    /// `wake` must make it run a frame soon, from any thread.
+    pub fn attach_frontend(&self, kind: &str, wake: impl Fn() + Send + Sync + 'static) {
+        *self.frontend.write() = Some(Frontend { kind: kind.to_owned(), wake: Arc::new(wake) });
     }
 
-    /// Frontends call this each frame; returns a pending screenshot path once.
-    pub fn take_screenshot_request(&self) -> Option<PathBuf> {
-        self.screenshot.lock().take()
+    /// The frontend is going away: fail whatever it hasn't answered.
+    pub fn detach_frontend(&self) {
+        self.frontend.write().take();
+        for c in self.calls.lock().drain(..) {
+            c.answer(Err("the window closed".into()));
+        }
+    }
+
+    /// `window`, `headless`, or `None` (terminal client, server).
+    pub fn frontend_kind(&self) -> Option<String> {
+        self.frontend.read().as_ref().map(|f| f.kind.clone())
+    }
+
+    /// Queue a call for the frontend and wake it. Errors at once if there is none.
+    pub fn call_frontend(&self, method: &str, params: Value) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
+        let wake = match &*self.frontend.read() {
+            Some(f) => f.wake.clone(),
+            None => {
+                return Err(format!(
+                    "{method} needs the app's window: this instance has none (terminal client or server). \
+                     Start the app (`den`), or one in the background (`den sandbox start`)"
+                ));
+            }
+        };
+        let (call, rx) = FrontendCall::new(method, params);
+        self.calls.lock().push(call);
+        wake();
+        Ok(rx)
+    }
+
+    /// Frontends call this each frame.
+    pub fn take_frontend_calls(&self) -> Vec<FrontendCall> {
+        std::mem::take(&mut *self.calls.lock())
+    }
+
+    /// The frontend copied `text` to the clipboard (or to `$DEN_CLIPBOARD`).
+    pub fn set_copied(&self, text: String) {
+        *self.copied.lock() = Some(Copied { text, ts: crate::now_ms() });
+    }
+
+    /// What the app last copied, if anything.
+    pub fn copied(&self) -> Option<Copied> {
+        self.copied.lock().clone()
     }
 
     /// Ask the graphical frontend (if any) to bring its window to the front.
@@ -244,6 +328,27 @@ mod tests {
         assert_eq!(wrapped, vec![Widget::Separator]);
         let text = parse_widgets("line one\nline two\n");
         assert_eq!(text.len(), 2);
+    }
+
+    #[test]
+    fn frontend_calls_need_a_frontend() {
+        let s = UiStore::default();
+        assert!(s.call_frontend("ui.tree", Value::Null).is_err());
+        let woken = Arc::new(AtomicU64::new(0));
+        let w = woken.clone();
+        s.attach_frontend("headless", move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut rx = s.call_frontend("ui.tree", Value::Null).unwrap();
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
+        let calls = s.take_frontend_calls();
+        assert_eq!(calls.len(), 1);
+        calls.into_iter().for_each(|c| c.answer(Ok(Value::Bool(true))));
+        assert_eq!(rx.try_recv().unwrap(), Ok(Value::Bool(true)));
+        let mut pending = s.call_frontend("ui.tree", Value::Null).unwrap();
+        s.detach_frontend();
+        assert!(pending.try_recv().unwrap().is_err());
+        assert_eq!(s.frontend_kind(), None);
     }
 
     #[test]

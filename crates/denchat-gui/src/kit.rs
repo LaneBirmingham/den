@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, LazyLock};
 
+use egui::accesskit::Role;
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Galley, Margin, Painter, Pos2, Rect, Response, Sense, Shadow, Stroke, Ui,
@@ -191,6 +192,23 @@ pub fn icon(painter: &Painter, c: Pos2, glyph: &str, size: f32, color: Color32) 
     painter.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(size), color);
 }
 
+// ----- naming ----------------------------------------------------------------
+
+/// Give a hand-painted widget a role and a name, so screen readers and
+/// `den ui tree` / `den ui click` see it like a stock egui widget.
+pub fn name(resp: &Response, role: Role, label: impl Into<String>) {
+    let label = label.into();
+    let enabled = resp.enabled();
+    resp.widget_info(|| egui::WidgetInfo::labeled(role, enabled, &label));
+}
+
+/// [`name`] for something that can be the current one (a channel row).
+pub fn name_selected(resp: &Response, role: Role, selected: bool, label: impl Into<String>) {
+    let label = label.into();
+    let enabled = resp.enabled();
+    resp.widget_info(|| egui::WidgetInfo::selected(role, enabled, selected, &label));
+}
+
 // ----- controls --------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -209,6 +227,7 @@ pub enum Tone {
 pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, tone: Tone, size: f32, p: &Palette) -> Response {
     let (_, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     paint_icon_button(ui, &resp, glyph, tone, p);
+    name_icon_button(&resp, "icon", tip, tone);
     if !tip.is_empty() { resp.on_hover_text(tip) } else { resp }
 }
 
@@ -216,7 +235,13 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, tone: Tone, size: f32, p
 pub fn icon_button_at(ui: &mut Ui, rect: Rect, salt: &str, glyph: &str, tip: &str, tone: Tone, p: &Palette) -> Response {
     let resp = ui.interact(rect, ui.scope_id().with(salt), Sense::click());
     paint_icon_button(ui, &resp, glyph, tone, p);
+    name_icon_button(&resp, salt, tip, tone);
     if !tip.is_empty() { resp.on_hover_text(tip) } else { resp }
+}
+
+/// The tooltip is the name (it says what a click does: `Mute`, `Unmute`).
+fn name_icon_button(resp: &Response, fallback: &str, tip: &str, _tone: Tone) {
+    name(resp, Role::Button, if tip.is_empty() { fallback } else { tip });
 }
 
 fn paint_icon_button(ui: &Ui, resp: &Response, glyph: &str, tone: Tone, p: &Palette) {
@@ -240,6 +265,7 @@ pub fn pill_button(ui: &mut Ui, text: &str, p: &Palette) -> Response {
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     ui.painter().rect_filled(rect, CornerRadius::same(12), mix(p.surface, p.surface_hover, t));
     put(ui.painter(), &g, rect.left() + 10.0, rect.center().y, p.text);
+    name(&resp, Role::Button, text);
     resp
 }
 
@@ -253,6 +279,7 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, p: &Palette) -> Re
     let bg = if enabled { mix(p.accent, p.text, 0.12 * t) } else { p.surface };
     ui.painter().rect_filled(rect, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), bg);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+    resp.widget_info(|| egui::WidgetInfo::labeled(Role::Button, enabled, text));
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
 }
 
@@ -273,6 +300,7 @@ pub fn section(ui: &mut Ui, text: &str, p: &Palette) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
     let g = line(ui, text, font(12.5, W::Semibold), p.muted, w - 8.0);
     put(ui.painter(), &g, rect.left() + 8.0, rect.center().y, p.muted);
+    name(&resp, Role::Heading, text);
     resp
 }
 
@@ -358,7 +386,8 @@ pub fn local_day(ts: i64) -> Option<chrono::NaiveDate> {
 pub fn day_divider(ui: &mut Ui, text: &str, p: &Palette) {
     ui.add_space(8.0);
     let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+    name(&resp, Role::Label, text);
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(12.0, W::Semibold), p.muted));
     let pill = Rect::from_center_size(rect.center(), vec2(g.size().x + 24.0, 22.0));
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.line));
@@ -370,7 +399,8 @@ pub fn day_divider(ui: &mut Ui, text: &str, p: &Palette) {
 pub fn new_divider(ui: &mut Ui, label: &str, centred: bool, p: &Palette) {
     ui.add_space(10.0);
     let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
+    name(&resp, Role::Label, label);
     let y = rect.center().y;
     let stroke = Stroke::new(1.0, alpha(p.danger, 0.75));
     if centred {

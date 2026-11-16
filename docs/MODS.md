@@ -6,7 +6,7 @@ itself — so a broken mod can't crash the app, and the same mod works with any
 frontend.
 
 ```sh
-den mods new my.notes          # scaffold into <config>/mods/my.notes
+den mods new --id my.notes     # scaffold into <config>/mods/my.notes
 den mods link ./path/to/mod    # use a mod from anywhere
 den mods list                  # status, problems, where each came from
 den mods disable my.notes      # or enable; running apps reload

@@ -39,6 +39,9 @@
 //!   a recycled buffer on input, and mix/resample/convert on output.
 //! * [`VoiceEngine::receive`] decodes on the caller's thread, so decoding never runs in
 //!   the output callback.
+//! * **test device threads** (`den-audio-test`) stand in for the cpal callbacks when a
+//!   device name starts with `test:` ([`testdev`]): a tone, silence or a WAV file in,
+//!   nothing or a WAV recording out, at real-time pace, with no audio hardware needed.
 
 pub mod codec;
 mod device;
@@ -46,6 +49,7 @@ mod engine;
 pub mod gate;
 pub mod mixer;
 pub mod resample;
+pub mod testdev;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +60,7 @@ pub use denchat_proto::voice::{Codec, FRAME_SAMPLES, SAMPLE_RATE};
 pub use codec::supported_codecs;
 pub use device::{DeviceList, list_devices};
 pub use engine::VoiceEngine;
+pub use testdev::{TEST_INPUTS, TEST_OUTPUTS, is_test_device};
 
 /// How the transmit gate decides when to send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -74,8 +79,11 @@ pub enum TxMode {
 pub struct VoiceSettings {
     /// Input device name as reported by [`list_devices`]; `None` = system default.
     /// A name that no longer exists falls back to the default (noted in `last_error`).
+    /// `test:silence`, `test:sine:<hz>` or `test:file:<path.wav>` is a virtual device
+    /// ([`testdev`]).
     pub input_device: Option<String>,
     /// Output device name as reported by [`list_devices`]; `None` = system default.
+    /// `test:null` or `test:capture:<path.wav>` is a virtual device ([`testdev`]).
     pub output_device: Option<String>,
     pub mode: TxMode,
     /// RMS gate threshold in 0..1 for [`TxMode::VoiceActivity`].

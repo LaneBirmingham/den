@@ -72,12 +72,13 @@ fn pill(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     painter.text(tile.center(), Align2::CENTER_CENTER, kit::initial(&name), kit::font(17.0, W::Semibold), p.accent_text);
     let x = tile.right() + 10.0;
     let text_w = rect.right() - 34.0 - x;
-    let g = kit::line(ui, name, kit::font(15.0, W::Semibold), p.text, text_w);
+    let g = kit::line(ui, name.clone(), kit::font(15.0, W::Semibold), p.text, text_w);
     kit::put(painter, &g, x, rect.center().y - 9.0, p.text);
     painter.circle_filled(pos2(x + 3.5, rect.center().y + 10.0), 3.5, dot);
-    let g = kit::line(ui, line, kit::font(12.0, W::Regular), p.muted, text_w - 12.0);
+    let g = kit::line(ui, line.clone(), kit::font(12.0, W::Regular), p.muted, text_w - 12.0);
     kit::put(painter, &g, x + 12.0, rect.center().y + 10.0, p.muted);
     kit::icon(painter, pos2(rect.right() - 18.0, rect.center().y), icons::CARET_DOWN, 16.0, p.muted);
+    kit::name(&resp, egui::accesskit::Role::Button, format!("Room menu: {name} · {line}"));
     room_menu(&resp, cx);
 }
 

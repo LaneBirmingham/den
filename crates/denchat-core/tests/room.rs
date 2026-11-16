@@ -254,6 +254,30 @@ async fn control_api_drives_a_session() {
     srv.shutdown();
 }
 
+/// `[modules] agent_control = false`: the calls that see and drive the app
+/// are refused, the rest of the API keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_control_can_be_switched_off() {
+    let home = tmp("agentoff");
+    let mut config =
+        AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    config.modules.agent_control = false;
+    let alice = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+    // As if a window were attached: the refusal mustn't depend on there being none.
+    alice.ui().attach_frontend("window", || {});
+    let env: std::collections::HashMap<_, _> = alice.api_env().into_iter().collect();
+    let mut api = ApiClient::connect(&env["DEN_API"], &env["DEN_API_TOKEN"]).await.unwrap();
+    for method in ["ui.tree", "ui.click", "ui.screenshot", "ui.window", "ui.clipboard", "app.quit"] {
+        let err = api.call(method, json!({"target": "Send"})).await.unwrap_err().to_string();
+        assert!(err.contains("agent control is off"), "{method}: {err}");
+    }
+    assert!(alice.ui().take_frontend_calls().is_empty(), "nothing reached the frontend");
+    let state = api.call("state.get", json!({})).await.unwrap();
+    assert_eq!(state["agent_control"], false);
+    api.call("ui.panel.set", json!({"panel": "agent/notes", "title": "Notes", "widgets": []})).await.unwrap();
+    alice.close().await;
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mods_commands_and_hooks() {
@@ -911,4 +935,130 @@ async fn handoff_prefers_members_others_can_reach() {
     assert_eq!(ann.addr.as_deref(), Some(real.as_str()));
     bob.shutdown();
     srv.shutdown();
+}
+
+/// Voice end to end with the built-in test devices: alice's app sends a tone, bob's app
+/// records what it would play. No audio hardware is touched.
+#[cfg(feature = "voice")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_between_two_sessions_on_test_devices() {
+    use denchat_core::audio::testdev::read_wav;
+    use denchat_core::config::VoiceConfig;
+
+    async fn voice_session(name: &str, home: &std::path::Path, input: &str, output: &str) -> Session {
+        let voice = VoiceConfig {
+            input_device: Some(input.into()),
+            output_device: Some(output.into()),
+            mode: "open".into(),
+            ..VoiceConfig::default()
+        };
+        let config = AppConfig {
+            nick: Some(name.into()),
+            bind: "localhost".into(),
+            port: 0,
+            net: NetConfig::direct_only(),
+            voice,
+            ..AppConfig::default()
+        };
+        Session::start(SessionOptions { paths: Paths::under(home), config, client_name: "test".into() }).await.unwrap()
+    }
+
+    let home = tmp("voice-devices");
+    let capture = home.join("bob-hears.wav");
+    let srv = start_server(None).await;
+    let addr = link(&srv).await;
+    let alice = voice_session("alice", &home.join("a"), "test:sine:440", "test:null").await;
+    let bob = voice_session("bob", &home.join("b"), "test:silence", &format!("test:capture:{}", capture.display())).await;
+    alice.join(&addr);
+    bob.join(&addr);
+    wait_for("both connected", || alice.state().conn.is_connected() && bob.state().conn.is_connected()).await;
+    alice.voice_join(Some("lounge".into()));
+    bob.voice_join(Some("lounge".into()));
+
+    wait_for("bob hears alice", || {
+        bob.voice_stats().is_some_and(|v| v.rx_packets >= 50 && v.speakers.iter().any(|s| s.speaking && s.level > 0.1))
+    })
+    .await;
+    let a = alice.voice_stats().unwrap();
+    assert_eq!(a.input_device.as_deref(), Some("test:sine:440"));
+    assert!(a.tx_packets >= 50 && a.input_level > 0.15, "{a:?}");
+    let b = bob.voice_stats().unwrap();
+    assert!(b.input_level < 1e-3, "silence in: {b:?}");
+
+    // The recording is readable while voice runs, and holds the tone.
+    wait_for("tone recorded", || {
+        read_wav(&capture).is_ok_and(|w| {
+            let tail = &w.samples[w.samples.len().saturating_sub(9600)..];
+            tail.len() == 9600 && (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt() > 0.1
+        })
+    })
+    .await;
+
+    alice.voice_leave();
+    bob.voice_leave();
+    alice.shutdown();
+    bob.shutdown();
+    srv.shutdown();
+}
+
+/// `[net] direct = false` (or `DEN_NO_DIRECT`): a relay-only endpoint opens
+/// no UDP sockets, so its links go through the relay whatever the other side
+/// does. One side switched off is enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_only_links_go_through_the_relay() {
+    let home = tmp("relay-only");
+    let relay = denchat_core::relay::LocalRelay::start(Some("127.0.0.1".parse().unwrap()), 0, "relay-only-test".into()).await.unwrap();
+    let url = relay.local_url.to_string();
+    let start = |nick: &str, direct: bool| {
+        let config = AppConfig {
+            nick: Some(nick.into()),
+            bind: "localhost".into(),
+            // Only the loopback relay: never the public ones.
+            net: NetConfig { direct, port_mapping: false, ..NetConfig::relays([url.clone()]) },
+            ..AppConfig::default()
+        };
+        Session::start(SessionOptions { paths: Paths::under(&home.join(nick)), config, client_name: "test".into() })
+    };
+    let routed = |s: &Session| s.state().conn.is_connected() && s.state().latency_ms.is_some();
+
+    // Alice hosts relay-only: her invite carries no address, and even her own
+    // app reaches the room through the relay.
+    let alice = start("alice", false).await.unwrap();
+    let invite = host(&alice, "relayed").await;
+    assert_eq!(Link::parse(&invite).unwrap().addr.ip_addrs().count(), 0, "no direct address advertised: {invite}");
+    assert!(alice.state().net.as_ref().is_some_and(|n| n.direct.is_empty() && n.reach == Reach::Strict));
+    // Bob has direct paths on, but nothing to take them to.
+    let bob = start("bob", true).await.unwrap();
+    bob.join(&invite);
+    wait_for("bob routed", || routed(&bob)).await;
+    assert_eq!(bob.state().via, Some(net::Via::Relay));
+    wait_for("alice routed", || routed(&alice)).await;
+    assert_eq!(alice.state().via, Some(net::Via::Relay));
+    alice.submit(None, "over the relay");
+    wait_for("bob gets it", || has_text(&bob, "general", "over the relay")).await;
+
+    // The other way round: Carol, relay-only, joins a host that has direct
+    // paths (and a loopback address in its link).
+    let dave = start("dave", true).await.unwrap();
+    let direct_invite = host(&dave, "direct").await;
+    assert!(Link::parse(&direct_invite).unwrap().addr.ip_addrs().count() > 0, "{direct_invite}");
+    let carol = start("carol", false).await.unwrap();
+    carol.join(&direct_invite);
+    wait_for("carol routed", || routed(&carol)).await;
+    assert_eq!(carol.state().via, Some(net::Via::Relay));
+    carol.submit(None, "relayed in");
+    wait_for("dave gets it", || has_text(&dave, "general", "relayed in")).await;
+
+    // Relay-only with no relay can't work, and says so.
+    let lonely = AppConfig { net: NetConfig { direct: false, ..NetConfig::direct_only() }, ..AppConfig::default() };
+    let s = Session::start(SessionOptions { paths: Paths::under(&home.join("lonely")), config: lonely, client_name: "test".into() })
+        .await
+        .unwrap();
+    s.host(HostOptions { name: "nope".into(), open: false });
+    wait_for("host fails", || matches!(&s.state().conn, ConnState::Failed { error, .. } if error.contains("no relay"))).await;
+    s.shutdown();
+    for s in [alice, bob, carol, dave] {
+        s.shutdown();
+    }
+    relay.shutdown().await;
 }

@@ -330,6 +330,11 @@ struct Route {
 struct NetInner {
     ep: Endpoint,
     relays: bool,
+    /// The relays in use, for the loopback endpoint of a relay-only endpoint.
+    relay_mode: RelayMode,
+    /// Direct (IP) paths are on; off, the endpoint has no UDP sockets and
+    /// reaches (and is reached) only through relays.
+    direct: bool,
     /// Relay URLs to tell peers instead of the endpoint's own (a server
     /// whose home relay is its own, reached locally at another URL).
     advertise: Mutex<Option<Vec<RelayUrl>>>,
@@ -412,6 +417,98 @@ impl NetFacts {
         let v6 = self.udp_v6 && !self.varies_v6;
         if v4 || v6 { Reach::Nat } else { Reach::Strict }
     }
+}
+
+/// What an endpoint's network report found (see [`Net::report`]).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReportView {
+    /// UDP to the relays' address discovery worked, over IPv4 / IPv6.
+    pub udp_v4: bool,
+    pub udp_v6: bool,
+    /// This machine's address as the internet sees it.
+    pub global_v4: Option<String>,
+    pub global_v6: Option<String>,
+    /// The NAT gives each destination its own port (hole-punching rarely works).
+    pub varies_v4: Option<bool>,
+    pub varies_v6: Option<bool>,
+    pub captive_portal: Option<bool>,
+    /// Best measured latency to each relay (URL without its token), in ms.
+    pub relay_latency_ms: Vec<(String, u64)>,
+}
+
+/// A home relay's connection (see [`Net::relay_health`]).
+#[derive(Clone, Debug, Serialize)]
+pub struct RelayHealth {
+    /// Without its token.
+    pub url: String,
+    pub connected: bool,
+    pub error: Option<String>,
+    /// The relay refused us (usually a wrong or missing token).
+    pub auth_denied: Option<String>,
+}
+
+/// What the router said about port mapping (see [`check_port_mapping`]).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PortMapCheck {
+    /// Protocols the router answers: `upnp`, `pcp`, `nat-pmp`.
+    pub offered: Vec<&'static str>,
+    /// The public address the router forwarded to us, if it granted one.
+    pub mapped: Option<String>,
+    pub error: Option<String>,
+}
+
+/// How long a TCP connection to `url`'s host and port takes (relays speak
+/// HTTP(S) over TCP), or why it failed. Says nothing about its token.
+pub async fn tcp_rtt(url: &RelayUrl, timeout: Duration) -> Result<Duration, String> {
+    let host = url.host_str().ok_or("no host")?.trim_end_matches('.');
+    // An IPv6 literal comes bracketed (`[::1]`); connect wants it bare.
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host).to_owned();
+    let port = url.port_or_known_default().ok_or("no port")?;
+    let start = tokio::time::Instant::now();
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host.as_str(), port))).await {
+        Ok(Ok(_)) => Ok(start.elapsed()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("no answer in {}s", timeout.as_secs())),
+    }
+}
+
+/// Ask the router which port mapping protocols it offers and, if any, for
+/// a mapping of UDP `local_port` (waiting up to `wait`), the way the app's
+/// endpoint does on start. The mapping is released before returning.
+pub async fn check_port_mapping(local_port: u16, wait: Duration) -> PortMapCheck {
+    let client = portmapper::Client::new(portmapper::Config::default());
+    let mut out = PortMapCheck::default();
+    match tokio::time::timeout(wait, client.probe()).await {
+        Ok(Ok(Ok(p))) => {
+            out.offered =
+                [(p.upnp, "upnp"), (p.pcp, "pcp"), (p.nat_pmp, "nat-pmp")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect()
+        }
+        Ok(Ok(Err(e))) => out.error = Some(e.to_string()),
+        Ok(Err(_)) => out.error = Some("port mapper stopped".into()),
+        Err(_) => out.error = Some("the router didn't answer".into()),
+    }
+    let Some(port) = std::num::NonZeroU16::new(local_port).filter(|_| !out.offered.is_empty()) else { return out };
+    let mut external = client.watch_external_address();
+    client.update_local_port(port);
+    client.procure_mapping();
+    let deadline = tokio::time::Instant::now() + wait;
+    while out.mapped.is_none() {
+        if let Some(a) = *external.borrow_and_update() {
+            out.mapped = Some(a.to_string());
+            break;
+        }
+        match tokio::time::timeout_at(deadline, external.changed()).await {
+            Ok(Ok(())) => {}
+            _ => break,
+        }
+    }
+    if out.mapped.is_none() && out.error.is_none() {
+        out.error = Some("the router offers port mapping but granted none".into());
+    }
+    client.deactivate();
+    // Let the release reach the router before the client goes away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    out
 }
 
 /// Keep asking the router (every 5 minutes) whether it maps ports. Only
@@ -532,10 +629,19 @@ impl Net {
     pub async fn bind(key: SecretKey, bind: &str, port: u16, strict: bool, cfg: &NetConfig) -> anyhow::Result<Net> {
         let ip = bind_ip(bind)?;
         let (mode, relays) = relay_mode(cfg)?;
+        let direct = cfg.direct_enabled();
+        if !direct && !relays {
+            bail!("direct paths are off ([net] direct = false or DEN_NO_DIRECT) and no relay is configured: nothing could connect");
+        }
         let build = |port: u16| -> anyhow::Result<iroh::endpoint::Builder> {
             let mut b = Endpoint::builder(presets::Minimal).secret_key(key.clone()).alpns(vec![ALPN.to_vec()]).relay_mode(mode.clone());
-            if !cfg.port_mapping {
+            if !cfg.port_mapping || !direct {
                 b = b.portmapper_config(PortmapperConfig::Disabled);
+            }
+            if !direct {
+                // Relay-only: no UDP sockets at all, so no IP path can form
+                // whatever the peer does, and no address is advertised.
+                return Ok(b.clear_ip_transports());
             }
             match ip {
                 None if port == 0 => {}
@@ -551,7 +657,7 @@ impl Net {
         };
         let ep = match build(port)?.bind().await {
             Ok(ep) => ep,
-            Err(e) if !strict && port != 0 => {
+            Err(e) if !strict && port != 0 && direct => {
                 tracing::info!("UDP port {port} is taken ({e}); using a free one");
                 build(0)?.bind().await.context("starting the network endpoint")?
             }
@@ -560,6 +666,8 @@ impl Net {
         let inner = Arc::new(NetInner {
             ep: ep.clone(),
             relays,
+            relay_mode: mode,
+            direct,
             advertise: Mutex::new(None),
             ready: AtomicBool::new(false),
             routes: Mutex::new(Vec::new()),
@@ -568,14 +676,15 @@ impl Net {
             router_maps: AtomicBool::new(false),
         });
         tokio::spawn(accept_loop(Arc::downgrade(&inner), ep.clone()));
-        if cfg.port_mapping && !ep.bound_sockets().iter().all(|a| a.ip().is_loopback()) {
+        if direct && cfg.port_mapping && !ep.bound_sockets().iter().all(|a| a.ip().is_loopback()) {
             tokio::spawn(watch_router(Arc::downgrade(&inner)));
         }
         tracing::info!(
-            "network endpoint {} up on {:?} (relays {})",
+            "network endpoint {} up on {:?} (relays {}, direct {})",
             inner.ep.id().fmt_short(),
             inner.ep.bound_sockets(),
-            if relays { "on" } else { "off" }
+            if relays { "on" } else { "off" },
+            if direct { "on" } else { "off: relay only" }
         );
         Ok(Net { inner })
     }
@@ -591,6 +700,12 @@ impl Net {
     /// Relays are configured (otherwise direct connections only).
     pub fn relays_on(&self) -> bool {
         self.inner.relays
+    }
+
+    /// Direct (IP) paths are on. Off (`[net] direct = false`,
+    /// `DEN_NO_DIRECT`), every connection goes through a relay.
+    pub fn direct_enabled(&self) -> bool {
+        self.inner.direct
     }
 
     /// UDP sockets the endpoint listens on.
@@ -644,13 +759,22 @@ impl Net {
     /// endpoint's network report and this machine's addresses. Never `open`:
     /// that takes someone else connecting in.
     pub fn reach(&self) -> Reach {
+        if !self.inner.direct {
+            // Relay-only: nobody can connect straight in.
+            return Reach::Strict;
+        }
+        self.facts().reach()
+    }
+
+    /// What [`Net::reach`] is worked out from.
+    pub fn facts(&self) -> NetFacts {
         let loopback = self.bound().iter().all(|a| a.ip().is_loopback());
         let public = |v6| !loopback && primary_ip(v6).is_some_and(crate::relay::is_public);
         // The router forwards a port to us, and we know our public IPv4.
         let mapped = self.inner.router_maps.load(Ordering::Relaxed)
             && self.inner.ep.addr().ip_addrs().any(|a| a.is_ipv4() && crate::relay::is_public(a.ip()));
         let mut report = self.inner.ep.net_report();
-        let facts = match report.get() {
+        match report.get() {
             Some(r) => NetFacts {
                 measured: true,
                 udp_v4: r.udp_v4,
@@ -662,13 +786,88 @@ impl Net {
                 mapped,
             },
             None => NetFacts { public_v4: public(false), public_v6: public(true), mapped, ..NetFacts::default() },
-        };
-        facts.reach()
+        }
     }
 
     /// A link to this endpoint (no room).
     pub async fn link(&self) -> Link {
         Link::new(self.ready_addr().await)
+    }
+
+    /// The relays the endpoint itself is homed on (not the advertised ones),
+    /// waiting up to a few seconds for the first.
+    async fn home_relays_ready(&self) -> Vec<RelayUrl> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let urls: Vec<RelayUrl> = self.inner.ep.addr().relay_urls().cloned().collect();
+            if !urls.is_empty() || tokio::time::Instant::now() >= deadline {
+                return urls;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The latest network report, if one has run (it needs relays).
+    pub fn report(&self) -> Option<ReportView> {
+        let r = self.inner.ep.net_report().get()?;
+        let mut latency: Vec<(String, u64)> = Vec::new();
+        for (_, url, d) in r.relay_latency.iter() {
+            let url = crate::relay::without_token(url);
+            let ms = d.as_millis() as u64;
+            match latency.iter_mut().find(|(u, _)| *u == url) {
+                Some((_, best)) => *best = (*best).min(ms),
+                None => latency.push((url, ms)),
+            }
+        }
+        latency.sort();
+        Some(ReportView {
+            udp_v4: r.udp_v4,
+            udp_v6: r.udp_v6,
+            global_v4: r.global_v4.map(|a| a.to_string()),
+            global_v6: r.global_v6.map(|a| a.to_string()),
+            varies_v4: r.mapping_varies_by_dest_ipv4,
+            varies_v6: r.mapping_varies_by_dest_ipv6,
+            captive_portal: r.captive_portal,
+            relay_latency_ms: latency,
+        })
+    }
+
+    /// Wait up to `timeout` for the first network report.
+    pub async fn wait_report(&self, timeout: Duration) -> Option<ReportView> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(r) = self.report() {
+                return Some(r);
+            }
+            if !self.inner.relays || tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Every relay this endpoint may use, token included.
+    pub fn relay_urls(&self) -> Vec<RelayUrl> {
+        match &self.inner.relay_mode {
+            RelayMode::Custom(map) => map.urls(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How the endpoint's connections to its home relays are doing.
+    pub fn relay_health(&self) -> Vec<RelayHealth> {
+        self.inner
+            .ep
+            .home_relay_status()
+            .get()
+            .iter()
+            .map(|s| RelayHealth {
+                url: crate::relay::without_token(s.url()),
+                connected: s.is_connected(),
+                error: s.last_error().map(|e| e.to_string()),
+                auth_denied: s.auth_denied_reason().map(str::to_owned),
+            })
+            .collect()
     }
 
     /// Route connections for `room` to `tx` until the registration drops.
@@ -683,7 +882,27 @@ impl Net {
     pub async fn connect(&self, addr: EndpointAddr, timeout: Duration) -> anyhow::Result<Connection> {
         let who = addr.id.fmt_short().to_string();
         let fut = async {
-            if addr.id == self.id() {
+            if addr.id == self.id() && !self.inner.direct {
+                // Relay-only, ourselves included: dial our own home relay.
+                let lo = self
+                    .inner
+                    .loopback
+                    .get_or_try_init(|| async {
+                        Endpoint::builder(presets::Minimal)
+                            .relay_mode(self.inner.relay_mode.clone())
+                            .portmapper_config(PortmapperConfig::Disabled)
+                            .clear_ip_transports()
+                            .bind()
+                            .await
+                            .context("starting the loopback endpoint")
+                    })
+                    .await?;
+                let relays: Vec<TransportAddr> = self.home_relays_ready().await.into_iter().map(TransportAddr::Relay).collect();
+                if relays.is_empty() {
+                    bail!("direct paths are off and this endpoint has no relay yet");
+                }
+                Ok(lo.connect(EndpointAddr::from_parts(addr.id, relays), ALPN).await?)
+            } else if addr.id == self.id() {
                 let lo = self
                     .inner
                     .loopback

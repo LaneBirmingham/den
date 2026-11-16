@@ -107,11 +107,17 @@ pub struct Modules {
     pub discovery: bool,
     /// Built-in slash commands (`/nick`, `/voice`, …).
     pub slash_commands: bool,
+    /// Let agents and scripts see and drive the app through the control API:
+    /// the `ui.*` calls behind `den ui` (widget tree, click, type, keys,
+    /// scroll, hover, wait, screenshots, window, zoom, clipboard) and
+    /// `app.quit`. Off, those calls are refused; the rest of the API (mods,
+    /// `den status`, `den wait`) still works.
+    pub agent_control: bool,
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Modules { voice: true, mods: true, api: true, discovery: true, slash_commands: true }
+        Modules { voice: true, mods: true, api: true, discovery: true, slash_commands: true, agent_control: true }
     }
 }
 
@@ -209,15 +215,31 @@ pub struct NetConfig {
     /// to never open ports on the router (connections then hole-punch, or go
     /// through a relay).
     pub port_mapping: bool,
+    /// Use direct (IP) paths. `false` makes this endpoint relay-only: it
+    /// opens no UDP sockets, advertises no addresses and every connection
+    /// goes through a relay (one side being relay-only is enough), so a
+    /// relayed link can be tested on demand. Needs a relay. The
+    /// `DEN_NO_DIRECT=1` environment variable does the same.
+    pub direct: bool,
     /// Relays added by the program (a server's own relay), kept whatever
     /// `DEN_RELAYS` says.
     #[serde(skip)]
     pub extra_relays: Vec<String>,
+    /// `DEN_RELAYS` and `DEN_NO_DIRECT` apply. True for configs read from a
+    /// file; false for the ones built in code ([`NetConfig::direct_only`],
+    /// [`NetConfig::relays`]), so a test means what it says whatever the
+    /// shell running it has set.
+    #[serde(skip, default = "env_applies")]
+    pub env_overrides: bool,
+}
+
+fn env_applies() -> bool {
+    true
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig { relays: vec!["default".into()], port_mapping: true, extra_relays: Vec::new() }
+        NetConfig { relays: vec!["default".into()], port_mapping: true, direct: true, extra_relays: Vec::new(), env_overrides: true }
     }
 }
 
@@ -225,18 +247,27 @@ impl NetConfig {
     /// No relays and no port mapping: direct connections only, and nothing
     /// asked of the router (tests, LAN-only setups).
     pub fn direct_only() -> NetConfig {
-        NetConfig { relays: Vec::new(), port_mapping: false, ..NetConfig::default() }
+        NetConfig { relays: Vec::new(), port_mapping: false, env_overrides: false, ..NetConfig::default() }
     }
 
     /// Just these relays.
     pub fn relays(urls: impl IntoIterator<Item = String>) -> NetConfig {
-        NetConfig { relays: urls.into_iter().collect(), ..NetConfig::default() }
+        NetConfig { relays: urls.into_iter().collect(), env_overrides: false, ..NetConfig::default() }
+    }
+
+    /// Direct paths are on: `direct`, unless `DEN_NO_DIRECT` is set (to
+    /// anything but `0`, `false`, `no` or `off`).
+    pub fn direct_enabled(&self) -> bool {
+        let off = self.env_overrides
+            && std::env::var("DEN_NO_DIRECT")
+                .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"));
+        self.direct && !off
     }
 
     /// The relay list after applying `DEN_RELAYS`, plus `extra_relays`.
     pub fn effective_relays(&self) -> Vec<String> {
-        let mut v = match std::env::var("DEN_RELAYS") {
-            Ok(v) if !v.trim().is_empty() => match v.trim() {
+        let mut v = match std::env::var("DEN_RELAYS").ok().filter(|_| self.env_overrides) {
+            Some(v) if !v.trim().is_empty() => match v.trim() {
                 "none" | "off" => Vec::new(),
                 other => other.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
             },

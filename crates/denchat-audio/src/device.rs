@@ -17,6 +17,7 @@ use denchat_proto::voice::SAMPLE_RATE;
 
 use crate::engine::Shared;
 use crate::resample::PullResampler;
+use crate::testdev;
 
 /// How long a backend may take to build a stream (not honoured by every backend).
 const BUILD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,13 +75,39 @@ pub(crate) struct IoRequest {
 }
 
 /// Body of the io thread: open both streams, report, then hold them until told to stop.
+///
+/// `test:…` names open a virtual device ([`crate::testdev`]) instead: no real device (nor
+/// the audio host, if neither side needs one) is touched for that direction. With
+/// `DEN_TEST_AUDIO=1` (sandboxes) only those open: any other choice, the system default
+/// included, gets `test:silence` / `test:null`.
 pub(crate) fn run_io(req: IoRequest) {
-    let IoRequest { input_device, output_device, shared, capture_tx, recycle_rx, ready_tx, stop_rx } = req;
-    let host = cpal::default_host();
+    let IoRequest { mut input_device, mut output_device, shared, capture_tx, recycle_rx, ready_tx, stop_rx } = req;
+    let mut host = None;
     let mut notes = Vec::new();
+    if std::env::var("DEN_TEST_AUDIO").is_ok_and(|v| v.trim() == "1") {
+        only_test_devices(&mut input_device, &mut output_device, &mut notes);
+    }
 
-    let input = open_input(&host, input_device.as_deref(), &shared, capture_tx, recycle_rx, &mut notes);
-    let output = open_output(&host, output_device.as_deref(), &shared, &mut notes);
+    let input = match input_device.as_deref().and_then(|n| testdev::parse_input(n).map(|d| (n, d))) {
+        Some((name, dev)) => dev.and_then(|d| {
+            let cb = InputCallback { channels: 1, capture_tx, recycle_rx };
+            testdev::open_input(name, d, cb).map(|(info, r)| (info, Held::Test(r)))
+        }),
+        None => {
+            let host = host.get_or_insert_with(cpal::default_host);
+            open_input(host, input_device.as_deref(), &shared, capture_tx, recycle_rx, &mut notes).map(|(i, s)| (i, Held::Cpal(s)))
+        }
+    };
+    let output = match output_device.as_deref().and_then(|n| testdev::parse_output(n).map(|d| (n, d))) {
+        Some((name, dev)) => dev.and_then(|d| {
+            let cb = OutputCallback::new(1, SAMPLE_RATE, &shared);
+            testdev::open_output(name, d, cb).map(|(info, r)| (info, Held::Test(r)))
+        }),
+        None => {
+            let host = host.get_or_insert_with(cpal::default_host);
+            open_output(host, output_device.as_deref(), &shared, &mut notes).map(|(i, s)| (i, Held::Cpal(s)))
+        }
+    };
 
     let (input, input_stream) = split(input);
     let (output, output_stream) = split(output);
@@ -94,9 +121,28 @@ pub(crate) fn run_io(req: IoRequest) {
     drop(output_stream);
 }
 
-type Opening = Result<(StreamInfo, cpal::Stream), String>;
+/// `DEN_TEST_AUDIO=1`: anything but a test device (the system default included) becomes
+/// `test:silence` / `test:null`.
+fn only_test_devices(input: &mut Option<String>, output: &mut Option<String>, notes: &mut Vec<String>) {
+    for (dev, fallback, dir) in [(input, "test:silence", "input"), (output, "test:null", "output")] {
+        if !dev.as_deref().is_some_and(testdev::is_test_device) {
+            let wanted = dev.as_deref().map_or("the system default".to_owned(), |d| format!("\"{d}\""));
+            notes.push(format!("{dir}: {wanted} isn't a test device; using {fallback} (DEN_TEST_AUDIO=1)"));
+            *dev = Some(fallback.into());
+        }
+    }
+}
 
-fn split(r: Opening) -> (Result<StreamInfo, String>, Option<cpal::Stream>) {
+/// What the io thread holds open: a real stream, or a virtual test device's thread.
+/// Dropping it stops it.
+enum Held {
+    Cpal(#[expect(dead_code, reason = "held to keep the stream playing")] cpal::Stream),
+    Test(#[expect(dead_code, reason = "held to keep the device running")] testdev::Runner),
+}
+
+type Opening<S = cpal::Stream> = Result<(StreamInfo, S), String>;
+
+fn split(r: Opening<Held>) -> (Result<StreamInfo, String>, Option<Held>) {
     match r {
         Ok((info, stream)) => (Ok(info), Some(stream)),
         Err(e) => (Err(e), None),
@@ -152,14 +198,14 @@ macro_rules! build_for_format {
 // Input
 
 /// Downmixes each callback to mono and hands it to the encoder thread in a recycled buffer.
-struct InputCallback {
-    channels: usize,
-    capture_tx: Sender<Vec<f32>>,
-    recycle_rx: Receiver<Vec<f32>>,
+pub(crate) struct InputCallback {
+    pub channels: usize,
+    pub capture_tx: Sender<Vec<f32>>,
+    pub recycle_rx: Receiver<Vec<f32>>,
 }
 
 impl InputCallback {
-    fn push<T: Sample>(&mut self, data: &[T])
+    pub fn push<T: Sample>(&mut self, data: &[T])
     where
         f32: FromSample<T>,
     {
@@ -210,7 +256,7 @@ fn open_input(
 
 /// Pulls 48 kHz audio from the mixer, resamples to the device rate, applies volume and
 /// copies the mono signal to every device channel.
-struct OutputCallback {
+pub(crate) struct OutputCallback {
     channels: usize,
     shared: Arc<Shared>,
     pump: PullResampler,
@@ -218,7 +264,16 @@ struct OutputCallback {
 }
 
 impl OutputCallback {
-    fn fill<T: Sample + FromSample<f32>>(&mut self, data: &mut [T]) {
+    pub fn new(channels: u16, device_rate: u32, shared: &Arc<Shared>) -> Self {
+        Self {
+            channels: channels.max(1) as usize,
+            shared: shared.clone(),
+            pump: PullResampler::new(SAMPLE_RATE, device_rate),
+            mono: Vec::with_capacity(8192),
+        }
+    }
+
+    pub fn fill<T: Sample + FromSample<f32>>(&mut self, data: &mut [T]) {
         if self.shared.controls.deafened.load(Relaxed) {
             data.fill(T::EQUILIBRIUM);
             return;
@@ -243,12 +298,7 @@ fn open_output(host: &cpal::Host, wanted: Option<&str>, shared: &Arc<Shared>, no
     let format = supported.sample_format();
     let err_shared = shared.clone();
     let on_error = move |e| stream_error(&err_shared, "output", e);
-    let mut cb = OutputCallback {
-        channels: config.channels.max(1) as usize,
-        shared: shared.clone(),
-        pump: PullResampler::new(SAMPLE_RATE, config.sample_rate),
-        mono: Vec::with_capacity(8192),
-    };
+    let mut cb = OutputCallback::new(config.channels, config.sample_rate, shared);
 
     let stream = build_for_format!(format, name, |T| device.build_output_stream::<T, _, _>(
         config,
@@ -260,4 +310,25 @@ fn open_output(host: &cpal::Host, wanted: Option<&str>, shared: &Arc<Shared>, no
     stream.play().map_err(|e| format!("\"{name}\": {e}"))?;
 
     Ok((StreamInfo { name, sample_rate: config.sample_rate, channels: config.channels, format }, stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_only_keeps_real_devices_shut() {
+        let mut notes = Vec::new();
+        let (mut input, mut output) = (None, Some("MacBook Pro Speakers".to_owned()));
+        only_test_devices(&mut input, &mut output, &mut notes);
+        assert_eq!((input.as_deref(), output.as_deref()), (Some("test:silence"), Some("test:null")));
+        assert_eq!(notes.len(), 2);
+
+        let mut notes = Vec::new();
+        let (mut input, mut output) = (Some("test:sine:440".to_owned()), Some("Test:capture:/tmp/x.wav".to_owned()));
+        only_test_devices(&mut input, &mut output, &mut notes);
+        assert_eq!(input.as_deref(), Some("test:sine:440"));
+        assert_eq!(output.as_deref(), Some("Test:capture:/tmp/x.wav"));
+        assert!(notes.is_empty());
+    }
 }

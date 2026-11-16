@@ -269,8 +269,16 @@ same mod works in the GUI, a future TUI, or a web view.
 * `Catalog` finds themes/layouts: built-in < mods < user files.
 * Panels get a read-only `PanelCx` and queue intents on `Actions`; the shell
   applies them after the frame (no locks held while user code runs).
-* Hot reload polls watched files; `ui.theme.set` / `ui.layout.set` /
-  `ui.screenshot` make the shell scriptable.
+* Hot reload polls watched files; `ui.theme.set` / `ui.layout.set` make
+  the shell scriptable.
+* **Driving it** (`agent.rs`): an egui plugin that answers the `ui.*`
+  frontend calls core forwards to it (`UiStore::call_frontend`). It reads
+  the accesskit tree (each panel is a group tagged `panel:<id>`) to find
+  widgets. It injects input as egui events or accesskit actions, so there's
+  no OS input and no focus change. It keeps a CPU copy of the textures so
+  `soft.rs` can draw a screenshot of a hidden window. The same `DenApp` also
+  runs with no window at all (`headless.rs`, `DEN_WINDOW=headless`): plain
+  egui frames on a timer, and screenshots drawn on the CPU.
 
 ## Mods
 

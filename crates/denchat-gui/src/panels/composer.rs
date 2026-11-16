@@ -113,6 +113,7 @@ impl Panel for Composer {
                         let c = r.center();
                         ui.painter().circle_filled(c, btn / 2.0, bg);
                         kit::icon(ui.painter(), c, icons::ARROW_UP, 17.0, fg);
+                        b.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, ready, "Send"));
                         send_clicked = b.on_hover_text("Send (Enter)").clicked();
                     }
                     resp

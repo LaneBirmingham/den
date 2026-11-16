@@ -332,16 +332,30 @@ pub fn config(cmd: ConfigCmd, paths: &Paths) -> anyhow::Result<()> {
 pub fn devices() -> anyhow::Result<()> {
     #[cfg(feature = "voice")]
     {
-        let d = denchat_core::audio::list_devices()?;
+        use denchat_core::audio::{TEST_INPUTS, TEST_OUTPUTS};
+        // Test devices need no hardware, so list them even when the system has no audio.
+        let (d, problem) = match denchat_core::audio::list_devices() {
+            Ok(d) => (d, None),
+            Err(e) => (Default::default(), Some(e)),
+        };
         println!("inputs:");
         for i in &d.inputs {
             println!("  {}{}", i, if Some(i) == d.default_input.as_ref() { "  (default)" } else { "" });
+        }
+        for (name, what) in TEST_INPUTS {
+            println!("  {name}  ({what})");
         }
         println!("outputs:");
         for o in &d.outputs {
             println!("  {}{}", o, if Some(o) == d.default_output.as_ref() { "  (default)" } else { "" });
         }
+        for (name, what) in TEST_OUTPUTS {
+            println!("  {name}  ({what})");
+        }
         println!("codecs: {:?}", denchat_core::audio::supported_codecs());
+        if let Some(e) = problem {
+            println!("note: couldn't list the system's audio devices: {e:#}");
+        }
         Ok(())
     }
     #[cfg(not(feature = "voice"))]
