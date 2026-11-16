@@ -27,5 +27,5 @@ chrono.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Leave the console window Windows opens when the app is started from Explorer,
-# and let an already-running app take the foreground.
+# turn on colour in the console, and let an already-running app take the foreground.
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }

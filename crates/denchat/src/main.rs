@@ -194,7 +194,35 @@ fn init_logging(verbose: u8, quiet_default: bool) {
         _ => "debug",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("DEN_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(stderr_colors()).try_init();
+}
+
+/// Colour log lines only on a terminal that shows colour: not in a file or
+/// pipe (escape codes end up in the text), nor in a Windows console that
+/// won't turn on escape sequences. `NO_COLOR` turns colour off.
+fn stderr_colors() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
+        };
+        // SAFETY: plain console calls on this process's own stderr handle.
+        unsafe {
+            let h = GetStdHandle(STD_ERROR_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                // A terminal that isn't a console (mintty, MSYS): it speaks ANSI.
+                return true;
+            }
+            mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 pub fn load_config(paths: &Paths, nick: Option<String>) -> anyhow::Result<AppConfig> {
