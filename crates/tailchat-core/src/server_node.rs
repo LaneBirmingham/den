@@ -12,6 +12,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -24,7 +27,7 @@ use crate::events::{Event, names};
 use crate::mods::{ModHost, ModRuntime};
 use crate::paths::Paths;
 use crate::rooms::{self, RoomSave};
-use crate::server::{self, ServerEvent, ServerHandle, ServerMode, ServerOptions};
+use crate::server::{self, HandoffState, ServerEvent, ServerHandle, ServerMode, ServerOptions};
 use crate::tailscale::Tailscale;
 use crate::ui::UiStore;
 
@@ -63,25 +66,56 @@ impl ServerNode {
         let term = save.term.max(live.as_ref().map(|l| l.server.term).unwrap_or(0)) + 1;
         let port = cfg.port;
         save.apply_config(&cfg);
-        let server = server::start(ServerOptions {
-            config: cfg,
+        let options = || ServerOptions {
+            config: cfg.clone(),
             mode: ServerMode::Headless,
             bind,
             history_dir: Some(rooms::history_dir(&paths, &save.id)),
             tailscale: tailscale.clone(),
             room_id: save.id.clone(),
             term,
-        })
-        .await?;
+        };
+        let mut claimed_from = None;
+        let server = match server::start(options()).await {
+            Ok(s) => s,
+            Err(e) if addr_in_use(&e) => {
+                // Most likely an app on this machine hosts the room on our
+                // port. Claim it first: it sends everyone here and lets go of
+                // the port a few seconds later. Members retry until we're up.
+                let Some(live) = &live else {
+                    return Err(e).context(format!("port {port} is in use by something that isn't hosting this room"));
+                };
+                tracing::info!("port {port} is in use and {} hosts this room; claiming it before binding", live.addr);
+                let ours = rooms::share_addrs(bind, tailscale.as_ref()).await;
+                rooms::claim(&live.addr, port, &save.id, term, ours).await.with_context(|| {
+                    format!(
+                        "port {port} is in use and {} (hosting this room) didn't hand it over; hand the room off there first",
+                        live.addr
+                    )
+                })?;
+                claimed_from = Some(live.addr.clone());
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    match server::start(options()).await {
+                        Ok(s) => break s,
+                        Err(e) if addr_in_use(&e) && Instant::now() < deadline => continue,
+                        Err(e) => return Err(e).context(format!("{} handed the room over but kept port {port}", live.addr)),
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         let share = rooms::share_addrs(server.local_addr(), tailscale.as_ref()).await;
         save.term = term;
         save.addrs = share.clone();
         rooms::save(&paths, &save)?;
-        let mut claimed_from = None;
-        if let Some(live) = live {
+        if let Some(from) = &claimed_from {
+            tracing::info!("took over the room from {from}");
+        } else if let Some(live) = live {
             match rooms::claim(&live.addr, port, &save.id, term, share).await {
                 Ok(()) => {
-                    tracing::info!("took the room back from {}", live.addr);
+                    tracing::info!("took over the room from {}", live.addr);
                     claimed_from = Some(live.addr);
                 }
                 Err(e) => tracing::warn!("{} is hosting this room and didn't hand it over: {e:#}", live.addr),
@@ -102,6 +136,7 @@ impl ServerNode {
         });
 
         let mut rx = server.subscribe();
+        let (save_paths, room_id) = (paths.clone(), inner.save.id.clone());
         tokio::spawn(async move {
             loop {
                 let ev = match rx.recv().await {
@@ -119,7 +154,18 @@ impl ServerNode {
                     ServerEvent::App { from, ns, channel, data } => {
                         Event::new(names::APP_MESSAGE, json!({"from": from, "ns": ns, "channel": channel, "data": data}))
                     }
-                    ServerEvent::Moved { to, term } => Event::new(names::ROOM_MOVED, json!({"to": to, "term": term})),
+                    ServerEvent::Moved { to, term } => {
+                        // Remember where it went, so the next start finds it there and claims it back.
+                        if let Ok(mut s) = rooms::load(&save_paths, &room_id) {
+                            s.term = s.term.max(term);
+                            s.addrs = to.clone();
+                            s.updated = crate::now_ms();
+                            if let Err(e) = rooms::save(&save_paths, &s) {
+                                tracing::warn!("saving room: {e:#}");
+                            }
+                        }
+                        Event::new(names::ROOM_MOVED, json!({"to": to, "term": term}))
+                    }
                 };
                 let _ = events.send(e);
             }
@@ -185,11 +231,35 @@ impl ServerNode {
         self.mods().run_command(host, name, args, channel, json!({"node": "server"})).await
     }
 
+    /// Hand the room to a member whose app can host (waiting a few seconds at
+    /// most), then stop. Members aren't stranded, and the next start claims
+    /// the room back. Stops straight away if there's nobody to hand it to.
+    pub async fn close(&self) {
+        let srv = &self.inner.server;
+        match srv.hand_off(None, None) {
+            Ok(m) => {
+                tracing::info!("shutting down: handing the room to {}", m.nick);
+                match srv.wait_handoff(Duration::from_secs(6)).await {
+                    HandoffState::Moved { to, .. } => tracing::info!("handed the room to {}", to.first().map_or("?", |a| a.as_str())),
+                    other => tracing::warn!("handoff didn't finish ({other:?}); stopping anyway"),
+                }
+                // Let the handoff frames reach everyone.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            Err(e) => tracing::info!("shutting down: {e:#}"),
+        }
+        self.shutdown();
+    }
+
     pub fn shutdown(&self) {
         self.inner.mods.read().stop();
         self.inner.server.shutdown();
         self.inner.api.lock().take();
     }
+}
+
+fn addr_in_use(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse))
 }
 
 struct NodeHost {

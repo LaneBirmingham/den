@@ -13,10 +13,16 @@ pub fn clock(ts: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ts).map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default()
 }
 
+/// Messages of the focused channel printed when joining a room.
+const HISTORY_LINES: usize = 20;
+
 pub async fn run(session: Session) -> anyhow::Result<()> {
     let mut events = session.subscribe();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut history = HistoryPrint::default();
     println!("tailchat {} — type /help for commands, /quit to exit", tailchat_core::VERSION);
+    let signal = crate::serve::wait_for_signal();
+    tokio::pin!(signal);
     loop {
         tokio::select! {
             line = lines.next_line() => match line? {
@@ -25,15 +31,66 @@ pub async fn run(session: Session) -> anyhow::Result<()> {
                 None => break,
             },
             ev = events.recv() => match ev {
-                Ok(ev) => print_event(&session, &ev),
+                Ok(ev) => {
+                    history.on_event(&session, &ev);
+                    print_event(&session, &ev);
+                }
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut signal => {
+                tracing::info!("signal received; closing");
+                break;
+            }
         }
         let _ = std::io::stdout().flush();
     }
     Ok(())
+}
+
+/// Print recent history once per room, when it first arrives after joining.
+/// (Reconnects and handoffs keep the same room, so they don't repeat it.)
+#[derive(Default)]
+struct HistoryPrint {
+    printed_room: Option<String>,
+    pending: bool,
+}
+
+impl HistoryPrint {
+    fn on_event(&mut self, session: &Session, ev: &Event) {
+        match ev.event.as_str() {
+            "connection.changed" if ev.data["state"] == "connected" => {
+                let room = session.state().room_id().map(str::to_owned);
+                self.pending = room.is_some() && room != self.printed_room;
+            }
+            "history.loaded" if self.pending => {
+                let st = session.state();
+                if st.focus.as_deref() != ev.data["channel"].as_str() {
+                    return;
+                }
+                let msgs = st.messages(st.focus.as_deref().unwrap_or_default());
+                let recent: Vec<&ChatMessage> = msgs.iter().filter(|m| m.kind != MessageKind::System).collect();
+                let recent = &recent[recent.len().saturating_sub(HISTORY_LINES)..];
+                if !recent.is_empty() {
+                    println!("== last {} message(s) in #{}", recent.len(), recent[0].channel);
+                    for m in recent {
+                        print_message(m, "");
+                    }
+                }
+                self.printed_room = st.room_id().map(str::to_owned);
+                self.pending = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_message(m: &ChatMessage, chan: &str) {
+    match m.kind {
+        MessageKind::User => println!("[{}] {chan}<{}> {}", clock(m.ts), m.author, m.text),
+        MessageKind::Server => println!("[{}] {chan}** {}: {}", clock(m.ts), m.author, m.text),
+        MessageKind::System => println!("[{}] {chan}-- {}", clock(m.ts), m.text),
+    }
 }
 
 fn print_event(session: &Session, ev: &Event) {
@@ -43,11 +100,7 @@ fn print_event(session: &Session, ev: &Event) {
             let Ok(m) = serde_json::from_value::<ChatMessage>(d["message"].clone()) else { return };
             let focus = session.state().focus.clone();
             let chan = if focus.as_deref() == Some(m.channel.as_str()) { String::new() } else { format!("#{} ", m.channel) };
-            match m.kind {
-                MessageKind::User => println!("[{}] {chan}<{}> {}", clock(m.ts), m.author, m.text),
-                MessageKind::Server => println!("[{}] {chan}** {}: {}", clock(m.ts), m.author, m.text),
-                MessageKind::System => println!("[{}] {chan}-- {}", clock(m.ts), m.text),
-            }
+            print_message(&m, &chan);
         }
         "notice" => {
             for line in d["text"].as_str().unwrap_or_default().lines() {

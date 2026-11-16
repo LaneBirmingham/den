@@ -400,6 +400,9 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
 
     let identity = shared.identify(peer.ip()).await;
     if let Some(refusal) = shared.refusal(&identity) {
+        if let ServerMsg::Error { code, .. } = &refusal {
+            tracing::info!("refused {nick:?} from {peer} ({}): {code}", describe_identity(&identity));
+        }
         let _ = write_frame(&mut wr, &refusal).await;
         return;
     }
@@ -462,6 +465,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         }
     };
     let Some(member) = registered else {
+        tracing::info!("refused {nick:?} from {peer}: the room is full");
         let _ = write_frame(&mut wr, &reject("full", "room is full")).await;
         return;
     };
@@ -546,6 +550,7 @@ impl Shared {
     async fn claim(&self, ip: IpAddr, room: &str, term: u64, addrs: Vec<String>) -> ServerMsg {
         let identity = self.identify(ip).await;
         if let Some(refusal) = self.refusal(&identity) {
+            tracing::info!("refused a claim from {ip} ({})", describe_identity(&identity));
             return refusal;
         }
         let (id, current) = {
@@ -556,6 +561,7 @@ impl Shared {
             return reject("wrong_room", "this server hosts a different room");
         }
         if term <= current {
+            tracing::info!("refused a claim from {ip} at term {term}: this room is at term {current}");
             return reject("stale_term", format!("this room is already at term {current}"));
         }
         if addrs.is_empty() || addrs.len() > 8 {

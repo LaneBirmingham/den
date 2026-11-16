@@ -536,3 +536,221 @@ async fn server_takes_the_room_back() {
     assert!(err.to_string().contains("term"), "{err}");
     node.shutdown();
 }
+
+fn node_opts() -> NodeOptions {
+    NodeOptions { api: false, mods: false, tailscale_bin: Some("/nonexistent/tailscale".into()) }
+}
+
+fn local_base(port: u16) -> ServerConfig {
+    ServerConfig { bind: "localhost".into(), port, rate_limit: 100, ..ServerConfig::default() }
+}
+
+/// A port that is free for both TCP and UDP right now.
+fn free_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// BUG-A: messages a member uploads because the host lacked them show up in
+/// that member's own view, not only on disk and on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploaded_messages_show_for_the_uploader() {
+    let home = tmp("upload-view");
+    let srv = start_room(None, "room-up", 1).await;
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    alice.join(srv.local_addr().to_string());
+    bob.join(srv.local_addr().to_string());
+    wait_for("both in", || alice.state().members.len() == 2).await;
+    alice.submit(None, "everyone saw this");
+    wait_for("bob has it", || has_text(&bob, "general", "everyone saw this")).await;
+    bob.leave();
+    // Only alice is around for these.
+    for i in 1..=3 {
+        alice.submit(None, &format!("solo {i}"));
+    }
+    wait_for("alice's copy", || {
+        let f = rooms::history_dir(&Paths::under(&home.join("a")), "room-up").join("general.jsonl");
+        std::fs::read_to_string(f).is_ok_and(|t| t.contains("solo 3"))
+    })
+    .await;
+    alice.leave();
+    srv.shutdown();
+
+    // Bob hosts from his older copy; alice comes back to it.
+    bob.open_room("room-up");
+    wait_for("bob hosts", || bob.state().hosting.is_some() && on_term(&bob, 2)).await;
+    alice.join(bob.state().hosting.as_ref().unwrap().share[0].clone());
+    wait_for("bob got alice's messages", || has_text(&bob, "general", "solo 3")).await;
+    wait_for("alice sees her own uploaded messages", || (1..=3).all(|i| has_text(&alice, "general", &format!("solo {i}")))).await;
+    assert!(has_text(&alice, "general", "everyone saw this"));
+    let texts: Vec<String> = alice.state().messages("general").iter().filter(|m| m.id != 0).map(|m| m.text.clone()).collect();
+    assert_eq!(texts.iter().filter(|t| t.as_str() == "solo 1").count(), 1, "no duplicates: {texts:?}");
+    // History files never carry per-host member ids.
+    let file = rooms::history_dir(&Paths::under(&home.join("b")), "room-up").join("general.jsonl");
+    wait_for("bob's file has them", || std::fs::read_to_string(&file).is_ok_and(|t| t.contains("solo 3"))).await;
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("author_id\":") || text.contains("author_id\":null"), "{text}");
+    bob.shutdown();
+    alice.shutdown();
+}
+
+/// BUG-C: closing twice at once (a signal while the window closes) hands the
+/// room on once and returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_hands_off_once_even_when_called_twice() {
+    let home = tmp("close-twice");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2).await;
+    let started = std::time::Instant::now();
+    tokio::join!(alice.close(), alice.close());
+    assert!(started.elapsed() < Duration::from_secs(7), "close is bounded");
+    wait_for("bob took over", || on_term(&bob, 2) && bob.state().hosting.is_some()).await;
+    assert!(has_text(&bob, "general", "you're hosting den now"), "a planned handoff says so, like a takeover");
+    assert!(bob.state().is_host());
+    // Nobody to hand to: close returns promptly.
+    let started = std::time::Instant::now();
+    bob.close().await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// BUG-E: `serve` going down hands the room to a member who can host; when
+/// it comes back, it claims the room back from wherever it went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_hands_off_on_shutdown_and_claims_back() {
+    let home = tmp("serve-close");
+    let srv_paths = Paths::under(&home.join("srv"));
+    let save = rooms::RoomSave::new(&ServerConfig { name: "always on".into(), ..ServerConfig::default() });
+    let id = save.id.clone();
+    let node = ServerNode::start(save.server_config(local_base(0)), save, srv_paths.clone(), node_opts()).await.unwrap();
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    alice.join(node.local_addr().to_string());
+    bob.join(node.local_addr().to_string());
+    wait_for("both in", || node.server().members().len() == 2 && on_term(&alice, 1) && on_term(&bob, 1)).await;
+    alice.submit(None, "while the server ran");
+    wait_for("bob has it", || has_text(&bob, "general", "while the server ran")).await;
+
+    node.close().await;
+    wait_for("a member hosts", || {
+        on_term(&alice, 2) && on_term(&bob, 2) && (alice.state().hosting.is_some() || bob.state().hosting.is_some())
+    })
+    .await;
+    let host_share = [&alice, &bob].iter().find_map(|s| s.state().hosting.as_ref().map(|h| h.share.clone())).unwrap();
+    // The server remembers where the room went.
+    let saved = rooms::load(&srv_paths, &id).unwrap();
+    assert_eq!((saved.term, &saved.addrs), (2, &host_share));
+
+    let node2 = ServerNode::start(saved.server_config(local_base(0)), saved, srv_paths.clone(), node_opts()).await.unwrap();
+    assert!(node2.claimed_from().is_some());
+    wait_for("everyone back on the server", || on_term(&alice, 3) && on_term(&bob, 3)).await;
+    assert_eq!(alice.state().server.as_ref().unwrap().mode, "server");
+    wait_for("server kept the history", || node2.server().history("general", 50).iter().any(|m| m.text == "while the server ran")).await;
+    node2.shutdown();
+    // Nobody can host after the apps leave: close is quick.
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// BUG-F: `serve` for a room an app on this machine hosts on the same port
+/// claims it first, then binds once the app lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_takes_a_room_hosted_on_its_own_port() {
+    let home = tmp("same-port");
+    let port = free_port();
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    alice.host(HostOptions { name: "den".into(), bind: "localhost".into(), port });
+    wait_for("hosting", || alice.state().hosting.is_some() && alice.state().conn.is_connected()).await;
+    bob.join(format!("127.0.0.1:{port}"));
+    wait_for("both in", || alice.state().members.len() == 2).await;
+
+    let save = rooms::list(&Paths::under(&home.join("a"))).remove(0);
+    let node = ServerNode::start(save.server_config(local_base(port)), save, Paths::under(&home.join("srv")), node_opts()).await.unwrap();
+    assert_eq!(node.local_addr().port(), port);
+    assert!(node.claimed_from().is_some());
+    wait_for("everyone on the server", || on_term(&alice, 2) && on_term(&bob, 2)).await;
+    assert_eq!(bob.state().server.as_ref().unwrap().mode, "server");
+    node.shutdown();
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// A host that refuses us is alive: no "Host this room" (takeover would only
+/// be refused again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_rejoin_offers_no_takeover() {
+    let home = tmp("refused");
+    let srv = start_room(None, "room-strict", 1).await;
+    let port = srv.local_addr().port();
+    let alice = session("alice", &home.join("a")).await;
+    alice.join(srv.local_addr().to_string());
+    wait_for("in", || alice.state().conn.is_connected()).await;
+    srv.shutdown();
+    drop(srv);
+    // The room comes back with an allow list alice isn't on.
+    let config = ServerConfig { name: "test room".into(), allow: vec!["someone@example.com".into()], ..ServerConfig::default() };
+    let mut strict = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(s) = server::start(ServerOptions {
+            config: config.clone(),
+            mode: ServerMode::Headless,
+            bind: format!("127.0.0.1:{port}").parse().unwrap(),
+            history_dir: None,
+            tailscale: None,
+            room_id: "room-strict".into(),
+            term: 2,
+        })
+        .await
+        {
+            strict = Some(s);
+            break;
+        }
+    }
+    let strict = strict.expect("the old server let go of its port");
+    wait_for("refused", || matches!(alice.state().conn, tailchat_core::session::ConnState::Failed { refused: true, .. })).await;
+    assert!(alice.state().room_id().is_some());
+    assert!(!alice.state().host_lost(), "no takeover offer when the host refused us");
+    strict.shutdown();
+}
+
+/// BUG-D: a name that resolves to several addresses (here `localhost` → v4
+/// and v6) connects to whichever one the room listens on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_tries_every_address_a_name_resolves_to() {
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", 1)).await.map(|i| i.collect()).unwrap_or_default();
+    if !(resolved.iter().any(|a| a.is_ipv4()) && resolved.iter().any(|a| a.is_ipv6())) {
+        eprintln!("skipping: localhost doesn't resolve to both IPv4 and IPv6 here");
+        return;
+    }
+    let home = tmp("resolve-all");
+    let config = ServerConfig { name: "v6 room".into(), ..ServerConfig::default() };
+    let Ok(srv) = server::start(ServerOptions {
+        config,
+        mode: ServerMode::Headless,
+        bind: "[::1]:0".parse().unwrap(),
+        history_dir: None,
+        tailscale: None,
+        room_id: "room-v6".into(),
+        term: 1,
+    })
+    .await
+    else {
+        eprintln!("skipping: no IPv6 loopback");
+        return;
+    };
+    let alice = session("alice", &home.join("a")).await;
+    // IPv4 is tried first and refused; the v6 address works.
+    alice.join(format!("localhost:{}", srv.local_addr().port()));
+    wait_for("connected over v6", || alice.state().conn.is_connected()).await;
+    srv.shutdown();
+}

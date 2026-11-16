@@ -39,7 +39,7 @@ the connection streams events. The token is compared in constant time.
 
 | Method | Params | |
 | --- | --- | --- |
-| `state.get` | | connection, room, members, channels, voice, focus, discovery |
+| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away |
 | `messages.list` | `channel?, limit?` | recent messages (default: focused channel) |
 | `message.send` | `text, channel?` | send plain text |
 | `input.submit` | `text, channel?` | as if typed: slash commands work |
@@ -47,7 +47,7 @@ the connection streams events. The token is compared in constant time.
 | `nick.set` | `nick` | |
 | `voice.join` / `voice.leave` | `channel?` | |
 | `voice.mute` / `voice.deafen` | `muted` / `deafened` | |
-| `voice.stats` | | mic level, speakers, devices, codec |
+| `voice.stats` | | mic level, speakers, devices, codec, `tx_packets` / `rx_packets` (counted since voice started; `open` mode sends even when silent) |
 | `app.send` | `ns, data, channel?, to?` | relay a mod-defined payload |
 | `ui.panel.set` | `panel, widgets, title?` | create/update a panel ([widgets](MODS.md#widgets)) |
 | `ui.panel.clear` | `panel` | |
@@ -55,7 +55,7 @@ the connection streams events. The token is compared in constant time.
 | `ui.notify` | `text, level?` | toast (`info`, `warn`, `error`) |
 | `ui.action` | `panel, action, value?` | emit a `ui.action` event |
 | `ui.theme.set` / `ui.layout.set` | `name` | switch look; the app follows within a second |
-| `ui.screenshot` | `path?` | PNG of the app window (GUI only) |
+| `ui.screenshot` | `path?` | PNG of the app window (GUI only). Written on the next frame the window draws; with the display off or the window hidden the OS may not draw one, and the file never appears |
 | `mods.list` / `mods.reload` | | |
 | `mods.run` | `command, args?` | run a mod command |
 | `session.host` | `name?, bind?, port?` | host a new room |
@@ -65,7 +65,7 @@ the connection streams events. The token is compared in constant time.
 | `rooms.list` | | rooms saved on this machine |
 | `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
 | `rooms.forget` | `room` | delete a saved room and its history |
-| `tailnet.status` / `tailnet.discover` | | peers / find rooms |
+| `tailnet.status` / `tailnet.discover` | | peers / find rooms (`addr` is the tailnet `ip:port` to connect to; show `peer` names to people) |
 | `config.get` | | |
 | `api.methods`, `api.ping`, `events.subscribe` | | built in everywhere |
 

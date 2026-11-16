@@ -127,6 +127,10 @@ pub struct VoiceStats {
     pub speakers: Vec<SpeakerStat>,
     /// Most recent problem worth showing the user (device fallback, stream error, ...).
     pub last_error: Option<String>,
+    /// Voice packets sent since the engine started (only while the gate is open).
+    pub tx_packets: u64,
+    /// Relayed voice packets received since the engine started (counted even when deafened).
+    pub rx_packets: u64,
 }
 
 /// Per-speaker playout state.

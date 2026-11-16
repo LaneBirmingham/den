@@ -37,6 +37,8 @@ pub mod names {
     /// The room moved to another host (`{to, term}`).
     pub const ROOM_MOVED: &str = "room.moved";
     pub const COMMAND_RUN: &str = "command.run";
+    /// History arrived from the host (on join, or merged from a sync): `{channel, count}`.
+    pub const HISTORY_LOADED: &str = "history.loaded";
 
     /// Every name, for docs and `api.methods`.
     pub const ALL: &[&str] = &[
@@ -54,6 +56,7 @@ pub mod names {
         HOSTING_CHANGED,
         ROOM_MOVED,
         COMMAND_RUN,
+        HISTORY_LOADED,
     ];
 }
 

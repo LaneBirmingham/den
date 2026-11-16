@@ -65,16 +65,29 @@ pub fn split_host_port(raw: &str, default_port: u16) -> (String, u16) {
 
 /// Resolve an address string, preferring IPv4 (tailnet IPv4 is always present).
 pub async fn resolve(raw: &str, default_port: u16) -> anyhow::Result<SocketAddr> {
+    let addrs = resolve_all(raw, default_port).await?;
+    Ok(addrs[0])
+}
+
+/// Every address a name resolves to (never empty): tailnet addresses first,
+/// then other IPv4, then the rest. A short machine name can resolve to a LAN
+/// address as well as (or instead of) the tailnet one.
+pub async fn resolve_all(raw: &str, default_port: u16) -> anyhow::Result<Vec<SocketAddr>> {
     let (host, port) = split_host_port(raw, default_port);
     if host.is_empty() {
         bail!("empty address");
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let addrs: Vec<SocketAddr> =
+    let mut addrs: Vec<SocketAddr> =
         tokio::net::lookup_host((host.as_str(), port)).await.with_context(|| format!("resolving {host}"))?.collect();
-    addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first()).copied().with_context(|| format!("{host} has no addresses"))
+    addrs.dedup();
+    addrs.sort_by_key(|a| (!crate::tailscale::is_tailnet_ip(a.ip()), !a.is_ipv4()));
+    if addrs.is_empty() {
+        bail!("{host} has no addresses");
+    }
+    Ok(addrs)
 }
 
 /// Ask a host for its room info without joining.

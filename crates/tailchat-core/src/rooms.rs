@@ -257,13 +257,17 @@ pub fn load_history(dir: &Path, channels: &[Channel], limit: usize) -> anyhow::R
 }
 
 /// Append messages to `<dir>/<channel>.jsonl` in the background.
+///
+/// History files never carry `author_id`: member ids belong to the host that
+/// assigned them, so they mean nothing once the room moves (or restarts).
 pub fn spawn_persister(dir: PathBuf) -> mpsc::UnboundedSender<ChatMessage> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatMessage>();
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some(mut msg) = rx.recv().await {
             if !safe_channel(&msg.channel) {
                 continue;
             }
+            msg.author_id = None;
             let path = history_file(&dir, &msg.channel);
             let line = match serde_json::to_string(&msg) {
                 Ok(l) => l + "\n",
@@ -337,20 +341,30 @@ impl Copy {
 pub struct LiveHost {
     /// What to connect to.
     pub addr: String,
+    /// The address that answered the probe.
+    pub sock: SocketAddr,
     pub server: ServerInfo,
     pub members: u32,
 }
 
 /// Look for a running host of room `id`: probe `addrs` (where it was last
-/// seen) and, with Tailscale, every online peer on `port`. Highest term wins.
+/// seen) and, with Tailscale, every online peer on `port`. See [`best_host`]
+/// for which one wins.
 pub async fn find_live(id: &str, addrs: &[String], port: u16, tailscale: Option<&Tailscale>) -> Option<LiveHost> {
     let mut set = tokio::task::JoinSet::new();
     for a in addrs.iter().cloned() {
         set.spawn(async move {
             let sock = resolve(&a, port).await.ok()?;
             match crate::net::probe(sock, Duration::from_millis(900)).await {
-                Ok(ServerMsg::ProbeInfo { server, members, .. }) => Some(LiveHost { addr: a, server, members }),
-                _ => None,
+                Ok(ServerMsg::ProbeInfo { server, members, .. }) => Some(LiveHost { addr: a, sock, server, members }),
+                Ok(other) => {
+                    tracing::debug!("{a} answered the probe with {other:?}");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!("no room at {a} ({sock}): {e:#}");
+                    None
+                }
             }
         });
     }
@@ -364,10 +378,20 @@ pub async fn find_live(id: &str, addrs: &[String], port: u16, tailscale: Option<
         && let Ok(status) = ts.status().await
     {
         for r in crate::session::discover_rooms(&status, port).await {
-            found.push(LiveHost { addr: r.addr, server: r.server, members: r.members });
+            let Ok(sock) = r.addr.parse() else { continue };
+            found.push(LiveHost { addr: r.addr, sock, server: r.server, members: r.members });
         }
     }
-    found.into_iter().filter(|h| h.server.room_id == id).max_by_key(|h| h.server.term)
+    best_host(found.into_iter().filter(|h| h.server.room_id == id))
+}
+
+/// The host members should be in when several run the same room: highest
+/// term; on equal terms (two members took over at once without seeing each
+/// other), an always-on `serve` beats an app, then the lowest address. Every
+/// member sees the same tailnet addresses, so they all pick the same host.
+/// (Claims stay strict: a claim must carry a higher term than the host's.)
+pub fn best_host(hosts: impl IntoIterator<Item = LiveHost>) -> Option<LiveHost> {
+    hosts.into_iter().max_by_key(|h| (h.server.term, h.server.mode == "server", std::cmp::Reverse(h.sock)))
 }
 
 /// Ask the host at `addr` to move everyone to us (we host the room at a
@@ -404,20 +428,27 @@ pub async fn adopt(paths: &Paths, addr: &str, port: u16) -> anyhow::Result<RoomS
 }
 
 /// Addresses friends can use to reach a room listening on `listen`, best first.
+///
+/// These are connect targets (handoffs, saves, *Join*), so the tailnet IP
+/// comes first, then the MagicDNS name. The short name is last: on some
+/// systems (glibc) it resolves to the LAN address, which a room bound to the
+/// tailnet doesn't listen on.
 pub async fn share_addrs(listen: SocketAddr, tailscale: Option<&Tailscale>) -> Vec<String> {
     let mut share = Vec::new();
-    if let Some(ts) = tailscale
+    let on_tailnet = listen.ip().is_unspecified() || crate::tailscale::is_tailnet_ip(listen.ip());
+    if on_tailnet
+        && let Some(ts) = tailscale
         && let Ok(st) = ts.status().await
         && let Some(me) = &st.me
     {
         let suffix = |h: String| if listen.port() == tailchat_proto::DEFAULT_PORT { h } else { format!("{h}:{}", listen.port()) };
-        share.push(suffix(me.short_name()));
-        if let Some(d) = &me.dns_name {
-            share.push(suffix(d.clone()));
-        }
         if let Some(ip) = me.ipv4() {
             share.push(format!("{ip}:{}", listen.port()));
         }
+        if let Some(d) = &me.dns_name {
+            share.push(suffix(d.clone()));
+        }
+        share.push(suffix(me.short_name()));
     }
     if share.is_empty() || !listen.ip().is_unspecified() && !crate::tailscale::is_tailnet_ip(listen.ip()) {
         share.insert(0, listen.to_string());
@@ -460,6 +491,24 @@ mod tests {
         assert!(list(&paths).is_empty());
         assert!(load(&paths, "../etc").is_err());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn best_host_breaks_term_ties_the_same_way_everywhere() {
+        let h = |addr: &str, term: u64, mode: &str| LiveHost {
+            addr: addr.into(),
+            sock: addr.parse().unwrap(),
+            server: ServerInfo { name: "r".into(), motd: None, version: "x".into(), mode: mode.into(), room_id: "r".into(), term },
+            members: 1,
+        };
+        let pick = |v: Vec<LiveHost>| best_host(v).map(|x| x.addr);
+        assert_eq!(pick(vec![h("100.0.0.9:1", 3, "host"), h("100.0.0.1:1", 2, "server")]).as_deref(), Some("100.0.0.9:1"));
+        // Same term: the order they were found in doesn't matter.
+        let a = vec![h("100.0.0.9:1", 3, "host"), h("100.0.0.2:1", 3, "host")];
+        let b = vec![h("100.0.0.2:1", 3, "host"), h("100.0.0.9:1", 3, "host")];
+        assert_eq!(pick(a), pick(b));
+        assert_eq!(pick(vec![h("100.0.0.2:1", 3, "host"), h("100.0.0.9:1", 3, "server")]).as_deref(), Some("100.0.0.9:1"));
+        assert!(pick(Vec::new()).is_none());
     }
 
     #[test]

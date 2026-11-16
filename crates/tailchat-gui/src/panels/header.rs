@@ -38,10 +38,11 @@ fn room_name(cx: &PanelCx<'_>) -> String {
     cx.state.server.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "tailchat".into())
 }
 
-/// `5 online`, or the connection problem.
+/// `5 online` (`· you host` when it runs here), or the connection problem.
 fn presence_line(cx: &PanelCx<'_>) -> (String, egui::Color32) {
     let p = cx.palette;
     match &cx.state.conn {
+        ConnState::Connected { .. } if cx.state.is_host() => (format!("{} online · you host", cx.state.members.len()), p.ok),
         ConnState::Connected { .. } => (format!("{} online", cx.state.members.len()), p.ok),
         ConnState::Connecting { attempt, .. } if *attempt > 0 => ("Reconnecting…".into(), p.warn),
         ConnState::Connecting { .. } => ("Connecting…".into(), p.warn),

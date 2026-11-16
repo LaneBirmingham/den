@@ -15,7 +15,6 @@ use tailchat_core::paths::Paths;
 use tailchat_core::proto::{ChannelKind, ChatMessage, Member, MessageKind};
 use tailchat_core::rooms::{self, RoomSave};
 use tailchat_core::server_node::{NodeOptions, ServerNode};
-use tailchat_core::tailscale::Tailscale;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -46,12 +45,18 @@ pub struct ServeArgs {
     /// Channels, replacing the config's list: `general`, `lounge:voice`. Repeatable.
     #[arg(long = "channel")]
     channels: Vec<String>,
-    /// Only admit peers identified by Tailscale.
+    /// Only admit peers identified by Tailscale. Saved with the room.
     #[arg(long)]
     require_tailnet: bool,
-    /// Only admit these tailnet logins. Repeatable.
+    /// Only admit these tailnet logins (repeatable). Replaces the room's saved
+    /// allow list.
     #[arg(long = "allow")]
     allow: Vec<String>,
+    /// Clear the room's join rules (allow list and require-tailnet) before
+    /// applying `--allow` / `--require-tailnet`. `--open` alone admits anyone
+    /// who can reach the port.
+    #[arg(long)]
+    open: bool,
     /// Don't load server-side mods.
     #[arg(long)]
     no_mods: bool,
@@ -125,8 +130,7 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
             })
             .collect();
     }
-    cfg.require_tailnet |= args.require_tailnet;
-    cfg.allow.extend(args.allow);
+    apply_join_rules(&mut cfg, args.open, args.require_tailnet, args.allow);
     if args.write_config {
         config::save(&path, &cfg)?;
         println!("wrote {}", path.display());
@@ -165,12 +169,27 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
 
     wait_for_signal().await;
     println!("shutting down…");
-    node.shutdown();
+    // Hand the room to a member who can host, so nobody is stranded; we claim it back next start.
+    node.close().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     Ok(())
 }
 
-async fn wait_for_signal() {
+/// Join rules from flags. They're saved with the room, so they persist across
+/// restarts: `--allow` replaces the saved list, `--open` clears both rules.
+fn apply_join_rules(cfg: &mut ServerConfig, open: bool, require_tailnet: bool, allow: Vec<String>) {
+    if open {
+        cfg.require_tailnet = false;
+        cfg.allow.clear();
+    }
+    cfg.require_tailnet |= require_tailnet;
+    if !allow.is_empty() {
+        cfg.allow = allow;
+    }
+}
+
+/// SIGINT (Ctrl-C) or SIGTERM.
+pub(crate) async fn wait_for_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
@@ -188,15 +207,14 @@ async fn wait_for_signal() {
 async fn print_banner(node: &ServerNode, cfg: &ServerConfig, paths: &Paths, console: bool) {
     let addr = node.local_addr();
     println!("tailchat {} — room \"{}\" on {addr} (tcp+udp)", tailchat_core::VERSION, cfg.name);
-    if let Some(ts) = Tailscale::locate(None)
-        && let Ok(st) = ts.status().await
-        && let Some(me) = st.me
-    {
-        let port = if addr.port() == tailchat_core::proto::DEFAULT_PORT { String::new() } else { format!(":{}", addr.port()) };
-        println!("  join with:  tailchat join {}{port}", me.short_name());
-        if let Some(d) = me.dns_name {
-            println!("              tailchat join {d}{port}");
-        }
+    // Best first: the tailnet IP and MagicDNS name work from anywhere, this machine included.
+    for (i, a) in node.save().addrs.iter().take(2).enumerate() {
+        println!("  {}tailchat join {a}", if i == 0 { "join with:  " } else { "            " });
+    }
+    let rules = &node.save().access;
+    if rules.require_tailnet || !rules.allow.is_empty() {
+        let allow = if rules.allow.is_empty() { "anyone on the tailnet".to_owned() } else { rules.allow.join(", ") };
+        println!("  admits:     {allow} (change with --allow / --open)");
     }
     let channels: Vec<String> = node
         .server()
@@ -328,7 +346,7 @@ async fn console_command(node: &ServerNode, line: &str) -> bool {
             println!("mods reloaded ({} active)", node.mods().active().count());
         }
         "quit" | "exit" | "stop" => {
-            node.shutdown();
+            node.close().await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             return false;
         }
@@ -341,4 +359,27 @@ async fn console_command(node: &ServerNode, line: &str) -> bool {
         other => println!("! unknown command {other:?} — try help"),
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_rule_flags_can_relax_saved_rules() {
+        let saved = ServerConfig { require_tailnet: true, allow: vec!["a@x".into(), "b@x".into()], ..ServerConfig::default() };
+        let rules = |open, req, allow: &[&str]| {
+            let mut c = saved.clone();
+            apply_join_rules(&mut c, open, req, allow.iter().map(|s| s.to_string()).collect());
+            (c.require_tailnet, c.allow)
+        };
+        // A plain restart keeps what was saved.
+        assert_eq!(rules(false, false, &[]), (true, vec!["a@x".to_string(), "b@x".to_string()]));
+        // --allow replaces the list instead of adding to it.
+        assert_eq!(rules(false, false, &["c@x"]), (true, vec!["c@x".to_string()]));
+        // --open clears both; flags after it set new ones.
+        assert_eq!(rules(true, false, &[]), (false, vec![]));
+        assert_eq!(rules(true, true, &[]), (true, vec![]));
+        assert_eq!(rules(true, false, &["c@x"]), (false, vec!["c@x".to_string()]));
+    }
 }

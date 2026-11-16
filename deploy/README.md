@@ -18,6 +18,19 @@ Settings: `tailchat serve --write-config` writes `server.toml` (name, motd,
 channels, history limit, `require_tailnet`, `allow` list of tailnet logins,
 max members, rate limit). Command-line flags override it.
 
+Join rules are saved in the room (`data/rooms/<id>/room.toml`, `[access]`)
+and enforced by whoever hosts it, so flags you pass once stay in force:
+
+| Flag | Effect on the saved rules |
+| --- | --- |
+| `--require-tailnet` | only admit peers Tailscale can identify |
+| `--allow <login>` (repeatable) | only admit these logins; **replaces** the saved list |
+| `--open` | clear both rules first; add `--allow` / `--require-tailnet` after it to set new ones |
+| (none) | keep what's saved |
+
+Locked yourself out? `tailchat serve --room <id> --open` (or `--open --allow
+you@example.com`). Refused joins are logged with the peer's identity.
+
 Which room it hosts:
 
 * default: the saved room named like `server.toml`'s `name`, created on the
@@ -27,9 +40,16 @@ Which room it hosts:
 * `--adopt <machine>`: the room someone hosts there right now. The server
   takes it over and members' copies fill in the history.
 
-The server is the room's preferred host, not its only one. While it's down,
-any member can *Host this room* from their copy; when it comes back it finds
-the room on the tailnet and claims it (members move over automatically).
+The server is the room's preferred host, not its only one. On SIGTERM /
+Ctrl-C / `quit` it hands the room to a member whose app can host (waiting
+up to ~6 s), so `systemctl stop` or a container restart doesn't strand
+anyone. While it's down, any member can *Host this room* from their copy;
+when it comes back it finds the room where it went (or on the tailnet) and
+claims it (members move over automatically).
+
+If an app on the same machine hosts the room on the server's port,
+`serve --room` claims the room from it first and binds once the app lets go
+of the port (a few seconds).
 
 Admin from the same machine:
 

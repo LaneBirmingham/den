@@ -50,16 +50,19 @@ A room works like a shared save game. Everyone who joins keeps a copy
 and their app swaps message ids with the host on every join, so all the
 copies fill each other's gaps. That means:
 
-* **The host can leave.** *Leave* (or closing the app) hands the room to
-  another member; everyone's app follows automatically. *Hand off to…* in
-  the room menu does the same on purpose.
+* **The host can leave.** *Leave* (or closing the app, or stopping it with
+  Ctrl-C / SIGTERM) hands the room to another member; everyone's app
+  follows automatically. *Hand off to…* in the room menu does the same on
+  purpose. The header says "you host" while the room runs on your machine.
 * **The host can vanish.** If the host drops, anyone can click
   **Host this room** and carry on from their copy; the others find it on
   the tailnet. Open a room later from *Your rooms* in the lobby (or
   `tailchat host --room <name>`): it joins whoever hosts it now, or hosts
   it from your copy.
 * Everyone in a room has the same rights: anyone can host it. Join rules
-  (`require_tailnet`, `allow`) travel with the room.
+  (`require_tailnet`, `allow`) travel with the room. If a host refuses you
+  because of them, there's no *Host this room*: the host is up, and would
+  refuse you again.
 
 ### Persistent server
 
@@ -74,9 +77,16 @@ would, runs server-side mods, and gives you an admin console (`help`, `who`,
 (`tailchat serve --write-config` writes one). See [`deploy/`](deploy) for
 systemd and Docker (Tailscale sidecar) setups.
 
-A server is just the room's always-on host. If it was down and someone else
-hosted the room meanwhile, it takes the room back when it starts, and the
-members' copies fill in what it missed. To move a room you started in the
+A server is just the room's always-on host. Stopping it (Ctrl-C, SIGTERM,
+`quit`) hands the room to a member whose app can host, so nobody is
+stranded. If it was down and someone else hosted the room meanwhile, it
+takes the room back when it starts, and the members' copies fill in what it
+missed.
+
+Join rules are saved with the room, so `--require-tailnet` and `--allow`
+stick across restarts. `--allow` replaces the saved list; `--open` clears
+both rules (combine it with `--allow` / `--require-tailnet` to set new
+ones), e.g. `tailchat serve --room den --open` to let everyone back in. To move a room you started in the
 app onto a server: `tailchat serve --adopt <your-machine>` (or copy
 `<data>/rooms/<id>/` over and run `tailchat serve --room <id>`).
 

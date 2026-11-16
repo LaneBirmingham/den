@@ -208,11 +208,13 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     if !terminal {
         let session = start_session(rt, paths, nick, "tailchat-gui")?;
         apply_start(&session, start);
+        close_on_signal(rt, &session);
         let res = {
             let _guard = rt.enter();
             tailchat_gui::run(session.clone())
         };
         // Hand the room on if we host it, then stop.
+        tracing::info!("window closed");
         rt.block_on(session.close());
         return res;
     }
@@ -228,6 +230,21 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     let res = rt.block_on(term::run(session.clone()));
     rt.block_on(session.close());
     res
+}
+
+/// SIGTERM / Ctrl-C while the window is open: close like the window's close
+/// button would (hand the room on if we host it, ~6 s at most), then exit.
+/// Done here rather than through the window, which may draw no frames (and so
+/// handle no events) while the display is off.
+#[cfg(feature = "gui")]
+fn close_on_signal(rt: &tokio::runtime::Runtime, session: &Session) {
+    let session = session.clone();
+    rt.spawn(async move {
+        serve::wait_for_signal().await;
+        tracing::info!("signal received; closing");
+        session.close().await;
+        std::process::exit(0);
+    });
 }
 
 fn apply_start(session: &Session, start: Start) {

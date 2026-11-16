@@ -28,12 +28,17 @@ pub async fn discover(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     }
     for r in rooms {
         let me = if r.peer.is_self { " (this machine)" } else { "" };
+        let saved = match tailchat_core::rooms::load(paths, &r.server.room_id) {
+            Ok(s) => format!(" · saved (term {})", s.term),
+            Err(_) => " · not saved".into(),
+        };
         println!(
-            "  {:<28} {:<24} {} member(s) · {}{me}\n    tailchat join {}",
+            "  {:<28} {:<24} {} member(s) · {} · term {}{saved}{me}\n    tailchat join {}",
             r.server.name,
             r.peer.short_name(),
             r.members,
             r.server.mode,
+            r.server.term,
             r.addr
         );
     }

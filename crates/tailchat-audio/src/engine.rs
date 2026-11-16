@@ -5,7 +5,7 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,9 @@ pub(crate) struct Shared {
     pub stop: AtomicBool,
     pub status: Mutex<Status>,
     warned_unsupported: AtomicBool,
+    /// Packets handed to the sink / fed to [`VoiceEngine::receive`].
+    pub tx_packets: AtomicU64,
+    pub rx_packets: AtomicU64,
 }
 
 impl Shared {
@@ -124,6 +127,8 @@ impl Shared {
             stop: AtomicBool::new(false),
             status: Mutex::new(Status::default()),
             warned_unsupported: AtomicBool::new(false),
+            tx_packets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
         }
     }
 
@@ -233,6 +238,7 @@ impl VoiceEngine {
 
     /// Feed one relayed packet. Called from a UDP thread; decodes on the caller's thread.
     pub fn receive(&self, speaker: u32, seq: u16, codec: Codec, payload: &[u8]) {
+        self.shared.rx_packets.fetch_add(1, Relaxed);
         let now = Instant::now();
         if !self.has_output || self.shared.controls.deafened.load(Relaxed) {
             // Nothing will be played: skip decoding but keep speaking indicators alive.
@@ -320,6 +326,8 @@ impl VoiceEngine {
             output_device: st.output_device,
             speakers,
             last_error: st.last_error,
+            tx_packets: self.shared.tx_packets.load(Relaxed),
+            rx_packets: self.shared.rx_packets.load(Relaxed),
         }
     }
 }
@@ -489,6 +497,7 @@ impl Transmitter {
         match result {
             Ok(payload) => {
                 sink.send_voice(self.seq, enc.codec(), &payload);
+                shared.tx_packets.fetch_add(1, Relaxed);
                 self.seq = self.seq.wrapping_add(1);
             }
             Err(e) => {
@@ -556,6 +565,7 @@ mod tests {
         for w in sent.windows(2) {
             assert_eq!(w[1].0, w[0].0.wrapping_add(1), "seq must be contiguous");
         }
+        assert_eq!(shared.tx_packets.load(Relaxed), sent.len() as u64, "tx counter matches what was sent");
     }
 
     #[test]

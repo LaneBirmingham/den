@@ -62,17 +62,39 @@ A room is a save that every member holds, not a process:
   answers `host_ready {term, addrs}`; the host broadcasts
   `handoff {to, term}`, everyone (the old host's own session too)
   reconnects there and syncs, and the old server stops a few seconds later.
-  Leaving while hosting does this with the first member who can host.
+  Leaving while hosting does this with the first member who can host, and
+  so does closing: the app's window, SIGTERM/Ctrl-C to the app
+  (`Session::close`, idempotent, ~6 s cap) and to `serve`
+  (`ServerNode::close`). The new host gets the same "you're hosting" notice
+  as a manual takeover.
 * **Manual takeover** — "Host this room" (`Session::open_room`) probes the
   room's last addresses and the tailnet for a live host with the same id;
-  if there is none it hosts from the save at `term + 1`.
+  if there is none it hosts from the save at `term + 1`. If several hosts
+  run the room (two members took over at once without seeing each other),
+  `rooms::best_host` picks the same one for everyone: highest term, then a
+  `serve` over an app, then the lowest address. Claims stay strict (a
+  higher term than the host's), so equal terms never claim each other.
 * **Claim** — a peer already hosting the room at a higher term sends
   `claim {room, term, addrs}` as its first frame; the host checks it against
   the room's join rules, broadcasts `handoff`, and steps down. This is how
   `serve` takes its room back after downtime (`serve --adopt <addr>` uses it
-  to move an app-hosted room onto a server).
-* **Rejoining** — a member whose host has gone looks for the room on the
-  tailnet (by id) while it retries, so it follows a handoff it missed.
+  to move an app-hosted room onto a server). A server records where the
+  room went when it hands off, so it probes there first on its next start.
+  If the room's host holds the server's port (an app on the same machine),
+  the server claims before it binds, then binds once the port is free.
+* **Rejoining** — a member whose host has gone looks for the room (by id)
+  at its saved addresses and on the tailnet while it retries, so it follows
+  a handoff it missed. Retries update one "connection lost" line instead of
+  adding one per attempt; `-v` logs every attempt and lookup.
+* **Addresses** — connect targets (share lists, handoff `to`, saves,
+  discovery `addr`) put the tailnet IP first, then the MagicDNS name; the
+  short machine name is for display. (glibc can resolve a short name to the
+  LAN address, which a tailnet-bound room doesn't listen on.) A connect
+  tries every address a name resolves to, and every candidate address,
+  before giving up.
+* **History files** never store `author_id`: member ids are per host. A
+  member's own uploads (what the host `want`ed) are merged into its own view
+  as well as the host's.
 
 Everyone has the same rights, so there are no roles to sync; join rules
 travel in `welcome` (`access`) and are enforced by whoever hosts.
