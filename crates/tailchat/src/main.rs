@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::detect();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("tailchat-rt").build()?;
 
-    match cli.cmd {
+    let res = match cli.cmd {
         None | Some(Cmd::Gui) => run_app(&rt, &paths, cli.nick, Start::Lobby, false),
         Some(Cmd::Host { room, cli: term }) => {
             let cfg = load_config(&paths, cli.nick.clone())?;
@@ -177,7 +177,11 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Config { cmd }) => cli::config(cmd, &paths),
         Some(Cmd::Devices) => cli::devices(),
         Some(Cmd::VoiceTest { seconds, codec }) => cli::voice_test(&paths, seconds, &codec),
-    }
+    };
+    // Don't wait on blocking work left behind, such as a stdin read that only
+    // ends when stdin does (a pipe or service keeps it open forever).
+    rt.shutdown_timeout(std::time::Duration::from_millis(500));
+    res
 }
 
 fn init_logging(verbose: u8, quiet_default: bool) {

@@ -62,7 +62,7 @@ the connection streams events. The token is compared in constant time.
 | `session.join` | `addr` | an invite link, or a room's address (uses the saved invite) |
 | `session.invite` | | `{invite}`: the invite link for the room you're in |
 | `session.leave` | | leave; if you host, another member takes the room over |
-| `session.handoff` | `to?` | while hosting: hand the room to member `to` (default: the first who can host) |
+| `session.handoff` | `to?` | while hosting: hand the room to member `to` (default: the best placed member who can host, by `reach`) |
 | `rooms.list` | | rooms saved on this machine |
 | `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
 | `rooms.forget` | `room` | delete a saved room and its history |
