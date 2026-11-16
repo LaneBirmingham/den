@@ -1,60 +1,235 @@
-# Testing Den from an agent
+# Driving and testing Den from an agent
 
-What an agent (or a script) can test today without anyone's help, and
-what got in the way during the Windows bug hunt of 2026-11-16. The aim
-is for every feature to be testable in the background, on a machine
-someone is using, through the CLI and the control API alone.
-
-## What works well
-
-* **Isolated instances**: `DEN_HOME=<dir>` gives each instance its own
-  profile, key and API. Several apps on one machine join each other's rooms
-  over loopback/LAN, which stands in for "a second machine".
-* **Control API** (`den api …`): host, join, invite, voice join/mute/deafen,
-  `voice.stats` (devices, codec, packet counts, levels), `state.get`
-  (now including `via`: direct or relay), messages, theme/layout switching.
-* **Screenshots**: `den api ui.screenshot path=…` renders the real window
-  even when it's behind other windows. Good for themes, fonts and layout.
-* **Display scaling**: `[ui] scale = 1.5` in `config.toml` stands in for
-  Windows DPI scaling (egui zoom works the same way as a higher DPI).
-* **Shutdown**: `taskkill /PID <pid>` (no `/F`) sends the window a close
-  request, the same path as the close button.
-* **Integration tests**: `crates/denchat-core/tests/room.rs` runs real
-  servers on loopback with no relays.
-
-## What blocked testing, and what would fix it
-
-| Blocker | What happened | Proposed fix |
-| --- | --- | --- |
-| **No way to click the GUI in the background** | Real mouse input (`SendInput`/`mouse_event`) goes to whatever window is in front: a test click landed in the user's game. Posting `WM_LBUTTONDOWN` to Den's window is ignored by winit. So menu items such as "Copy invite link" couldn't be clicked end to end. | Add `ui.input {events: [...]}` to the control API, which queues egui pointer/key/text events into the next frame (Den runs them like real input, with no focus or cursor changes). Or turn on eframe `accesskit` and drive it through UI Automation. Also, every panel action should have an API method (see AGENTS.md). |
-| **The clipboard is the user's** | Checking a copy meant writing to and reading the system clipboard, which overwrote whatever the user had copied. | `ui.clipboard.get` (what the app last copied) and/or `DEN_CLIPBOARD=<file>` to send copies to a file during tests. |
-| **Voice needs real devices** | Voice tests had to use real devices. Silent virtual ones (Oculus, Steam Streaming) proved packets flow, but levels, VAD and noise couldn't be measured. Playing a tone into VB-Audio Cable was too risky (it may feed the user's Discord). | Built-in test devices: `input_device = "test:sine:440"` / `"test:file:<wav>"` and `output_device = "test:null"` / `"test:capture:<wav>"`, then compare levels/SNR in `voice.stats` or the captured WAV. |
-| **Can't force a relay path** | `via` only ever showed `direct` on one machine (iroh punches through at once), so the relay case and the firewall-blocked case went untested. | A test switch to turn off direct paths (`[net] direct = false` / `DEN_NO_DIRECT=1`), so a relay-only link can be tested on demand. |
-| **Firewall prompt can't be observed** | Windows Defender showed no prompt and made no rule for `den.exe` (public profile, user notifications on); the user was in a fullscreen game. No way to check this headlessly. | Document the expected rule; optionally add `den doctor`, which reports firewall rules for the exe, the network profile, port mapping, reach and relay latency as JSON. |
-| **GUI windows appear on the user's desktop** | Each test instance opens a real 1100×720 window; that can steal focus or get in the way. | `DEN_WINDOW=hidden` (or offscreen), keeping screenshots working, for background test runs. |
-| **Console events need hand-made helpers** | Ctrl+C and console-close to a process in its own console need `AttachConsole` + `GenerateConsoleCtrlEvent` / `WM_CLOSE` to the console window (PowerShell + C# here). | Ship a small `den-test` helper (or `scripts/windows/*.ps1`) for: send Ctrl+C, close the console, check whether a process has a console. |
-| **System DPI can't be changed** | Changing display scaling would change the user's monitor. | `[ui] scale` already works; also add a `--scale` flag / `DEN_SCALE` so tests don't have to edit config. |
-| **Real second machine** | Only same-machine instances were possible. | A remote runner (another host with Den and an SSH/agent hook) for real NAT/firewall/LAN tests. |
-| **Stale docs** | AGENTS.md said `den host --bind localhost`, which no longer exists. | Fixed. |
-
-## Recipes used
+Anything a person can do in the app, an agent can do in the background
+from a shell. It can read what's on screen, click, type, press keys,
+scroll, hover, take screenshots, and resize or minimise the window. This
+works on the user's running app (it never moves their mouse or takes
+focus) and on throwaway **sandboxes** that have no window at all. Output is
+short plain text, so an agent spends few tokens reading it.
 
 ```sh
-# Two apps on one machine, both in a room
-DEN_HOME=/tmp/a den --nick alice host &
-DEN_HOME=/tmp/a den api session.invite            # -> den://…
-DEN_HOME=/tmp/b den --nick bob join 'den://…' &
-DEN_HOME=/tmp/b den api state.get                 # conn, via, latency_ms
-
-# Voice on silent virtual devices (config.toml in each home)
-# [voice]
-# input_device = "<a silent input from `den devices`>"
-# output_device = "<an output nobody listens to>"
-# mode = "open"
-DEN_HOME=/tmp/a den api voice.join channel=lounge
-DEN_HOME=/tmp/a den api voice.stats              # tx/rx packets, codec
-
-# Fonts / DPI
-DEN_HOME=/tmp/a den api message.send text='😀 你好 مرحبا'
-DEN_HOME=/tmp/a den api ui.screenshot path=/tmp/shot.png
+den sandbox start a                    # a headless Den with its own home, hosting a room
+den -S a ui tree                       # what's on screen, one widget per line
+den -S a ui click "Room menu"
+den -S a ui click "Copy invite link"
+den -S a ui clip                       # what it copied (never the user's clipboard)
+den -S a ui type "hello" --enter       # into the composer
+den -S a ui shot /tmp/a.png            # then look at the PNG
+den sandbox stop a --rm
 ```
+
+Drop `-S a` to drive the user's own running app instead. Every `den ui`
+command is a thin wrapper over the control API (`ui.*` in
+[API.md](API.md#driving-the-interface)), so scripts and mods can do the
+same over the socket.
+
+## Reading the screen
+
+```text
+$ den -S a ui tree
+window 1100x720 "a's room — Den" (headless)
+core.header
+  @37 button "Room menu: a's room · 2 online · you host"
+core.voice
+  @38 button "Voice settings"
+  @39 button "Mute"
+core.channels
+  @43 button "#general" on
+  @45 button "Join lounge (b)"
+core.composer
+  @51 textbox "Message #general" value="" focused
+  @52 button "Send" disabled
+example.dice/history
+  @53 button "d20"
+```
+
+* Widgets are grouped by the panel that drew them (layout ids such as
+  `core.members` or `my.mod/panel`). Popups and menus appear under the panel
+  that opened them.
+* **Targets.** Any command that takes a target accepts:
+  * `@37`: a ref. A ref stays valid while that widget keeps the same text.
+    Once the text changes or the widget goes away, the ref stops matching
+    and the command fails, so it never quietly lands on another widget.
+  * `Join lounge`: text. Den tries an exact match, then a case-insensitive
+    one, then a substring.
+  * `button:Join`: a role and text.
+
+  If several widgets match, the command fails and lists them. Narrow it
+  with `--panel`, `--index N` or a ref.
+* `--panel <id>` limits the output to one panel. `--all` includes widgets
+  scrolled out of view. `--rects` adds `[x,y wxh]` in points. `--json` gives
+  everything as data.
+* `den status` summarises the app's state in a few lines: connection, room,
+  channels, members, voice and mods. Use it instead of `den api state.get`.
+* Screenshots: `den ui shot [path] [--panel id | --target T] [--scale 0.5]`.
+  It prints `path WxH renderer`. A visible window is captured from the GPU.
+  A minimised, hidden or headless one is drawn on the CPU, so the result is
+  the same either way. A cropped or scaled-down shot costs far fewer tokens
+  to look at.
+
+## Acting
+
+| Command | |
+| --- | --- |
+| `den ui click <target \| X,Y> [--right] [--double] [--pointer]` | Click through the widget's accessibility action, or with a synthetic pointer at its centre. |
+| `den ui type <text> [--into T] [--enter]` | Type into the focused text box (or focus `T` first). `--enter` sends it. |
+| `den ui key <keys…>` | Press keys and chords in order: `Escape`, `Tab`, `ctrl+a Backspace`, `cmd+k`. |
+| `den ui scroll <dy> [--dx N] [--over T]` | Scroll by points over a widget. A positive `dy` scrolls down. |
+| `den ui hover <target>` | Move the pointer over it. Returns after its tooltip has appeared. |
+| `den ui window [--size WxH] [--pos X,Y] [--minimize\|--restore\|--maximize] [--fullscreen] [--show\|--hide] [--focus]` | Print the window's state. The flags change it first. |
+| `den ui scale 1.5` | UI zoom, which stands in for display scaling. |
+| `den ui clip` | Print the text the app last copied. |
+| `den ui quit` | Close the app the way its close button does. |
+
+Every action returns once the frame it caused has been drawn. Run
+`den ui tree` straight after a click and the menu it opened is already
+listed.
+
+### Waiting
+
+* `den ui wait <target> [--gone] [--timeout 10]` waits until a widget
+  appears (or, with `--gone`, disappears). It exits 1 on timeout.
+* Every action takes `--wait <target>`: `den ui click Mute --wait Unmute`.
+* `den wait <event…> [--where path=value] [--count N]` waits for events
+  from the app and prints them. Example:
+  `den wait message.created --where message.text=rolled`. Event names are
+  listed in [API.md](API.md#events).
+
+## Sandboxes
+
+`den sandbox start [name]` starts a Den in the background, with its own home
+folder (under `$DEN_SANDBOXES`, by default `<tmp>/den-sandboxes`). It waits
+until the room is up and prints the invite link. A sandbox:
+
+* runs **headless**, with no window, no GPU and no focus. Add `--window` to
+  see a real one.
+* uses the **test audio devices** `test:silence` → `test:null`, so it never
+  touches the user's microphone or speakers.
+* sends anything it **copies** to `<home>/clipboard.txt`, never to the
+  user's clipboard.
+* hosts a room, joins one (`--join b`, or `--join '<invite>'`), or stays in
+  the lobby (`--lobby`).
+* loads mods with `--mod <dir>` (repeatable; they are linked, not copied).
+* starts from the user's own setup with `--copy-config` (theme, layout, and
+  their mods); `--theme` and `--layout` override those.
+* logs to `<home>/den.log`.
+
+You can also:
+
+* drive a sandbox with `den -S <name> …` (or `export DEN_SANDBOX=<name>`).
+  `den -S a api …`, `den -S a mods …` and `den -S a config path` all target
+  it.
+* manage them with `den sandbox list`, `den sandbox stop <names…> | --all
+  [--rm]` and `den sandbox path <name>`.
+
+Several sandboxes on one machine can join each other's rooms, which stands
+in for "a second machine":
+
+```sh
+den sandbox start a
+den sandbox start b --join a
+den -S b ui type "hi from b" --enter
+den -S a wait message.created --where message.text=hi
+den -S b ui click "Join lounge" --wait "Leave voice"
+den -S a status                         # members a (you), b [voice:lounge]
+```
+
+Without sandboxes, the same switches work on any instance:
+`DEN_HOME=/tmp/x den --window headless --size 900x600 host`.
+
+* `DEN_WINDOW=headless` runs with no window.
+* `DEN_SIZE=WxH` sets the window size (and doesn't save it).
+* `DEN_SCALE=1.5` sets the UI zoom.
+* `DEN_CLIPBOARD=<file>` sends copies to a file.
+
+## Testing a mod end to end
+
+```sh
+den mods new ./my-mod --id my.mod            # a starter: /hello and a status panel
+den sandbox start t --mod ./my-mod --fresh
+den -S t status | tail -1                    # mods my.mod · panels my.mod/status
+den -S t ui tree --panel my.mod              # does the panel show what it should?
+den -S t ui click "Say hello" --panel my.mod
+den -S t ui type "/hello agent" --enter
+den -S t wait message.created --where message.text=agent
+den -S t ui shot /tmp/panel.png --panel my.mod
+# edit den-mod.toml / mod.py, then:
+den -S t api mods.reload
+den sandbox stop t --rm
+```
+
+* Test it against the user's look with `--copy-config`. For a multiplayer
+  mod, add a second sandbox with `--join t` and check that the other side
+  sees what it should.
+* Problems loading the mod show in `den -S t api mods.list` and in
+  `<home>/den.log`.
+* Mod panels are made from declarative widgets, so they show up in
+  `ui tree` with no extra work.
+
+## Built-in panels: keep them drivable
+
+Stock egui widgets (buttons, labels, text boxes, checkboxes) name
+themselves. A widget drawn by hand with `allocate_exact_size` or `interact`
+does not, so call `kit::name(&resp, Role::Button, "Join lounge")`
+(`kit::name_selected` for a current or selected item). Use the words a
+person sees, plus any state that only shows as colour or an icon
+(`"b · Muted · lounge"`). This is what the accessibility tree and screen
+readers get, too.
+
+## Voice without real devices
+
+Set these in a home's `config.toml` (`[voice] input_device` /
+`output_device`). Sandboxes already use `test:silence` and `test:null`.
+
+| Device | |
+| --- | --- |
+| `test:silence` | Input: digital silence. |
+| `test:sine:<hz>` | Input: a steady tone, e.g. `test:sine:440`. |
+| `test:file:<wav>` | Input: a WAV file, looped. |
+| `test:null` | Output: discards everything. |
+| `test:capture:<wav>` | Output: writes what it hears to a WAV file. |
+
+```sh
+den sandbox start a && den sandbox start b --join a
+# give a a tone: [voice] input_device = "test:sine:440" in $(den sandbox path a)/config/config.toml, then restart a
+den -S a api voice.join channel=lounge; den -S b api voice.join channel=lounge
+den -S b api voice.stats                     # rx_packets climbing, level > 0
+```
+
+## Network switches
+
+* `[net] direct = false` (or `DEN_NO_DIRECT=1`) makes an endpoint
+  relay-only, with no UDP sockets and no addresses. Setting it on one side
+  is enough. `den status` then shows `via relay`.
+* `den doctor [--json]` reports:
+  * reach and addresses;
+  * port mapping (offered / granted);
+  * relay latency and health;
+  * paths;
+  * on Windows, the firewall rules for the exe and the active network
+    profile.
+
+## Automated tests
+
+* `crates/denchat-core/tests/room.rs` runs real servers on loopback with no
+  relays: rooms, sync, takeover, voice on test devices, relay-only links.
+* `crates/denchat-gui/tests/headless.rs` runs the real app headless and
+  drives it through the same calls `den ui` uses: find, click, type, menu,
+  clipboard, toggle a panel, screenshot, resize, quit.
+
+## What's still hard
+
+| Gap | Status |
+| --- | --- |
+| Clicking the GUI in the background | **Fixed**: `den ui click/type/key/scroll/hover`, which inject egui input or accesskit actions. No focus, no real mouse. |
+| The clipboard is the user's | **Fixed**: `den ui clip`, and `DEN_CLIPBOARD=<file>` (always on in sandboxes and headless). Clicking "Copy" in the user's own app still copies to their clipboard, as it should. |
+| Voice needs real devices | **Fixed**: `test:` devices (above). |
+| Can't force a relay path | **Fixed**: `[net] direct = false` / `DEN_NO_DIRECT=1`. |
+| Test windows on the user's desktop | **Fixed**: `DEN_WINDOW=headless`; sandboxes are headless by default. |
+| Screenshots of hidden or minimised windows | **Fixed**: CPU renderer fallback. |
+| System DPI can't be changed | **Fixed**: `DEN_SCALE`, `--scale`, `den ui scale`. |
+| Firewall prompt can't be observed | `den doctor` reports the rules and the network profile; the prompt itself still can't be seen. The Windows check is untested. |
+| Console Ctrl+C / close on Windows | Still needs hand-made helpers (`AttachConsole` + `GenerateConsoleCtrlEvent`). `den ui quit` and `den sandbox stop` cover the normal close path. |
+| A real second machine | Still manual. Sandboxes cover same-machine rooms (direct and relay-only); real NAT and firewall need another host. |
+| `den serve` with direct off | Needs `--relay-url`. The reach probe in `server.rs` still sends direct UDP. |
+| Headless and windowed driving on Windows/Linux | Built and tested on macOS. The code is portable; it hasn't been run there yet. |

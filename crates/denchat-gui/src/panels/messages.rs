@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use denchat_core::proto::{ChatMessage, MemberId, MessageKind};
+use egui::accesskit::Role;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, CornerRadius, Frame, Galley, Layout, Margin, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 
@@ -195,7 +196,15 @@ impl Panel for Messages {
 fn header(ui: &mut Ui, cx: &mut PanelCx<'_>, channel: &str, big: bool) {
     let p = *cx.palette;
     let Some(c) = cx.state.channel(channel).cloned() else { return };
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), if big { 58.0 } else { 54.0 }), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if big { 58.0 } else { 54.0 }), Sense::hover());
+    kit::name(
+        &resp,
+        Role::Heading,
+        match &c.topic {
+            Some(t) => format!("#{} · {t}", c.name),
+            None => format!("#{}", c.name),
+        },
+    );
     let y = rect.center().y;
     let mut right = rect.right() - 8.0;
     let members_placed = cx.shell.placed.iter().any(|(id, _)| id == "core.members");
@@ -271,6 +280,7 @@ fn voice_pill(ui: &mut Ui, cx: &mut PanelCx<'_>, right: f32, y: f32) -> f32 {
     let resp = ui.interact(r, ui.scope_id().with("voice-pill"), Sense::click());
     let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     ui.painter().rect_filled(r, CornerRadius::same(15), crate::theme::mix(bg, fg, 0.08 * hot));
+    kit::name(&resp, Role::Button, g.text().trim_start_matches(icons::PHONE).trim());
     ui.painter().galley(r.center() - g.size() / 2.0, g, fg);
     if let Some(id) = join {
         if resp.on_hover_text("Join voice").clicked() {
@@ -353,7 +363,8 @@ fn cozy(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, p: &Palette, ni
         ui.add_space(4.0);
         let text = format!("{}   {}", v.text, v.time);
         let g = ui.ctx().fonts_mut(|f| f.layout(text, kit::font(13.0, W::Regular), p.muted, wrap));
-        let (rect, _) = ui.allocate_exact_size(vec2(w, g.size().y.max(18.0) + 6.0), Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, g.size().y.max(18.0) + 6.0), Sense::hover());
+        kit::name(&resp, Role::Label, v.text);
         kit::icon(ui.painter(), pos2(rect.left() + 14.0 + AVATAR / 2.0, rect.top() + 3.0 + 9.0), glyph, 15.0, ic);
         ui.painter().galley(pos2(rect.left() + TEXT_X, rect.top() + 3.0), g, p.muted);
         return;
@@ -370,6 +381,7 @@ fn cozy(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, p: &Palette, ni
         ui.add_space(10.0);
     }
     let (rect, resp) = ui.allocate_exact_size(vec2(w, pad_top + head + g.size().y + 3.0), Sense::click());
+    kit::name(&resp, Role::ListItem, message_label(m, v, &body));
     let hovered = resp.hovered();
     let t = ui.ctx().animate_bool_with_time(resp.id, hovered, 0.1);
     let painter = ui.painter();
@@ -456,6 +468,7 @@ fn bubble(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, end: bool, p:
         Rect::from_min_size(pos2(row.left() + 8.0 + gutter, row.top() + head), size)
     };
     let resp = ui.interact(bubble, ui.scope_id().with(("bubble", m.id, m.ts)), Sense::click());
+    kit::name(&resp, Role::ListItem, message_label(m, v, v.text));
     let (big, small) = (18u8, 5u8);
     let mut c = CornerRadius::same(big);
     let joined_top = !start;
@@ -498,6 +511,16 @@ fn bubble(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, end: bool, p:
     }
     let resp = resp.on_hover_text(&v.time);
     copy_menu(&resp, v.text);
+}
+
+/// `bob: hi there` (`you: …` for your own), for the accessibility tree.
+fn message_label(m: &ChatMessage, v: &View<'_>, body: &str) -> String {
+    let who = match m.kind {
+        MessageKind::Server if m.author.is_empty() => "server",
+        _ if v.own => "you",
+        _ => &m.author,
+    };
+    if v.emote { body.to_owned() } else { format!("{who}: {body}") }
 }
 
 /// One line per message: `time author text`, in the order `row` says.

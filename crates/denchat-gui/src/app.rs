@@ -13,6 +13,7 @@ use denchat_core::session::{ConnState, Session, SessionState, VoiceStatsView};
 use denchat_core::ui::PanelContent;
 use egui::{Align, Align2, CornerRadius, Frame, Id, Layout as ELayout, Margin, Order, Stroke, Ui, ViewportCommand};
 
+use crate::agent::{self, AgentPlugin, Kind};
 use crate::catalog::{Catalog, Entry};
 use crate::layout::{Layout, Screen, ShellStyle, Slot, SlotMode, SlotName, parse_key};
 use crate::panels::{Actions, Missing, ModPanel, Panel, PanelCx, Registry, ShellCmd, ShellView};
@@ -62,16 +63,28 @@ pub struct DenApp {
     exit_now: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// UI zoom: `DEN_SCALE` (or `--scale`) wins over `[ui] scale`.
+fn scale(configured: f32) -> f32 {
+    std::env::var("DEN_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| (0.25..=5.0).contains(s)).unwrap_or(configured)
+}
+
 impl DenApp {
     pub fn new(cc: &eframe::CreationContext<'_>, session: Session, registry: Registry) -> DenApp {
-        let ctx = cc.egui_ctx.clone();
-        session.on_change(move || ctx.request_repaint());
+        DenApp::create(&cc.egui_ctx, cc.storage, session, registry, Kind::Window)
+    }
+
+    /// Build the app on any egui context: eframe's window, or the headless runner.
+    pub fn create(ctx: &egui::Context, storage: Option<&dyn eframe::Storage>, session: Session, registry: Registry, kind: Kind) -> DenApp {
+        let repaint = ctx.clone();
+        session.on_change(move || repaint.request_repaint());
+        agent::attach(ctx, session.ui(), kind);
         let hidden: HashSet<String> =
-            cc.storage.and_then(|s| eframe::get_value::<Vec<String>>(s, HIDDEN_KEY)).unwrap_or_default().into_iter().collect();
+            storage.and_then(|s| eframe::get_value::<Vec<String>>(s, HIDDEN_KEY)).unwrap_or_default().into_iter().collect();
         let catalog = Catalog::scan(session.paths(), &session.mods());
         let ui_cfg = session.config().ui;
-        if (ui_cfg.scale - 1.0).abs() > f32::EPSILON && ui_cfg.scale > 0.25 {
-            cc.egui_ctx.set_zoom_factor(ui_cfg.scale);
+        let zoom = scale(ui_cfg.scale);
+        if (zoom - 1.0).abs() > f32::EPSILON && zoom > 0.25 {
+            ctx.set_zoom_factor(zoom);
         }
         let mut app = DenApp {
             session,
@@ -99,7 +112,7 @@ impl DenApp {
             }),
             exit_now: Default::default(),
         };
-        app.load_theme(&cc.egui_ctx, &ui_cfg.theme);
+        app.load_theme(ctx, &ui_cfg.theme);
         app.load_layout(&ui_cfg.layout);
         app
     }
@@ -307,37 +320,36 @@ impl DenApp {
         }
     }
 
-    /// Window screenshots on request (`ui.screenshot` API or `DEN_SCREENSHOT`),
-    /// so people and agents can check a theme/layout change without a display.
+    /// `DEN_SCREENSHOT=<png>`: one screenshot once the UI has settled (then
+    /// exit with `DEN_SCREENSHOT_EXIT=1`). `ui.screenshot` goes through the
+    /// agent plugin the same way.
     fn screenshots(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
         if self.exit_now.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
-        let mut request = self.session.ui().take_screenshot_request().map(|p| (p, false));
-        if let Some((at, path)) = &self.auto_shot {
-            if Instant::now() >= *at {
-                request = Some((path.clone(), std::env::var("DEN_SCREENSHOT_EXIT").is_ok_and(|v| v == "1")));
-                self.auto_shot = None;
-            } else {
-                ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
-            }
+        let Some((at, path)) = &self.auto_shot else { return };
+        if Instant::now() < *at {
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+            return;
         }
-        let Some((path, exit)) = request else { return };
-        let session = self.session.clone();
-        let exit_now = self.exit_now.clone();
-        let repaint = ctx.clone();
-        ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
-            match save_png(&path, &img) {
-                Ok(()) => tracing::info!("screenshot saved to {}", path.display()),
-                Err(e) => session.notice(NoticeLevel::Error, format!("screenshot {}: {e:#}", path.display())),
+        let exit = std::env::var("DEN_SCREENSHOT_EXIT").is_ok_and(|v| v == "1");
+        let (call, rx) = denchat_core::ui::FrontendCall::new("ui.screenshot", serde_json::json!({"path": path}));
+        ctx.with_plugin::<AgentPlugin, _>(|p| p.submit(call));
+        self.auto_shot = None;
+        let (session, exit_now, repaint) = (self.session.clone(), self.exit_now.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            match rx.blocking_recv() {
+                Ok(Ok(v)) => tracing::info!("screenshot saved to {}", v["path"].as_str().unwrap_or("?")),
+                Ok(Err(e)) => session.notice(NoticeLevel::Error, format!("screenshot: {e}")),
+                Err(_) => {}
             }
             if exit {
                 exit_now.store(true, Ordering::Relaxed);
             }
             repaint.request_repaint();
-        })));
+        });
         ctx.request_repaint();
     }
 
@@ -351,6 +363,7 @@ impl DenApp {
         };
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+            ctx.with_plugin::<AgentPlugin, _>(|p| p.set_title(&title));
             self.title = title;
         }
     }
@@ -358,6 +371,19 @@ impl DenApp {
 
 impl eframe::App for DenApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
+        hidden.sort();
+        eframe::set_value(storage, HIDDEN_KEY, &hidden);
+    }
+}
+
+impl DenApp {
+    /// One frame of the whole app into the root `ui`.
+    pub fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         if self.session.config().ui.hot_reload {
@@ -419,12 +445,6 @@ impl eframe::App for DenApp {
         for cmd in actions.shell.drain(..) {
             self.apply_shell(&ctx, cmd);
         }
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
-        hidden.sort();
-        eframe::set_value(storage, HIDDEN_KEY, &hidden);
     }
 }
 
@@ -559,7 +579,20 @@ impl Render<'_> {
         let inst = self.instances.get_mut(id).expect("instance exists");
         let mut cx =
             PanelCx { id, session, state, palette, voice, settings, shell: &self.shell, actions: self.actions, in_card: self.in_card };
-        ui.push_id(("panel", id), |ui| inst.panel.show(ui, &mut cx));
+        ui.push_id(("panel", id), |ui| {
+            // A node in the accessibility tree that groups the panel's widgets,
+            // so `den ui tree`/`click` can tell panels apart.
+            let node = ui.unique_id();
+            ui.ctx().accesskit_node_builder(node, |n| {
+                n.set_role(egui::accesskit::Role::Group);
+                n.set_author_id(format!("{}{id}", agent::PANEL_TAG));
+            });
+            inst.panel.show(ui, &mut cx);
+            let r = ui.min_rect();
+            ui.ctx().accesskit_node_builder(node, |n| {
+                n.set_bounds(egui::accesskit::Rect { x0: r.min.x.into(), y0: r.min.y.into(), x1: r.max.x.into(), y1: r.max.y.into() });
+            });
+        });
     }
 
     fn screen(
@@ -805,20 +838,6 @@ fn slot_card(p: &Palette, fill: egui::Color32, margin: Margin) -> Frame {
         .stroke(Stroke::new(1.0, p.line))
         .shadow(p.shadow)
         .inner_margin(margin)
-}
-
-fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, img.size[0] as u32, img.size[1] as u32);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut w = enc.write_header()?;
-    let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
-    w.write_image_data(&bytes)?;
-    Ok(())
 }
 
 /// Narrowest a left/right slot gets, and the width the centre keeps.

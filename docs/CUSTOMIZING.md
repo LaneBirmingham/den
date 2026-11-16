@@ -141,11 +141,15 @@ reload = "Ctrl+Shift+R"  # reload theme + layout
 ```sh
 den api ui.theme.set name=rose-pine-dawn
 den api ui.layout.set name=messenger
-den api ui.screenshot path=/tmp/look.png
+den ui shot /tmp/look.png
 ```
 
-`DEN_SCREENSHOT=out.png DEN_SCREENSHOT_EXIT=1 den` renders the
-lobby, saves a PNG and quits (`DEN_SCREENSHOT_DELAY_MS` to wait longer).
+To try a look without touching the running app, start a sandbox from your
+own setup: `den sandbox start t --copy-config --theme rose-pine-dawn`, then
+`den -S t ui shot /tmp/t.png` ([AGENT-TESTING.md](AGENT-TESTING.md)).
+`DEN_SCREENSHOT=out.png DEN_SCREENSHOT_EXIT=1 den` renders the lobby,
+saves a PNG and quits (`DEN_SCREENSHOT_DELAY_MS` to wait longer; add
+`DEN_WINDOW=headless` for no window).
 
 ## Going further
 

@@ -25,6 +25,10 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `den status | head` should end quietly, not panic on the closed pipe.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Leave the console window Windows opens when the app is started from Explorer,
 # turn on colour in the console, and let an already-running app take the foreground.

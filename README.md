@@ -143,6 +143,11 @@ den serve [--room <saved> | --adopt <link>] [...]   always-on host + admin conso
 den relay [--port 3340]     a relay on its own, for rooms hosted from apps
 den discover [--json]       which of your saved rooms are live
 den api <method> [params]   drive a running instance (see docs/API.md)
+den ui tree|click|type|key|scroll|hover|wait|shot|window|scale|clip|quit
+                            use the app in the background, like a person would (agents, tests)
+den status | den wait <event> [--where k=v]   state summary / block until an event
+den sandbox start|list|stop|path   throwaway headless Dens for testing mods and rooms
+den doctor [--json]         network self-check: reach, port mapping, relays, firewall
 den mods list|new|link|unlink|enable|disable|path
 den config path|init        where files live / write editable defaults
 den devices | voice-test    audio checks
@@ -150,6 +155,9 @@ den devices | voice-test    audio checks
 
 Global flags: `--home <dir>` (or `DEN_HOME`) keeps config/data/state in
 one folder — handy for running several instances on one machine.
+`-S <name>` does the same for a `den sandbox`. Before the command,
+`--window headless` (no window at all), `--size WxH` and `--scale 1.5`
+change how the app shows itself for that run.
 
 In the chat box, `/invite` prints the room's invite link and `/whoami` your
 key for the room.
@@ -159,14 +167,15 @@ key for the room.
 * **Theme / layout:** *View* menu in the app, or `config.toml` → `[ui]`.
   `den config init` exports the built-ins to your config folder; edit
   and save — the app hot-reloads. → [docs/CUSTOMIZING.md](docs/CUSTOMIZING.md)
-* **Mods:** `den mods new my.mod` scaffolds one. Examples in
+* **Mods:** `den mods new --id my.mod` scaffolds one. Examples in
   [`mods/`](mods). → [docs/MODS.md](docs/MODS.md)
 * **Turn things off:** delete a panel from the layout, or switch whole
   modules off in `config.toml` → `[modules]` (`voice`, `mods`, `api`,
   `discovery`, `slash_commands`).
 * **Using an AI agent:** point it at [AGENTS.md](AGENTS.md). It can edit
-  themes/layouts/mods, apply them live, and screenshot the result
-  (`den api ui.screenshot`).
+  themes/layouts/mods, try them in a headless sandbox, click through them
+  and screenshot the result, then apply them live
+  ([docs/AGENT-TESTING.md](docs/AGENT-TESTING.md)).
 
 ## Platforms
 

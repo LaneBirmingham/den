@@ -1,4 +1,5 @@
 use denchat_core::proto::Member;
+use egui::accesskit::Role;
 use egui::{Color32, Sense, Ui, pos2, vec2};
 
 use super::{Panel, PanelCx};
@@ -24,7 +25,8 @@ impl Panel for Members {
         let behind = if cx.in_card { p.panel } else { p.canvas };
         ui.spacing_mut().item_spacing.y = 2.0;
 
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+        kit::name(&resp, Role::Heading, format!("People ({})", cx.state.members.len()));
         let g = kit::line(ui, "People", kit::font(15.0, W::Semibold), p.text, rect.width() - 40.0);
         kit::put(ui.painter(), &g, rect.left() + 4.0, rect.center().y, p.text);
         kit::badge(ui.painter(), ui, pos2(rect.right() - 4.0, rect.center().y), &cx.state.members.len().to_string(), p.surface, p.muted);
@@ -48,10 +50,11 @@ impl Panel for Members {
                 0 => ("Just you".to_owned(), "waiting for others".to_owned()),
                 _ => (others.join(", "), "and you".to_owned()),
             };
-            let g = kit::line(ui, title, kit::font(14.0, W::Semibold), p.text, r.right() - x);
+            let g = kit::line(ui, title.clone(), kit::font(14.0, W::Semibold), p.text, r.right() - x);
             kit::put(ui.painter(), &g, x, r.center().y - 8.0, p.text);
-            let g = kit::line(ui, sub, kit::font(12.0, W::Regular), p.muted, r.right() - x);
+            let g = kit::line(ui, sub.clone(), kit::font(12.0, W::Regular), p.muted, r.right() - x);
             kit::put(ui.painter(), &g, x, r.center().y + 9.0, p.muted);
+            kit::name(&resp, Role::Label, format!("{title}, {sub}"));
             resp.on_hover_text(faces.iter().map(|f| f.0.as_str()).collect::<Vec<_>>().join("\n"));
             if !rest.is_empty() {
                 kit::section(ui, "Elsewhere", &p);
@@ -103,6 +106,7 @@ fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, talking: bool, behind: 
         ui.painter().rect_filled(r, egui::CornerRadius::same(4), p.surface);
         ui.painter().galley(r.center() - tag.size() / 2.0, tag, p.muted);
     }
+    kit::name(&resp, Role::ListItem, format!("{}{} · {status}", m.nick, if is_me { " (you)" } else { "" }));
     let g = kit::line(ui, status, kit::font(12.0, W::Regular), color, right - x);
     kit::put(ui.painter(), &g, x, rect.center().y + 9.0, color);
     let who = match (m.identity.verified, m.identity.short()) {

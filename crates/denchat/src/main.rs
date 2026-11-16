@@ -6,8 +6,11 @@
 //! * `den serve`                   an always-on host for a room, with an admin console
 //! * `den relay`                   a relay on its own, for rooms hosted from apps
 //! * `den api <method> [params]`   drive any running instance (mods, scripts, agents)
-//! * `den discover | mods | config | devices | voice-test`
+//! * `den ui …`, `den status`, `den wait`   drive and watch the app (agents, scripts)
+//! * `den sandbox start|list|stop`         throwaway background instances for tests
+//! * `den discover | mods | config | devices | voice-test | doctor`
 
+mod agent;
 mod cli;
 mod doctor;
 mod serve;
@@ -33,6 +36,19 @@ struct Cli {
     /// More logging (-v info, -vv debug).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Use (or drive) the sandbox of this name: `den -S a ui tree`. See `den sandbox`.
+    #[arg(short = 'S', long, global = true, env = "DEN_SANDBOX")]
+    sandbox: Option<String>,
+    /// How the app shows itself: `normal`, or `headless` (no window at all;
+    /// drive it with `den ui`). Before the command: `den --window headless host`.
+    #[arg(long, env = "DEN_WINDOW", value_name = "MODE")]
+    window: Option<String>,
+    /// Window size in points, WxH (e.g. 1100x720); not remembered.
+    #[arg(long, env = "DEN_SIZE", value_name = "WxH")]
+    size: Option<String>,
+    /// UI zoom for this run (overrides `[ui] scale`).
+    #[arg(long, env = "DEN_SCALE")]
+    scale: Option<f32>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -91,6 +107,24 @@ enum Cmd {
     },
     /// Call the control API of a running Den (`den api api.methods`).
     Api(cli::ApiArgs),
+    /// Drive the running app like a user, in the background: widget tree,
+    /// click, type, keys, scroll, screenshots, window. `den ui tree` to start.
+    Ui {
+        #[command(subcommand)]
+        cmd: agent::UiCmd,
+    },
+    /// Summary of the running app: connection, room, channels, members, voice, mods.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for an event from the running app and print it (`den wait message.created --where text=hi`).
+    Wait(agent::WaitArgs),
+    /// Throwaway Dens in the background, each with its own home, for testing mods and rooms end to end.
+    Sandbox {
+        #[command(subcommand)]
+        cmd: agent::SandboxCmd,
+    },
     /// Manage mods.
     Mods {
         #[command(subcommand)]
@@ -145,13 +179,52 @@ pub enum Start {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    if let Some(home) = &cli.home {
-        // SAFETY: single-threaded at this point; nothing else reads the environment yet.
-        unsafe { std::env::set_var("DEN_HOME", home) };
+    let mut cli = Cli::parse();
+    // The user's own profile, before a sandbox replaces it (`sandbox start --copy-config`).
+    let user_paths = Paths::detect();
+    if let Some(name) = &cli.sandbox
+        && !matches!(cli.cmd, Some(Cmd::Sandbox { .. }))
+    {
+        cli.home = Some(agent::sandbox_home(name)?);
     }
-    let quiet_default = matches!(cli.cmd, None | Some(Cmd::Gui | Cmd::Host { .. } | Cmd::Join { .. } | Cmd::Chat { .. } | Cmd::Api(_)));
+    // SAFETY: single-threaded at this point; nothing else reads the environment yet.
+    unsafe {
+        if let Some(home) = &cli.home {
+            std::env::set_var("DEN_HOME", home);
+        }
+        for (key, value) in
+            [("DEN_WINDOW", cli.window.clone()), ("DEN_SIZE", cli.size.clone()), ("DEN_SCALE", cli.scale.map(|s| s.to_string()))]
+        {
+            if let Some(v) = value {
+                std::env::set_var(key, v);
+            }
+        }
+    }
+    let quiet_default = matches!(
+        cli.cmd,
+        None | Some(
+            Cmd::Gui
+                | Cmd::Host { .. }
+                | Cmd::Join { .. }
+                | Cmd::Chat { .. }
+                | Cmd::Api(_)
+                | Cmd::Ui { .. }
+                | Cmd::Status { .. }
+                | Cmd::Wait(_)
+                | Cmd::Sandbox { .. }
+        )
+    );
     init_logging(cli.verbose, quiet_default);
+    // Commands that print and exit end quietly when their reader goes away
+    // (`den ui tree | head`); the app and servers keep ignoring SIGPIPE.
+    #[cfg(unix)]
+    if !matches!(
+        cli.cmd,
+        None | Some(Cmd::Gui | Cmd::Host { .. } | Cmd::Join { .. } | Cmd::Chat { .. } | Cmd::Serve(_) | Cmd::Relay { .. })
+    ) {
+        // SAFETY: restoring the default action for one signal, before any threads start.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let paths = Paths::detect();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("den-rt").build()?;
 
@@ -180,6 +253,10 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Discover { json }) => rt.block_on(cli::discover(&paths, json)),
         Some(Cmd::Doctor { json }) => rt.block_on(doctor::run(&paths, json)),
         Some(Cmd::Api(args)) => rt.block_on(cli::api(args, &paths)),
+        Some(Cmd::Ui { cmd }) => rt.block_on(agent::ui(cmd, &paths)),
+        Some(Cmd::Status { json }) => rt.block_on(agent::status(&paths, json)),
+        Some(Cmd::Wait(args)) => rt.block_on(agent::wait(args, &paths)),
+        Some(Cmd::Sandbox { cmd }) => rt.block_on(agent::sandbox(cmd, &user_paths)),
         Some(Cmd::Mods { cmd }) => rt.block_on(cli::mods(cmd, &paths)),
         Some(Cmd::Config { cmd }) => cli::config(cmd, &paths),
         Some(Cmd::Devices) => cli::devices(),

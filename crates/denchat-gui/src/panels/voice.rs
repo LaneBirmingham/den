@@ -1,4 +1,5 @@
 use denchat_core::session::ConnState;
+use egui::accesskit::Role;
 use egui::{CornerRadius, Rect, RichText, Sense, Ui, pos2, vec2};
 
 use super::{Panel, PanelCx};
@@ -105,15 +106,21 @@ impl Panel for Voice {
                 (_, ConnState::Idle) => ("Offline".into(), p.muted, String::new()),
             };
             let indent = if v.channel.is_some() && connected { 16.0 } else { 0.0 };
+            let me = format!("{} · {status}", cx.state.nick);
             let g = kit::line(ui, status, kit::font(12.0, W::Regular), color, w - indent);
             kit::put(ui.painter(), &g, x + indent, y + 9.0, color);
             if v.channel.is_some() && supported {
                 if let Some(g) = gear.take() {
+                    kit::name(&g, Role::Button, format!("Voice settings ({me})"));
                     let tip = if tip.is_empty() { "Voice settings".to_owned() } else { format!("{tip}\nClick for voice settings") };
                     gear = Some(g.on_hover_text(tip));
                 }
-            } else if !tip.is_empty() {
-                ui.interact(me_rect, ui.scope_id().with("me-tip"), Sense::hover()).on_hover_text(tip);
+            } else {
+                let resp = ui.interact(me_rect, ui.scope_id().with("me-tip"), Sense::hover());
+                kit::name(&resp, Role::Label, me);
+                if !tip.is_empty() {
+                    resp.on_hover_text(tip);
+                }
             }
 
             if supported && v.channel.is_some() && v.mode == "push_to_talk" {

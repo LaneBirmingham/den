@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use denchat_core::proto::{Channel, Member, MessageKind};
+use egui::accesskit::Role;
 use egui::{CornerRadius, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 
 use super::{Panel, PanelCx};
@@ -97,6 +98,7 @@ fn channel_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel) {
     let weight = if unread > 0 && !selected { W::Semibold } else { W::Medium };
     let g = kit::line(ui, &c.name, kit::font(14.5, weight), if lit { p.text } else { p.muted }, right - rect.left() - 40.0);
     kit::put(ui.painter(), &g, rect.left() + 34.0, rect.center().y, p.text);
+    kit::name_selected(&resp, Role::Button, selected, unread_label(&format!("#{}", c.name), unread, mentions));
     if resp.clicked() && !selected {
         focus(cx, &c.id);
     }
@@ -151,6 +153,7 @@ fn conversation_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel) {
     let color = if unread > 0 && !selected { p.text2 } else { p.muted };
     let g = kit::line(ui, preview.replace('\n', " "), kit::font(12.5, W::Regular), color, right - x);
     kit::put(painter, &g, x, bottom, color);
+    kit::name_selected(&resp, Role::Button, selected, unread_label(&format!("#{}", c.name), unread, mentions));
     if resp.clicked() && !selected {
         focus(cx, &c.id);
     }
@@ -188,6 +191,8 @@ fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet<
     }
     let g = kit::line(ui, &c.name, kit::font(14.5, W::Medium), p.muted, right - rect.left() - 34.0);
     kit::put(ui.painter(), &g, rect.left() + 34.0, rect.center().y, p.muted);
+    let who = folks.iter().map(|f| f.0.as_str()).collect::<Vec<_>>().join(", ");
+    kit::name(&resp, Role::Button, if who.is_empty() { format!("Join {}", c.name) } else { format!("Join {} ({who})", c.name) });
     let resp = resp.on_hover_text(if folks.is_empty() {
         "Nobody here yet — click to join".to_owned()
     } else {
@@ -206,7 +211,8 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet
     kit::card(&p, fill, !cx.in_card).stroke(Stroke::new(1.0, p.ok_soft)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        kit::name(&resp, Role::Heading, format!("{} (you're here)", c.name));
         let painter = ui.painter();
         kit::icon(painter, pos2(rect.left() + 9.0, rect.center().y), icons::SPEAKER_HIGH, 16.0, p.ok);
         let here = match cx.state.voice.joined_at {
@@ -242,7 +248,7 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet
             }
             let name = if me { format!("{} (you)", m.nick) } else { m.nick.clone() };
             let (font, color) = if talking { (kit::font(14.0, W::Semibold), p.text) } else { (kit::font(14.0, W::Regular), p.muted) };
-            let g = kit::line(ui, name, font, color, right - r.left() - 34.0);
+            let g = kit::line(ui, name.clone(), font, color, right - r.left() - 34.0);
             kit::put(ui.painter(), &g, r.left() + 32.0, r.center().y, color);
             let state = if m.deafened {
                 "deafened"
@@ -253,12 +259,22 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet
             } else {
                 ""
             };
+            kit::name(&resp, Role::Label, if state.is_empty() { name } else { format!("{name} · {state}") });
             if !state.is_empty() {
                 resp.on_hover_text(state);
             }
         }
     });
     ui.add_space(4.0);
+}
+
+/// `#general · 3 unread`, for the accessibility tree.
+fn unread_label(name: &str, unread: u32, mentions: u32) -> String {
+    match (unread, mentions) {
+        (_, m) if m > 0 => format!("{name} · {m} mentions"),
+        (0, _) => name.to_owned(),
+        (n, _) => format!("{name} · {n} unread"),
+    }
 }
 
 /// `42:10` or `1:02:03`.
