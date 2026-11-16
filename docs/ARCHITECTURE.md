@@ -100,8 +100,8 @@ A room is a save that every member holds, not a process:
   answers `host_ready {term, addrs}`; the host broadcasts
   `handoff {to, term}`, everyone (the old host's own session too)
   reconnects there and syncs, and the old server stops a few seconds later.
-  Leaving while hosting does this with the first member who can host, and
-  so does closing: the app's window, SIGTERM/Ctrl-C to the app
+  Leaving while hosting does this with the best placed member who can
+  host (see *Reachability* below), and so does closing: the app's window, SIGTERM/Ctrl-C to the app
   (`Session::close`, idempotent, ~6 s cap) and to `serve`
   (`ServerNode::close`). The new host gets the same "you're hosting" notice
   as a manual takeover.
@@ -133,6 +133,41 @@ A room is a save that every member holds, not a process:
 Everyone has the same rights, so there are no roles to sync; join rules
 travel in `welcome` (`access`), and with the invite key and profiles, are
 enforced by whoever hosts.
+
+## Reachability: who should host
+
+Everyone connects to the host, so the room works best when others can reach
+the host directly: then nobody needs a relay, whatever their own NAT. Each
+member carries `reach` (`proto::Reach`, worst to best):
+
+| `reach` | meaning |
+| --- | --- |
+| `strict` | UDP blocked, or a NAT that picks a new port per destination (hole-punching rarely works) |
+| `unknown` | not measured yet |
+| `nat` | behind a router: connecting out works, connections in need hole-punching |
+| `public` | the machine has a public address (not checked yet) |
+| `open` | the host connected to it directly, from a fresh endpoint |
+
+* **The app measures itself** (`Net::reach`): iroh's network report (UDP
+  over v4/v6, whether the NAT mapping varies by destination; needs relays)
+  plus whether this machine's own outgoing address is public, or the router
+  forwards it a port (iroh's port mapper asks for one by UPnP / NAT-PMP /
+  PCP; `Net` asks the router every 5 min whether it offers that). It sends that
+  in `hello` and, when it or its address changes, in `reach {reach, addr}`
+  (checked every 5 s). A claim is capped at `public`.
+* **The host checks** (`server::check_reach`): it dials the member's public
+  addresses from a throwaway endpoint with no relay, no port mapping and no
+  history with the member, so nothing can hole-punch for it. Success means
+  anyone could connect: `open`. Failure caps the claim at `nat`. One check
+  per member every 2 s at most; a newer report wins. The host's own app
+  (hosting from it) isn't checked. Loopback-only hosts (tests) check
+  loopback addresses too. Caveat: a member on the host's LAN is checked via
+  the router (hairpin NAT), and an address-restricted NAT can let the host's
+  IP in where a stranger's wouldn't.
+* **Uses** — `hand_off(None)` picks the best `reach`, then whoever has been
+  here longest. When the host is gone, `SessionState::best_host` /
+  `better_host` tell the UI (and `/takeover`) if someone else is better
+  placed to take over; it stays a manual choice.
 
 ## Identity: a key per room
 
@@ -166,7 +201,7 @@ fix.
   bidirectional stream. `ClientMsg` / `ServerMsg` are tagged enums
   (`{"type": "send", …}`). A connection either sends `probe {room?}`
   (discovery: get room info, close) or `hello` (version, nick, codecs,
-  features, room, proof, the app's own link) and receives `welcome` with
+  features, room, proof, the app's own link, its `reach`) and receives `welcome` with
   members, channels, join rules, profiles and the voice setup (a per-member
   token), followed by history. Room sync and handoff messages are described
   above.

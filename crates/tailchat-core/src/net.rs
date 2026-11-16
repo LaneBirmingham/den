@@ -23,11 +23,11 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use data_encoding::{BASE32_DNSSEC, HEXLOWER};
-use iroh::endpoint::{BindOpts, Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, TransportAddr};
+use iroh::endpoint::{BindOpts, Connection, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, TransportAddr, Watcher};
 use parking_lot::Mutex;
 use serde::{Serialize, de::DeserializeOwned};
-use tailchat_proto::{ALPN, ClientMsg, MAX_FRAME, Proof, ServerMsg, encode_frame};
+use tailchat_proto::{ALPN, ClientMsg, MAX_FRAME, Proof, Reach, ServerMsg, encode_frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -305,6 +305,9 @@ struct NetInner {
     next_route: AtomicU64,
     /// A second endpoint for joining rooms this one hosts (an endpoint can't dial itself).
     loopback: tokio::sync::OnceCell<Endpoint>,
+    /// The router offers port mapping (UPnP, NAT-PMP or PCP), so the
+    /// endpoint's own port mapper (on by default) has a port forwarded to it.
+    router_maps: AtomicBool,
 }
 
 /// This process's endpoint. Cheap to clone.
@@ -343,6 +346,108 @@ pub fn relay_map(cfg: &NetConfig) -> anyhow::Result<RelayMap> {
 fn relay_mode(cfg: &NetConfig) -> anyhow::Result<(RelayMode, bool)> {
     let map = relay_map(cfg)?;
     if map.is_empty() { Ok((RelayMode::Disabled, false)) } else { Ok((RelayMode::Custom(map), true)) }
+}
+
+/// What an endpoint knows about its network, for [`Net::reach`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetFacts {
+    /// A network report has run (it needs relays).
+    pub measured: bool,
+    pub udp_v4: bool,
+    pub udp_v6: bool,
+    /// The NAT gives each destination its own port (hole-punching rarely works).
+    pub varies_v4: bool,
+    pub varies_v6: bool,
+    /// The machine itself has a public address (not just its router).
+    pub public_v4: bool,
+    pub public_v6: bool,
+    /// The router forwards a port to the endpoint (UPnP / NAT-PMP / PCP).
+    pub mapped: bool,
+}
+
+impl NetFacts {
+    pub fn reach(self) -> Reach {
+        let v4_open = self.public_v4 || self.mapped;
+        if (v4_open && (self.udp_v4 || !self.measured)) || (self.public_v6 && (self.udp_v6 || !self.measured)) {
+            return Reach::Public;
+        }
+        if !self.measured {
+            return Reach::Unknown;
+        }
+        let v4 = self.udp_v4 && !self.varies_v4;
+        let v6 = self.udp_v6 && !self.varies_v6;
+        if v4 || v6 { Reach::Nat } else { Reach::Strict }
+    }
+}
+
+/// Keep asking the router (every 5 minutes) whether it maps ports. Only
+/// asks; the endpoint's own port mapper makes the mapping.
+async fn watch_router(inner: Weak<NetInner>) {
+    let client = portmapper::Client::new(portmapper::Config::default());
+    loop {
+        let found = match client.probe().await {
+            Ok(Ok(out)) => out.upnp || out.pcp || out.nat_pmp,
+            Ok(Err(e)) => {
+                tracing::debug!("port mapping probe: {e}");
+                false
+            }
+            Err(_) => false,
+        };
+        let Some(i) = inner.upgrade() else { return };
+        if i.ep.is_closed() {
+            return;
+        }
+        if i.router_maps.swap(found, Ordering::Relaxed) != found {
+            tracing::info!("the router {} port mapping", if found { "offers" } else { "doesn't offer" });
+        }
+        drop(i);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+    }
+}
+
+/// The address this machine would send from to the internet (no packet is
+/// sent: connecting a UDP socket only picks a route; the targets are
+/// documentation addresses).
+fn primary_ip(v6: bool) -> Option<IpAddr> {
+    let (bind, to) = if v6 { ("[::]:0", "[2001:db8::1]:9") } else { ("0.0.0.0:0", "192.0.2.1:9") };
+    let s = std::net::UdpSocket::bind(bind).ok()?;
+    s.connect(to).ok()?;
+    Some(s.local_addr().ok()?.ip())
+}
+
+/// Can a fresh endpoint connect to `id` at `addrs` directly within
+/// `timeout`? It has no relay, no port mapping and no history with the
+/// peer, so nothing can hole-punch for it: success means anyone could.
+pub async fn reachable(id: EndpointId, addrs: Vec<SocketAddr>, timeout: Duration) -> bool {
+    if addrs.is_empty() {
+        return false;
+    }
+    let ep = match Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .portmapper_config(PortmapperConfig::Disabled)
+        .bind()
+        .await
+    {
+        Ok(ep) => ep,
+        Err(e) => {
+            tracing::debug!("reach check: no endpoint: {e:#}");
+            return false;
+        }
+    };
+    let addr = EndpointAddr::from_parts(id, addrs.into_iter().map(TransportAddr::Ip));
+    let ok = match tokio::time::timeout(timeout, ep.connect(addr, ALPN)).await {
+        Ok(Ok(conn)) => {
+            conn.close(0u32.into(), b"reach check");
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("reach check of {}: {e:#}", id.fmt_short());
+            false
+        }
+        Err(_) => false,
+    };
+    ep.close().await;
+    ok
 }
 
 /// A short, human form of a link (its endpoint id), or `raw` if it isn't one.
@@ -397,8 +502,12 @@ impl Net {
             routes: Mutex::new(Vec::new()),
             next_route: AtomicU64::new(1),
             loopback: tokio::sync::OnceCell::new(),
+            router_maps: AtomicBool::new(false),
         });
-        tokio::spawn(accept_loop(Arc::downgrade(&inner), ep));
+        tokio::spawn(accept_loop(Arc::downgrade(&inner), ep.clone()));
+        if !ep.bound_sockets().iter().all(|a| a.ip().is_loopback()) {
+            tokio::spawn(watch_router(Arc::downgrade(&inner)));
+        }
         tracing::info!("network endpoint {} up on {:?} (relays {})", inner.ep.id().fmt_short(), inner.ep.bound_sockets(), if relays { "on" } else { "off" });
         Ok(Net { inner })
     }
@@ -463,6 +572,32 @@ impl Net {
         }
     }
 
+    /// How reachable this endpoint looks from here (see [`Reach`]), from the
+    /// endpoint's network report and this machine's addresses. Never `open`:
+    /// that takes someone else connecting in.
+    pub fn reach(&self) -> Reach {
+        let loopback = self.bound().iter().all(|a| a.ip().is_loopback());
+        let public = |v6| !loopback && primary_ip(v6).is_some_and(crate::relay::is_public);
+        // The router forwards a port to us, and we know our public IPv4.
+        let mapped = self.inner.router_maps.load(Ordering::Relaxed)
+            && self.inner.ep.addr().ip_addrs().any(|a| a.is_ipv4() && crate::relay::is_public(a.ip()));
+        let mut report = self.inner.ep.net_report();
+        let facts = match report.get() {
+            Some(r) => NetFacts {
+                measured: true,
+                udp_v4: r.udp_v4,
+                udp_v6: r.udp_v6,
+                varies_v4: r.mapping_varies_by_dest_ipv4 == Some(true),
+                varies_v6: r.mapping_varies_by_dest_ipv6 == Some(true),
+                public_v4: public(false),
+                public_v6: public(true),
+                mapped,
+            },
+            None => NetFacts { public_v4: public(false), public_v6: public(true), mapped, ..NetFacts::default() },
+        };
+        facts.reach()
+    }
+
     /// A link to this endpoint (no room).
     pub async fn link(&self) -> Link {
         Link::new(self.ready_addr().await)
@@ -487,6 +622,8 @@ impl Net {
                     .get_or_try_init(|| async {
                         Endpoint::builder(presets::Minimal)
                             .relay_mode(RelayMode::Disabled)
+                            // It's only for this machine: no router mapping.
+                            .portmapper_config(PortmapperConfig::Disabled)
                             .clear_ip_transports()
                             .bind_addr("127.0.0.1:0")?
                             .bind()
@@ -608,6 +745,23 @@ fn no_room(room: Option<&str>) -> ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reach_from_facts() {
+        let nat = NetFacts { measured: true, udp_v4: true, ..NetFacts::default() };
+        assert_eq!(nat.reach(), Reach::Nat);
+        assert_eq!(NetFacts { varies_v4: true, ..nat }.reach(), Reach::Strict);
+        // Strict over IPv4, but IPv6 works without a NAT in the way.
+        assert_eq!(NetFacts { varies_v4: true, udp_v6: true, ..nat }.reach(), Reach::Nat);
+        assert_eq!(NetFacts { public_v4: true, ..nat }.reach(), Reach::Public);
+        // A strict NAT, but the router forwards a port to us.
+        assert_eq!(NetFacts { varies_v4: true, mapped: true, ..nat }.reach(), Reach::Public);
+        assert_eq!(NetFacts { measured: true, ..NetFacts::default() }.reach(), Reach::Strict);
+        assert_eq!(NetFacts::default().reach(), Reach::Unknown);
+        // No report (no relays), but the machine has a public address.
+        assert_eq!(NetFacts { public_v4: true, ..NetFacts::default() }.reach(), Reach::Public);
+        assert!(Reach::Open > Reach::Public && Reach::Public > Reach::Nat && Reach::Nat > Reach::Unknown && Reach::Unknown > Reach::Strict);
+    }
 
     #[test]
     fn links_roundtrip() {

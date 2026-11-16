@@ -85,6 +85,12 @@ copies fill each other's gaps. That means:
   asking every member's app they know of. Open a room later from *Your rooms* in the lobby (or
   `tailchat host --room <name>`): it joins whoever hosts it now, or hosts
   it from your copy.
+* **The best placed member hosts next.** Apps measure how easily others can
+  reach them, and the host double-checks by connecting to each member
+  directly. A handoff goes to whoever others can reach most easily (they
+  need no relay to host), and when the host has vanished, *Host this room*
+  says if someone else is better placed. The lobby shows your own network
+  (*behind a router*, *strict network*, …).
 * Everyone in a room has the same rights: anyone can host it. The invite
   key, members' profiles (key → nick) and join rules (`allow`) travel with
   the room. If a host refuses you, there's no *Host this room*: the host is

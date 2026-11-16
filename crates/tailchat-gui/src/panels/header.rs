@@ -106,7 +106,10 @@ fn bar(ui: &mut Ui, cx: &mut PanelCx<'_>) {
 /// already took over).
 fn takeover_button(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     let Some(id) = cx.state.room_id().map(str::to_owned) else { return };
-    let tip = "Nobody is hosting right now. Host the room from your copy; everyone else finds it here.";
+    let mut tip = "Nobody is hosting right now. Host the room from your copy; everyone else finds it here.".to_owned();
+    if let Some(m) = cx.state.better_host() {
+        tip.push_str(&format!("\n\n{} is better placed to host ({}): if they're around, let them.", m.nick, m.reach.short()));
+    }
     if kit::pill_button(ui, "Host this room", cx.palette).on_hover_text(tip).clicked() {
         cx.actions.session(move |s| s.open_room(&id));
     }
@@ -126,13 +129,15 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
                 cx.actions.session(|s| s.notice(tailchat_core::proto::NoticeLevel::Info, "copied the invite link".into()));
                 ui.close();
             }
-            let others: Vec<(u32, String)> = cx.state.can_take_over().map(|m| (m.id, m.nick.clone())).collect();
+            let others: Vec<(u32, String, &'static str)> =
+                cx.state.can_take_over().map(|m| (m.id, m.nick.clone(), m.reach.describe())).collect();
             if others.is_empty() {
                 ui.label(cx.small("Nobody else here can host yet"));
             } else {
                 ui.menu_button(format!("{}  Hand off to…", icons::USERS), |ui| {
-                    for (id, nick) in others {
-                        if ui.button(nick).on_hover_text("they host the room from their copy; everyone moves over").clicked() {
+                    for (id, nick, reach) in others {
+                        let tip = format!("{reach}\nThey host the room from their copy; everyone moves over.");
+                        if ui.button(nick).on_hover_text(tip).clicked() {
                             cx.actions.session(move |s| s.handoff(Some(id)));
                             ui.close();
                         }
@@ -142,6 +147,9 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
             ui.separator();
         } else if cx.state.host_lost() {
             ui.label(cx.small("The host is gone"));
+            if let Some(m) = cx.state.better_host() {
+                ui.label(cx.small(format!("{} is better placed to host ({})", m.nick, m.reach.short())));
+            }
             if let Some(id) = cx.state.room_id().map(str::to_owned)
                 && ui.button(format!("{}  Host this room", icons::ARROW_CLOCKWISE)).clicked()
             {

@@ -16,7 +16,8 @@ after a crash is a button, not automatic.
 ### Next, if wanted
 
 * **Automatic takeover.** When the host vanishes, the first member in a
-  succession list (members who can host, by join time) waits a few seconds
+  succession list (members who can host, best `reach` first, then by join
+  time; `SessionState::best_host` already computes it) waits a few seconds
   and hosts; others try the list in order. Terms already prevent a stale
   host from winning, and the client already looks for the room by id.
 * **Split brain.** Two members clicking *Host this room* at once (or a

@@ -11,7 +11,7 @@ use tailchat_core::config::{AppConfig, NetConfig, RelayServeConfig, ServerConfig
 use tailchat_core::net::{self, Link, Net, SecretKey, read_frame, write_frame};
 use tailchat_core::paths::Paths;
 use tailchat_core::proto::voice::{Codec, Packet};
-use tailchat_core::proto::{ClientMsg, MessageKind, PROTOCOL_VERSION, ServerMsg};
+use tailchat_core::proto::{ClientMsg, FEATURE_HOST, MessageKind, PROTOCOL_VERSION, Reach, ServerMsg};
 use tailchat_core::rooms;
 use tailchat_core::server::{self, ServerHandle, ServerMode, ServerOptions};
 use tailchat_core::server_node::{NodeOptions, ServerNode};
@@ -300,6 +300,18 @@ command = ["sh", "-c", "echo '[{\"type\":\"kv\",\"key\":\"node\",\"value\":\"'$T
 
 /// Minimal raw protocol client for testing the server without a Session.
 async fn raw_join(net: &Net, room: &Link, nick: &str) -> (Connection, SendStream, RecvStream, u32, u64) {
+    raw_join_as(net, room, nick, vec![], None, Reach::Unknown).await
+}
+
+/// [`raw_join`], saying more about ourselves in `hello`.
+async fn raw_join_as(
+    net: &Net,
+    room: &Link,
+    nick: &str,
+    features: Vec<String>,
+    addr: Option<String>,
+    reach: Reach,
+) -> (Connection, SendStream, RecvStream, u32, u64) {
     let conn = net.connect(room.addr.clone(), Duration::from_secs(5)).await.unwrap();
     let (mut wr, mut rd) = conn.open_bi().await.unwrap();
     let id = room.room.clone().unwrap();
@@ -309,10 +321,11 @@ async fn raw_join(net: &Net, room: &Link, nick: &str) -> (Connection, SendStream
         nick: nick.into(),
         client: "raw".into(),
         codecs: vec![Codec::Opus, Codec::Pcm16],
-        features: vec![],
+        features,
         room: Some(id.clone()),
         proof: net::prove(&conn, &id, Some(&member), None).unwrap(),
-        addr: None,
+        addr,
+        reach,
     };
     write_frame(&mut wr, &hello).await.unwrap();
     match read_frame::<_, ServerMsg>(&mut rd).await.unwrap().unwrap() {
@@ -841,4 +854,45 @@ async fn serve_relay_gets_members_in() {
     wait_for("server has it", || node.server().history("general", 10).iter().any(|m| m.text == "hello via relay")).await;
     alice.shutdown();
     node.close().await;
+}
+
+/// The host checks how reachable each member's app is (a fresh endpoint
+/// connects to it directly), and a handoff goes to the best placed member,
+/// not just the one who's been here longest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_prefers_members_others_can_reach() {
+    let home = tmp("reach");
+    let srv = start_room(None, "room-reach", 1).await;
+    let room = Link::parse(&link(&srv).await).unwrap();
+    let reach_of = |nick: &str| srv.members().into_iter().find(|m| m.nick == nick).map(|m| m.reach);
+
+    // Ann joins first and claims a public address, but gives one nobody
+    // answers on: the check caps her at `nat`.
+    let ann_net = test_net(SecretKey::generate(), 0).await;
+    let nowhere = Link::new(iroh::EndpointAddr::from_parts(
+        SecretKey::generate().public(),
+        [iroh::TransportAddr::Ip("127.0.0.1:1".parse().unwrap())],
+    ));
+    let (_c, mut ann_wr, _rd, _, _) =
+        raw_join_as(&ann_net, &room, "ann", vec![FEATURE_HOST.into()], Some(nowhere.to_string()), Reach::Public).await;
+    assert_eq!(reach_of("ann"), Some(Reach::Public), "her claim stands until it's checked");
+    wait_for("ann checked", || reach_of("ann") == Some(Reach::Nat)).await;
+
+    // Bob's app answers on its address: `open`.
+    let bob = session("bob", &home.join("b")).await;
+    bob.join(room.to_string());
+    wait_for("bob checked", || reach_of("bob") == Some(Reach::Open)).await;
+    wait_for("bob sees it", || bob.state().members.values().any(|m| m.nick == "bob" && m.reach == Reach::Open)).await;
+
+    let picked = srv.hand_off(None, None).unwrap();
+    assert_eq!(picked.nick, "bob", "the member others can reach hosts next, though ann was here first");
+
+    // Ann's network changes: her real address is checked, and works.
+    let real = ann_net.link().await.to_string();
+    write_frame(&mut ann_wr, &ClientMsg::Reach { reach: Reach::Nat, addr: Some(real.clone()) }).await.unwrap();
+    wait_for("ann checked again", || reach_of("ann") == Some(Reach::Open)).await;
+    let ann = srv.members().into_iter().find(|m| m.nick == "ann").unwrap();
+    assert_eq!(ann.addr.as_deref(), Some(real.as_str()));
+    bob.shutdown();
+    srv.shutdown();
 }

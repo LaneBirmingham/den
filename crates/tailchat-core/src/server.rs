@@ -32,7 +32,7 @@ use serde_json::Value;
 use tailchat_proto::voice::{self, Packet};
 use tailchat_proto::{
     Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
-    MessageKind, PROTOCOL_VERSION, Profile, Proof, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
+    MessageKind, PROTOCOL_VERSION, Profile, Proof, Reach, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -138,6 +138,10 @@ struct Conn {
     tx: mpsc::Sender<Arc<[u8]>>,
     kick: Option<oneshot::Sender<String>>,
     sent: VecDeque<Instant>,
+    /// Reach checks so far (the newest one wins), and when the latest one
+    /// starts (one every 2 s at most).
+    reach_seq: u64,
+    reach_at: Instant,
 }
 
 struct Room {
@@ -379,7 +383,7 @@ async fn answer(inc: Incoming, reply: &ServerMsg) {
 async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
     let peer = inc.conn.remote_id().fmt_short().to_string();
     let first = inc.first.clone();
-    let (nick, client, codecs, features, proof, addr) = match first {
+    let (nick, client, codecs, features, proof, addr, claimed) = match first {
         ClientMsg::Probe { .. } => {
             let (members, channels) = {
                 let room = shared.room.lock();
@@ -394,7 +398,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
             answer(inc, &reply).await;
             return;
         }
-        ClientMsg::Hello { version, nick, client, codecs, features, proof, addr, .. } => {
+        ClientMsg::Hello { version, nick, client, codecs, features, proof, addr, reach, .. } => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("protocol {version} not supported (server speaks {PROTOCOL_VERSION})");
                 answer(inc, &reject("version", msg)).await;
@@ -406,7 +410,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
                 answer(inc, &ServerMsg::Handoff { to, term }).await;
                 return;
             }
-            (nick, client, codecs, features, proof, addr)
+            (nick, client, codecs, features, proof, addr, reach)
         }
         _ => {
             answer(inc, &reject("handshake", "expected hello")).await;
@@ -455,8 +459,19 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
                 codecs,
                 can_host: features.iter().any(|f| f == FEATURE_HOST),
                 addr,
+                // Only the host's own check can make someone `open`.
+                reach: claimed.min(Reach::Public),
             };
-            let mut conn = Conn { member: member.clone(), token, link: link.clone(), tx, kick: Some(kick_tx), sent: VecDeque::new() };
+            let mut conn = Conn {
+                member: member.clone(),
+                token,
+                link: link.clone(),
+                tx,
+                kick: Some(kick_tx),
+                sent: VecDeque::new(),
+                reach_seq: 0,
+                reach_at: Instant::now(),
+            };
             // Welcome and history go into the outbox before anything else can.
             let welcome = ServerMsg::Welcome {
                 version: PROTOCOL_VERSION,
@@ -493,6 +508,9 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
     };
     let id = member.id;
     tracing::info!("{} joined from {peer} ({})", member.nick, describe_identity(&member.identity));
+    if shared.checks_reach(member.addr.as_deref()) {
+        tokio::spawn(check_reach(shared.clone(), id, 0, Duration::ZERO, member.addr.clone(), member.reach));
+    }
     let _ = shared.events.send(ServerEvent::MemberJoined { member });
 
     let writer = tokio::spawn(async move {
@@ -546,6 +564,32 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
         tracing::info!("{} left ({reason})", member.nick);
         let _ = shared.events.send(ServerEvent::MemberLeft { member, reason });
     }
+}
+
+/// Connect to a member's app directly from a fresh endpoint, and put the
+/// answer in the member list: `open` if it worked, else what the member
+/// claimed, at most `nat`. A newer report (`seq`) makes this one moot.
+async fn check_reach(shared: Arc<Shared>, id: MemberId, seq: u64, delay: Duration, addr: Option<String>, claimed: Reach) {
+    let Some(link) = addr.as_deref().and_then(|a| Link::parse(a).ok()) else { return };
+    let current = || shared.room.lock().members.get(&id).is_some_and(|c| c.reach_seq == seq);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    if !current() {
+        return;
+    }
+    // Public addresses only (a LAN address would only prove we share a LAN),
+    // except for a host that only listens on loopback (tests).
+    let loopback = shared.net.bound().iter().all(|a| a.ip().is_loopback());
+    let targets: Vec<std::net::SocketAddr> =
+        link.addr.ip_addrs().filter(|a| crate::relay::is_public(a.ip()) || (loopback && a.ip().is_loopback())).copied().collect();
+    let reach = if net::reachable(link.addr.id, targets, Duration::from_secs(4)).await { Reach::Open } else { claimed.min(Reach::Nat) };
+    let mut room = shared.room.lock();
+    if room.members.get(&id).is_none_or(|c| c.reach_seq != seq) {
+        return;
+    }
+    tracing::debug!("reach check of member {id}: {}", reach.as_str());
+    shared.update_member(&mut room, id, |m| m.reach = reach);
 }
 
 fn describe_identity(id: &Identity) -> String {
@@ -623,7 +667,7 @@ impl Shared {
         }
     }
 
-    fn handle(&self, id: MemberId, msg: ClientMsg) {
+    fn handle(self: &Arc<Self>, id: MemberId, msg: ClientMsg) {
         let mut room = self.room.lock();
         match msg {
             ClientMsg::Hello { .. } | ClientMsg::Probe { .. } => {
@@ -776,8 +820,40 @@ impl Shared {
                     self.handoff.send_replace(HandoffState::Failed { error: format!("{nick} couldn't host: {error}") });
                 }
             }
+            ClientMsg::Reach { reach, addr } => {
+                let Some(conn) = room.members.get_mut(&id) else { return };
+                let addr = addr.filter(|a| a.len() <= 1024 && Link::parse(a).is_ok()).or_else(|| conn.member.addr.clone());
+                let claimed = reach.min(Reach::Public);
+                let checkable = self.checks_reach(addr.as_deref());
+                // One check every 2 s at most: a report that comes sooner is
+                // checked when its turn comes (unless a newer one beats it).
+                let now = Instant::now();
+                let start = (conn.reach_at + Duration::from_secs(2)).max(now);
+                if checkable {
+                    conn.reach_seq += 1;
+                    conn.reach_at = start;
+                }
+                let seq = conn.reach_seq;
+                // Our own app can't be checked: its claim stands. Others keep
+                // what they have until the check answers.
+                let shown = if checkable { conn.member.reach } else { claimed };
+                self.update_member(&mut room, id, |m| {
+                    m.addr = addr.clone();
+                    m.reach = shown;
+                });
+                drop(room);
+                if checkable {
+                    tokio::spawn(check_reach(self.clone(), id, seq, start - now, addr, claimed));
+                }
+            }
             ClientMsg::Claim { .. } => self.reply(&mut room, id, &reject("handshake", "claim must be the first frame")),
         }
+    }
+
+    /// Whether we can check how reachable the app at `addr` is: it has an
+    /// address, and it isn't our own app (hosting from it).
+    fn checks_reach(&self, addr: Option<&str>) -> bool {
+        addr.and_then(|a| Link::parse(a).ok()).is_some_and(|l| l.addr.id != self.net.id())
     }
 
     fn update_member(&self, room: &mut Room, id: MemberId, f: impl FnOnce(&mut Member)) {
@@ -882,9 +958,10 @@ impl ServerHandle {
         Arc::ptr_eq(&self.shared, &other.shared)
     }
 
-    /// Ask a member to take over hosting. `to: None` picks the
-    /// longest-connected member whose app can host, other than `except`
-    /// (usually the host's own session). When they're ready, everyone is
+    /// Ask a member to take over hosting. `to: None` picks the member whose
+    /// app can host and that others reach most easily (see [`Reach`]; ties go
+    /// to whoever has been here longest), other than `except` (usually the
+    /// host's own session). When they're ready, everyone is
     /// sent to them; watch [`handoff_state`](Self::handoff_state).
     pub fn hand_off(&self, to: Option<MemberId>, except: Option<MemberId>) -> anyhow::Result<Member> {
         if matches!(*self.shared.handoff.borrow(), HandoffState::Moved { .. }) {
@@ -895,7 +972,11 @@ impl ServerHandle {
         let target = match to {
             Some(id) => room.members.get(&id).map(|c| c.member.clone()).with_context(|| format!("no member {id}"))?,
             None => {
-                room.members().into_iter().find(|m| Some(m.id) != except && m.can_host).context("nobody else here can host the room")?
+                room.members()
+                    .into_iter()
+                    .filter(|m| Some(m.id) != except && m.can_host)
+                    .max_by_key(|m| (m.reach, std::cmp::Reverse(m.id)))
+                    .context("nobody else here can host the room")?
             }
         };
         if !target.can_host {

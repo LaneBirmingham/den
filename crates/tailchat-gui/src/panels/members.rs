@@ -109,5 +109,5 @@ fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, talking: bool, behind: 
         (true, Some(k)) => format!("Signed in with key {k}… (this room's profile for {})", m.nick),
         _ => "No key: anyone could be using this nick".to_owned(),
     };
-    resp.on_hover_text(who);
+    resp.on_hover_text(format!("{who}\nConnection: {}", m.reach.describe()));
 }

@@ -47,6 +47,82 @@ pub const MAX_BATCH: usize = 100;
 /// `hello` feature: this client can host the room if asked.
 pub const FEATURE_HOST: &str = "host";
 
+/// How easily others can connect to a member's app directly, worst to best.
+/// The room's host should be someone others can reach: everyone connects to
+/// it, so a reachable host needs no relay. Members report what they measure
+/// (at most `public`); only the host's check makes someone `open`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Reach {
+    /// UDP is blocked, or the NAT picks a new port for every destination:
+    /// direct connections rarely work, so peers go through a relay.
+    Strict,
+    /// Not measured yet (or an app that doesn't say).
+    #[default]
+    Unknown,
+    /// Behind a router or firewall: connecting out works, and connections
+    /// in usually need hole-punching.
+    Nat,
+    /// Has a public address (not checked yet).
+    Public,
+    /// The host connected to it directly, from a fresh endpoint, with no
+    /// relay and no hole-punching.
+    Open,
+}
+
+impl Reach {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reach::Strict => "strict",
+            Reach::Unknown => "unknown",
+            Reach::Nat => "nat",
+            Reach::Public => "public",
+            Reach::Open => "open",
+        }
+    }
+
+    /// A few words, for status lines.
+    pub fn short(self) -> &'static str {
+        match self {
+            Reach::Strict => "strict network",
+            Reach::Unknown => "measuring the network…",
+            Reach::Nat => "behind a router",
+            Reach::Public => "public address",
+            Reach::Open => "reachable directly",
+        }
+    }
+
+    /// For people.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Reach::Strict => "strict network: others may need a relay to reach it",
+            Reach::Unknown => "connection not measured yet",
+            Reach::Nat => "behind a router: fine to join from, so-so to host from",
+            Reach::Public => "public address (not checked yet)",
+            Reach::Open => "others can connect to it directly: a good host",
+        }
+    }
+}
+
+impl Serialize for Reach {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Reach {
+    /// Unknown words (from newer apps) read as `unknown`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "strict" => Reach::Strict,
+            "nat" => Reach::Nat,
+            "public" => Reach::Public,
+            "open" => Reach::Open,
+            _ => Reach::Unknown,
+        })
+    }
+}
+
 /// Session-scoped member id assigned by the server on connect.
 pub type MemberId = u32;
 /// Stable channel slug, e.g. `general`.
@@ -123,6 +199,9 @@ pub struct Member {
     /// so members can find the room again whoever ends up hosting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
+    /// How easily others can connect to the member's app (see [`Reach`]).
+    #[serde(default)]
+    pub reach: Reach,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -259,6 +338,9 @@ pub enum ClientMsg {
         /// Where the member's own app can be reached (shared with the room).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         addr: Option<String>,
+        /// How reachable the member's app thinks it is.
+        #[serde(default)]
+        reach: Reach,
     },
     /// Ask for public room info and close. Used to find a room's live host.
     Probe {
@@ -330,6 +412,13 @@ pub enum ClientMsg {
     HostFailed {
         term: u64,
         error: String,
+    },
+    /// Our network changed: how reachable we think we are now, and our
+    /// address. The host checks it again.
+    Reach {
+        reach: Reach,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addr: Option<String>,
     },
 }
 

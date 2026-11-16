@@ -575,6 +575,7 @@ mod tests {
             codecs: Vec::new(),
             can_host: true,
             addr: Some(peer.clone()),
+            reach: Default::default(),
         };
         s.note_member(&m);
         s.note_member(&m);

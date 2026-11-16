@@ -26,4 +26,5 @@ chrono.workspace = true
 iroh.workspace = true
 iroh-relay.workspace = true
 data-encoding.workspace = true
+portmapper.workspace = true
 bytes.workspace = true

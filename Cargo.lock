@@ -5010,6 +5010,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "parking_lot",
+ "portmapper",
  "rand 0.9.5",
  "serde",
  "serde_json",

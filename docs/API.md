@@ -66,7 +66,7 @@ the connection streams events. The token is compared in constant time.
 | `rooms.list` | | rooms saved on this machine |
 | `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
 | `rooms.forget` | `room` | delete a saved room and its history |
-| `net.status` | | this app's endpoint: `id`, `short`, `relay`, `direct` addresses |
+| `net.status` | | this app's endpoint: `id`, `short`, `relay`, `direct` addresses, `reach` (`strict`/`unknown`/`nat`/`public`: how easily others could connect to it; see ARCHITECTURE.md) |
 | `rooms.discover` | | look for live hosts of your saved rooms; results in `state.get` → `discovery` (`addr` is the link to join; show `host` to people) |
 | `config.get` | | |
 | `api.methods`, `api.ping`, `events.subscribe` | | built in everywhere |

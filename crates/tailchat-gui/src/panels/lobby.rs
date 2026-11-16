@@ -105,7 +105,8 @@ impl Lobby {
                         (None, true) => "no relay yet — direct connections only".to_owned(),
                         (None, false) => "relays off — direct connections only".to_owned(),
                     };
-                    ui.label(cx.small(format!("device {} · {via}", n.short)));
+                    ui.label(cx.small(format!("device {} · {via} · {}", n.short, n.reach.short())))
+                        .on_hover_text(format!("For hosting: {}", n.reach.describe()));
                 }
                 None => {
                     ui.label(cx.small("starting the network…"));

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tailchat_proto::voice::Codec;
 use tailchat_proto::{
     Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, Member, MemberId, MessageKind, NoticeLevel,
-    PROTOCOL_VERSION, ServerInfo, ServerMsg, VoiceSetup,
+    PROTOCOL_VERSION, Reach, ServerInfo, ServerMsg, VoiceSetup,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc};
@@ -163,6 +163,9 @@ pub struct NetView {
     pub direct: Vec<String>,
     /// Relays are configured (otherwise direct connections only).
     pub relays_on: bool,
+    /// How easily others could connect to this app, as far as it can tell
+    /// (a host's check can say more: see the member list).
+    pub reach: Reach,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -291,9 +294,39 @@ impl SessionState {
         self.serving_this_room()
     }
 
-    /// Members other than us whose app can take over hosting.
+    /// Members other than us whose app can take over hosting, best placed
+    /// first (see [`SessionState::best_host`]).
     pub fn can_take_over(&self) -> impl Iterator<Item = &Member> {
-        self.members.values().filter(move |m| m.can_host && Some(m.id) != self.me)
+        let mut v: Vec<&Member> = self.members.values().filter(|m| m.can_host && Some(m.id) != self.me).collect();
+        v.sort_by_key(|m| (std::cmp::Reverse(m.reach), m.id));
+        v.into_iter()
+    }
+
+    /// Who should host this room, us included: the member others can reach
+    /// most easily (whoever has been here longest, on a tie), among those
+    /// whose app can host, leaving out the host we're (or were) connected to.
+    pub fn best_host(&self) -> Option<&Member> {
+        let host = self.host_endpoint();
+        self.members
+            .values()
+            .filter(|m| m.can_host && (host.is_none() || m.addr.as_deref().and_then(|a| Link::parse(a).ok()).map(|l| l.addr.id) != host))
+            .max_by_key(|m| (m.reach, std::cmp::Reverse(m.id)))
+    }
+
+    /// Someone else is better placed to host than we are (see
+    /// [`SessionState::best_host`]): worth saying before we take over.
+    pub fn better_host(&self) -> Option<&Member> {
+        let mine = self.me.and_then(|id| self.members.get(&id)).map(|m| m.reach).unwrap_or_default();
+        self.best_host().filter(|m| Some(m.id) != self.me && m.reach > mine)
+    }
+
+    /// The endpoint of the host we're connected (or connecting) to.
+    fn host_endpoint(&self) -> Option<net::EndpointId> {
+        let addr = match &self.conn {
+            ConnState::Idle => return None,
+            ConnState::Connecting { addr, .. } | ConnState::Connected { addr } | ConnState::Failed { addr, .. } => addr,
+        };
+        Link::parse(addr).ok().map(|l| l.addr.id)
     }
 
     /// Our own server is the one we're connected to.
@@ -424,11 +457,28 @@ impl Session {
         if modules.mods {
             session.reload_mods();
         }
-        // Bring the endpoint up now, so joining and hosting are quick.
-        let inner = session.inner.clone();
+        // Bring the endpoint up now, so joining and hosting are quick, then
+        // keep its view current (addresses and NAT facts settle over a few
+        // seconds, and change when the network does).
+        let weak = Arc::downgrade(&session.inner);
         session.inner.rt.spawn(async move {
-            if let Err(e) = inner.net().await {
-                tracing::warn!("network: {e:#}");
+            let Some(inner) = weak.upgrade() else { return };
+            let net = match inner.net().await {
+                Ok(n) => n,
+                Err(e) => return tracing::warn!("network: {e:#}"),
+            };
+            drop(inner);
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else { break };
+                if net.endpoint().is_closed() {
+                    break;
+                }
+                let view = net_view(&net.addr(), net.relays_on(), net.reach());
+                if inner.state.read().net.as_ref() != Some(&view) {
+                    inner.update(|s| s.net = Some(view));
+                }
             }
         });
         Ok(session)
@@ -795,7 +845,13 @@ impl Session {
                 }
             }
             "takeover" => {
-                let id = self.state().room_id().map(str::to_owned);
+                let (id, better) = {
+                    let s = self.state();
+                    (s.room_id().map(str::to_owned), s.better_host().map(|m| format!("{} is better placed to host ({})", m.nick, m.reach.short())))
+                };
+                if let Some(b) = better {
+                    self.notice(NoticeLevel::Info, format!("{b}; hosting from here anyway"));
+                }
                 match id {
                     Some(id) => self.open_room(&id),
                     None => self.notice(NoticeLevel::Warn, "not in a room".into()),
@@ -1195,6 +1251,7 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
         None => None,
     };
     let me_addr = net.link().await.to_string();
+    let me_reach = net.reach();
     let conn = net.connect(link.addr.clone(), Duration::from_secs(10)).await?;
     let (mut wr, mut rd) = conn.open_bi().await.context("opening a stream")?;
     let nick = inner.state.read().nick.clone();
@@ -1206,7 +1263,8 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
         features: vec![FEATURE_HOST.into()],
         room: Some(room.clone()),
         proof: net::prove(&conn, &room, Some(&member), invite.as_ref().map(|(_, k)| k))?,
-        addr: Some(me_addr),
+        addr: Some(me_addr.clone()),
+        reach: me_reach,
     };
     write_frame(&mut wr, &hello).await?;
     let first: ServerMsg = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd))
@@ -1243,6 +1301,25 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     // This task is aborted when we leave; the helpers must go with it, or
     // the socket stays open and the host keeps us as a ghost member.
     let _writer = AbortOnDrop(writer.abort_handle());
+    // Tell the host when our network changes (new address, NAT measured), so
+    // it can check how reachable we are again.
+    let (reach_tx, reach_net) = (tx.clone(), net.clone());
+    let reporter = tokio::spawn(async move {
+        let mut last = (me_reach, me_addr);
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let now = (reach_net.reach(), reach_net.link().await.to_string());
+            if now != last {
+                if reach_tx.send(ClientMsg::Reach { reach: now.0, addr: Some(now.1.clone()) }).is_err() {
+                    break;
+                }
+                last = now;
+            }
+        }
+    });
+    let _reporter = AbortOnDrop(reporter.abort_handle());
     let ping_inner = inner.clone();
     let pinger = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -1378,7 +1455,7 @@ impl Inner {
             .await?
             .clone();
         if self.state.read().net.is_none() {
-            let view = net_view(&net.ready_addr().await, net.relays_on());
+            let view = net_view(&net.ready_addr().await, net.relays_on(), net.reach());
             self.update(|s| s.net = Some(view));
         }
         Ok(net)
@@ -2303,13 +2380,14 @@ struct Welcome<'a> {
     profiles: &'a [tailchat_proto::Profile],
 }
 
-fn net_view(addr: &net::EndpointAddr, relays_on: bool) -> NetView {
+fn net_view(addr: &net::EndpointAddr, relays_on: bool, reach: Reach) -> NetView {
     NetView {
         id: addr.id.to_z32(),
         short: addr.id.fmt_short().to_string(),
         relay: addr.relay_urls().next().map(crate::relay::without_token),
         direct: addr.ip_addrs().map(|a| a.to_string()).collect(),
         relays_on,
+        reach,
     }
 }
 

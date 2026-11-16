@@ -306,7 +306,7 @@ async fn console_command(node: &ServerNode, line: &str) -> bool {
             for m in members {
                 let voice = m.voice.map(|v| format!(" ~{v}{}", if m.muted { " (muted)" } else { "" })).unwrap_or_default();
                 let who = m.identity.key.clone().map(|k| format!("key {k}")).unwrap_or_else(|| "no key".into());
-                println!("[{}] {} — {who}{voice} · {}", m.id, m.nick, m.client);
+                println!("[{}] {} — {who}{voice} · {} · {}", m.id, m.nick, m.client, m.reach.short());
             }
         }
         "channels" => {
