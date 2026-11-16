@@ -254,6 +254,30 @@ async fn control_api_drives_a_session() {
     srv.shutdown();
 }
 
+/// `[modules] agent_control = false`: the calls that see and drive the app
+/// are refused, the rest of the API keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_control_can_be_switched_off() {
+    let home = tmp("agentoff");
+    let mut config =
+        AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    config.modules.agent_control = false;
+    let alice = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+    // As if a window were attached: the refusal mustn't depend on there being none.
+    alice.ui().attach_frontend("window", || {});
+    let env: std::collections::HashMap<_, _> = alice.api_env().into_iter().collect();
+    let mut api = ApiClient::connect(&env["DEN_API"], &env["DEN_API_TOKEN"]).await.unwrap();
+    for method in ["ui.tree", "ui.click", "ui.screenshot", "ui.window", "ui.clipboard", "app.quit"] {
+        let err = api.call(method, json!({"target": "Send"})).await.unwrap_err().to_string();
+        assert!(err.contains("agent control is off"), "{method}: {err}");
+    }
+    assert!(alice.ui().take_frontend_calls().is_empty(), "nothing reached the frontend");
+    let state = api.call("state.get", json!({})).await.unwrap();
+    assert_eq!(state["agent_control"], false);
+    api.call("ui.panel.set", json!({"panel": "agent/notes", "title": "Notes", "widgets": []})).await.unwrap();
+    alice.close().await;
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mods_commands_and_hooks() {

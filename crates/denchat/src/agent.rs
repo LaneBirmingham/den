@@ -452,7 +452,8 @@ pub async fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     }
     let str_of = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     let frontend = s["frontend"].as_str().unwrap_or("no window");
-    println!("den pid {} · {frontend} · nick {}", info.pid, str_of(&s["nick"]));
+    let control = if s["agent_control"] == false { " · agent control off" } else { "" };
+    println!("den pid {} · {frontend} · nick {}{control}", info.pid, str_of(&s["nick"]));
     let conn = &s["conn"];
     let state = conn["state"].as_str().unwrap_or("idle");
     match &s["server"] {
@@ -705,6 +706,9 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
             // Its own config: never the user's devices, never the user's clipboard.
             let mut cfg: AppConfig = config::load_or_default(&paths.config_file())?;
             cfg.nick = Some(name.clone());
+            // A copied config may have these off; a sandbox is for driving.
+            cfg.modules.api = true;
+            cfg.modules.agent_control = true;
             if input.is_some() {
                 cfg.voice.input_device = input;
             } else if !test_device(&cfg.voice.input_device) {

@@ -171,7 +171,7 @@ key for the room.
   [`mods/`](mods). → [docs/MODS.md](docs/MODS.md)
 * **Turn things off:** delete a panel from the layout, or switch whole
   modules off in `config.toml` → `[modules]` (`voice`, `mods`, `api`,
-  `discovery`, `slash_commands`).
+  `discovery`, `slash_commands`, `agent_control`).
 * **Using an AI agent:** point it at [AGENTS.md](AGENTS.md). It can edit
   themes/layouts/mods, try them in a headless sandbox, click through them
   and screenshot the result, then apply them live

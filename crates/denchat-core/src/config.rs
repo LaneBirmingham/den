@@ -107,11 +107,17 @@ pub struct Modules {
     pub discovery: bool,
     /// Built-in slash commands (`/nick`, `/voice`, …).
     pub slash_commands: bool,
+    /// Let agents and scripts see and drive the app through the control API:
+    /// the `ui.*` calls behind `den ui` (widget tree, click, type, keys,
+    /// scroll, hover, wait, screenshots, window, zoom, clipboard) and
+    /// `app.quit`. Off, those calls are refused; the rest of the API (mods,
+    /// `den status`, `den wait`) still works.
+    pub agent_control: bool,
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Modules { voice: true, mods: true, api: true, discovery: true, slash_commands: true }
+        Modules { voice: true, mods: true, api: true, discovery: true, slash_commands: true, agent_control: true }
     }
 }
 

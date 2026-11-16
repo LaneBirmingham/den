@@ -2291,6 +2291,9 @@ impl ApiHandler for SessionApi {
             return ready(Err("session closed".into()));
         };
         let s = Session { inner };
+        if (FRONTEND_METHODS.contains(&method) || method == "ui.clipboard") && !s.config().modules.agent_control {
+            return ready(Err(format!("{method}: agent control is off in this app ([modules] agent_control = false in config.toml)")));
+        }
         if FRONTEND_METHODS.contains(&method) {
             return frontend_call(&s, method, p);
         }
@@ -2304,6 +2307,7 @@ impl ApiHandler for SessionApi {
                 v["panels"] = json!(s.ui().panel_ids().into_iter().map(|(id, _)| id).collect::<Vec<_>>());
                 v["is_host"] = json!(st.is_host());
                 v["frontend"] = json!(s.ui().frontend_kind());
+                v["agent_control"] = json!(s.config().modules.agent_control);
                 Ok(v)
             }
             "messages.list" => {

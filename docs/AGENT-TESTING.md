@@ -23,6 +23,14 @@ command is a thin wrapper over the control API (`ui.*` in
 [API.md](API.md#driving-the-interface)), so scripts and mods can do the
 same over the socket.
 
+**Turning it off.** `[modules] agent_control = false` in `config.toml`
+makes the app refuse every call that reads or drives its interface:
+`den ui …`, `ui.*` and `app.quit`. Mods and the rest of the API, including
+`den status` and `den wait`, keep working, and `den status` shows `agent
+control off`. Sandboxes always have it on, even with `--copy-config`. It's
+a preference, not a security boundary: anything that can edit `config.toml`
+as the user can turn it back on.
+
 ## Reading the screen
 
 ```text

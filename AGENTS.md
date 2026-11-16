@@ -24,7 +24,9 @@ den wait message.created --where message.text=hi -- den ui type hi --enter   # l
 
 On the **user's own app** these never move the mouse or take focus. Still,
 avoid `den ui window --focus`, and remember that "Copy" buttons in their
-app copy to their clipboard. To test anything that changes state (a mod, a
+app copy to their clipboard. If `den ui` says "agent control is off", the
+user switched it off (`[modules] agent_control = false`). Respect that:
+don't switch it back on without asking. Sandboxes always allow it. To test anything that changes state (a mod, a
 theme, room flows), use a **sandbox**. A sandbox is a throwaway headless
 Den with its own home, test audio devices and a file clipboard:
 

@@ -68,6 +68,10 @@ window is minimised or behind others, never move the real mouse or take
 focus, and answer once the frame they caused is drawn. `den ui …` wraps them
 with short output; see [AGENT-TESTING.md](AGENT-TESTING.md).
 
+`[modules] agent_control = false` in `config.toml` refuses all of these,
+plus `ui.clipboard` and `app.quit`. The rest of the API keeps working, and
+`state.get` reports it as `agent_control`.
+
 A **target** is `@12` (a ref from `ui.tree`; a ref stops matching when that
 widget's text changes), text (exact, then any case, then a substring), or
 `role:text` (`button:Join`). Add `panel` (`core.header`, `my.mod`) and/or
