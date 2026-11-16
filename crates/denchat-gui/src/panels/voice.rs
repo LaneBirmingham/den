@@ -95,7 +95,8 @@ impl Panel for Voice {
                     let (n, c) = kit::signal_level(cx.state.latency_ms, &p);
                     kit::signal(painter, pos2(x, y + 13.0), n, c, p.surface_hover);
                     let ms = cx.state.latency_ms.map(|m| format!(" · {m} ms")).unwrap_or_default();
-                    (ch.clone(), p.muted, format!("Voice connected to {addr}{ms}"))
+                    let via = cx.state.via.map(|v| format!(" · {}", v.as_str())).unwrap_or_default();
+                    (ch.clone(), p.muted, format!("Voice connected to {addr}{ms}{via}"))
                 }
                 (_, ConnState::Connected { .. }) if !supported => ("No voice in this build".into(), p.muted, String::new()),
                 (_, ConnState::Connected { .. }) => ("Not in voice".into(), p.muted, String::new()),

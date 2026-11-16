@@ -466,6 +466,32 @@ pub fn bind_ip(spec: &str) -> anyhow::Result<Option<IpAddr>> {
     })
 }
 
+/// How a connection's packets travel right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// Straight between the two machines (LAN, hole-punched, or a public address).
+    Direct,
+    /// Forwarded by a relay: something (often a firewall) stops a direct path.
+    Relay,
+}
+
+impl Via {
+    /// The path `conn` sends on now, if it has one.
+    pub fn of(conn: &Connection) -> Option<Via> {
+        let paths = conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        Some(if selected.is_relay() { Via::Relay } else { Via::Direct })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Direct => "direct",
+            Via::Relay => "relay",
+        }
+    }
+}
+
 impl Net {
     /// Start the endpoint with identity `key`, listening on `bind` (`all`,
     /// `localhost` or an IP) and UDP `port` (0: any). Unless `strict`, a

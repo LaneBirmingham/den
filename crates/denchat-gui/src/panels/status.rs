@@ -26,6 +26,9 @@ impl Panel for Status {
             if let Some(ms) = cx.state.latency_ms {
                 ui.label(cx.small(format!("· {ms} ms")));
             }
+            if let Some(via) = cx.state.via {
+                ui.label(cx.small(format!("· {}", via.as_str())));
+            }
             if let Some(h) = &cx.state.hosting {
                 ui.label(cx.small(format!("· hosting as {}", denchat_core::net::short_addr(&h.addr))));
             }

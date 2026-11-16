@@ -198,6 +198,8 @@ pub struct SessionState {
     pub new_since: HashMap<ChannelId, i64>,
     pub voice: VoiceView,
     pub latency_ms: Option<u32>,
+    /// Whether our connection to the host is direct or relayed (updated with `latency_ms`).
+    pub via: Option<net::Via>,
     /// Our network endpoint, once it's up.
     pub net: Option<NetView>,
     pub discovery: DiscoveryView,
@@ -224,6 +226,7 @@ impl SessionState {
             new_since: HashMap::new(),
             voice: VoiceView::default(),
             latency_ms: None,
+            via: None,
             net: None,
             discovery: DiscoveryView::default(),
             rooms: Vec::new(),
@@ -690,6 +693,7 @@ impl Session {
             s.voice.channel = None;
             s.voice.joined_at = None;
             s.latency_ms = None;
+            s.via = None;
         });
         self.inner.emit(names::CONNECTION_CHANGED, json!({"state": "idle"}));
         self.inner.emit(names::HOSTING_CHANGED, json!({"hosting": null}));
@@ -1719,6 +1723,7 @@ impl Inner {
             s.voice.channel = None;
             s.voice.joined_at = None;
             s.latency_ms = None;
+            s.via = None;
         });
     }
 
@@ -1920,7 +1925,11 @@ impl Inner {
                     && n == nonce
                 {
                     let ms = at.elapsed().as_millis().min(u32::MAX as u128) as u32;
-                    self.update(|s| s.latency_ms = Some(ms));
+                    let via = self.conn.lock().link.as_ref().and_then(net::Via::of);
+                    self.update(|s| {
+                        s.latency_ms = Some(ms);
+                        s.via = via;
+                    });
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::ProbeInfo { .. } | ServerMsg::Bye { .. } | ServerMsg::Handoff { .. } => {}

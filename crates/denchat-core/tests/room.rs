@@ -102,6 +102,9 @@ async fn chat_between_two_sessions() {
     bob.join(&addr);
     wait_for("both connected", || alice.state().conn.is_connected() && bob.state().conn.is_connected()).await;
     wait_for("alice sees bob", || alice.state().members.len() == 2).await;
+    // The first ping reports how the link travels: loopback with no relays is direct.
+    wait_for("route known", || bob.state().latency_ms.is_some()).await;
+    assert_eq!(bob.state().via, Some(net::Via::Direct));
     assert_eq!(alice.state().server.as_ref().unwrap().name, "test room");
     assert_eq!(alice.state().focus.as_deref(), Some("general"));
 

@@ -39,7 +39,7 @@ the connection streams events. The token is compared in constant time.
 
 | Method | Params | |
 | --- | --- | --- |
-| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away |
+| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away; `latency_ms` and `via` (`direct` or `relay`: how the link to the host travels) |
 | `messages.list` | `channel?, limit?` | recent messages (default: focused channel) |
 | `message.send` | `text, channel?` | send plain text |
 | `input.submit` | `text, channel?` | as if typed: slash commands work |

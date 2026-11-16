@@ -162,7 +162,13 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
             ui.separator();
         } else if let ConnState::Connected { addr } = &cx.state.conn {
             let ms = cx.state.latency_ms.map(|m| format!(" · {m} ms")).unwrap_or_default();
-            ui.label(cx.small(format!("Connected to {}{ms}", denchat_core::net::short_addr(addr))));
+            let via = cx.state.via.map(|v| format!(" · {}", v.as_str())).unwrap_or_default();
+            let line = ui.label(cx.small(format!("Connected to {}{ms}{via}", denchat_core::net::short_addr(addr))));
+            if cx.state.via == Some(denchat_core::net::Via::Relay) {
+                line.on_hover_text(
+                    "Going through a relay: a firewall or router is blocking a direct path. It works, with a little more delay.",
+                );
+            }
             if ui
                 .button(format!("{}  Copy invite link", icons::COPY))
                 .on_hover_text("friends paste this into Join; anyone with it can join")
