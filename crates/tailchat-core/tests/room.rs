@@ -1,21 +1,21 @@
-//! End-to-end tests: real server, real sessions, loopback sockets.
+//! End-to-end tests: real servers, real sessions, iroh endpoints on loopback
+//! (direct connections only: no relays, no discovery).
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde_json::json;
 use tailchat_core::api::ApiClient;
-use tailchat_core::config::{AppConfig, ServerConfig};
-use tailchat_core::net::{read_frame, write_frame};
+use tailchat_core::config::{AppConfig, NetConfig, RelayServeConfig, ServerConfig};
+use tailchat_core::net::{self, Link, Net, SecretKey, read_frame, write_frame};
 use tailchat_core::paths::Paths;
 use tailchat_core::proto::voice::{Codec, Packet};
 use tailchat_core::proto::{ClientMsg, MessageKind, PROTOCOL_VERSION, ServerMsg};
 use tailchat_core::rooms;
 use tailchat_core::server::{self, ServerHandle, ServerMode, ServerOptions};
 use tailchat_core::server_node::{NodeOptions, ServerNode};
-use tailchat_core::session::{HostOptions, Session, SessionOptions};
-use tokio::net::{TcpStream, UdpSocket};
+use tailchat_core::session::{ConnState, HostOptions, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tailchat-test-{}-{name}", std::process::id()));
@@ -28,28 +28,50 @@ async fn start_server(history: Option<PathBuf>) -> ServerHandle {
     start_room(history, "test-room", 1).await
 }
 
+/// An endpoint on loopback, direct connections only.
+async fn test_net(key: SecretKey, port: u16) -> Net {
+    Net::bind(key, "localhost", port, true, &NetConfig::direct_only()).await.unwrap()
+}
+
 async fn start_room(history: Option<PathBuf>, room_id: &str, term: u64) -> ServerHandle {
     let config = ServerConfig { name: "test room".into(), rate_limit: 100, ..ServerConfig::default() };
+    start_with(config, test_net(SecretKey::generate(), 0).await, history, room_id, term, None).await
+}
+
+async fn start_with(
+    config: ServerConfig,
+    net: Net,
+    history: Option<PathBuf>,
+    room_id: &str,
+    term: u64,
+    invite: Option<String>,
+) -> ServerHandle {
     server::start(ServerOptions {
         config,
         mode: ServerMode::Headless,
-        bind: "127.0.0.1:0".parse().unwrap(),
+        net,
         history_dir: history,
-        tailscale: None,
         room_id: room_id.into(),
         term,
+        invite,
+        profiles: Vec::new(),
     })
     .await
     .unwrap()
 }
 
+/// The invite link to a running room, as members paste it.
+async fn link(srv: &ServerHandle) -> String {
+    srv.link().await.to_string()
+}
+
 async fn session(name: &str, home: &std::path::Path) -> Session {
     let config = AppConfig {
         nick: Some(name.into()),
-        // Never touch the real tailnet from tests.
-        tailscale_bin: Some("/nonexistent/tailscale".into()),
-        // When asked to host, pick any free port (on localhost, without Tailscale).
+        // Loopback only, and never the public relays.
+        bind: "localhost".into(),
         port: 0,
+        net: NetConfig::direct_only(),
         ..AppConfig::default()
     };
     Session::start(SessionOptions { paths: Paths::under(home), config, client_name: "test".into() }).await.unwrap()
@@ -73,7 +95,7 @@ fn has_text(s: &Session, channel: &str, text: &str) -> bool {
 async fn chat_between_two_sessions() {
     let home = tmp("chat");
     let srv = start_server(Some(home.join("history"))).await;
-    let addr = srv.local_addr().to_string();
+    let addr = link(&srv).await;
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
     alice.join(&addr);
@@ -123,7 +145,7 @@ async fn chat_between_two_sessions() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let srv2 = start_server(Some(home.join("history"))).await;
     let carol = session("carol", &home.join("c")).await;
-    carol.join(srv2.local_addr().to_string());
+    carol.join(link(&srv2).await);
     wait_for("history replayed", || has_text(&carol, "general", "hello bob")).await;
     assert!(has_text(&carol, "general", "maintenance at 5"));
     srv2.shutdown();
@@ -136,18 +158,8 @@ async fn unread_mentions_and_new_divider() {
     let home = tmp("unread");
     let mut config = ServerConfig { name: "test room".into(), rate_limit: 100, ..ServerConfig::default() };
     config.channels.insert(1, ChannelSpec { id: "random".into(), name: None, kind: ChannelKind::Text, topic: None });
-    let srv = server::start(ServerOptions {
-        config,
-        mode: ServerMode::Headless,
-        bind: "127.0.0.1:0".parse().unwrap(),
-        history_dir: None,
-        tailscale: None,
-        room_id: "unread".into(),
-        term: 1,
-    })
-    .await
-    .unwrap();
-    let addr = srv.local_addr().to_string();
+    let srv = start_with(config, test_net(SecretKey::generate(), 0).await, None, "unread", 1, None).await;
+    let addr = link(&srv).await;
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
     alice.join(&addr);
@@ -187,7 +199,7 @@ async fn unread_mentions_and_new_divider() {
 async fn control_api_drives_a_session() {
     let home = tmp("api");
     let srv = start_server(None).await;
-    let addr = srv.local_addr().to_string();
+    let addr = link(&srv).await;
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
     alice.join(&addr);
@@ -256,7 +268,7 @@ command = ["sh", "-c", "echo '[{\"type\":\"kv\",\"key\":\"node\",\"value\":\"'$T
     )
     .unwrap();
     let srv = start_server(None).await;
-    let addr = srv.local_addr().to_string();
+    let addr = link(&srv).await;
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
     assert_eq!(alice.mods().active().count(), 1, "problems: {:?}", alice.mods().problems());
@@ -287,48 +299,55 @@ command = ["sh", "-c", "echo '[{\"type\":\"kv\",\"key\":\"node\",\"value\":\"'$T
 }
 
 /// Minimal raw protocol client for testing the server without a Session.
-async fn raw_join(addr: SocketAddr, nick: &str) -> (TcpStream, u32, u64) {
-    let mut s = TcpStream::connect(addr).await.unwrap();
+async fn raw_join(net: &Net, room: &Link, nick: &str) -> (Connection, SendStream, RecvStream, u32, u64) {
+    let conn = net.connect(room.addr.clone(), Duration::from_secs(5)).await.unwrap();
+    let (mut wr, mut rd) = conn.open_bi().await.unwrap();
+    let id = room.room.clone().unwrap();
+    let member = SecretKey::generate();
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         nick: nick.into(),
         client: "raw".into(),
         codecs: vec![Codec::Opus, Codec::Pcm16],
         features: vec![],
+        room: Some(id.clone()),
+        proof: net::prove(&conn, &id, Some(&member), None).unwrap(),
+        addr: None,
     };
-    write_frame(&mut s, &hello).await.unwrap();
-    match read_frame::<_, ServerMsg>(&mut s).await.unwrap().unwrap() {
-        ServerMsg::Welcome { you, voice, .. } => (s, you, voice.token),
+    write_frame(&mut wr, &hello).await.unwrap();
+    match read_frame::<_, ServerMsg>(&mut rd).await.unwrap().unwrap() {
+        ServerMsg::Welcome { you, voice, .. } => (conn, wr, rd, you, voice.token),
         other => panic!("expected welcome, got {other:?}"),
     }
+}
+
+async fn datagram(c: &Connection, wait: Duration) -> Option<Vec<u8>> {
+    tokio::time::timeout(wait, c.read_datagram()).await.ok()?.ok().map(|b| b.to_vec())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn voice_relay_and_moderation() {
     let srv = start_server(None).await;
-    let addr = srv.local_addr();
-    let (mut a, a_id, a_tok) = raw_join(addr, "a").await;
-    let (mut b, _b_id, b_tok) = raw_join(addr, "b").await;
+    let room = srv.link().await;
+    let (na, nb) = (test_net(SecretKey::generate(), 0).await, test_net(SecretKey::generate(), 0).await);
+    let (ca, mut a, mut ar, a_id, a_tok) = raw_join(&na, &room, "a").await;
+    let (cb, mut b, _br, _b_id, b_tok) = raw_join(&nb, &room, "b").await;
     write_frame(&mut a, &ClientMsg::VoiceJoin { channel: "lounge".into() }).await.unwrap();
     write_frame(&mut b, &ClientMsg::VoiceJoin { channel: "lounge".into() }).await.unwrap();
-    let ua = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let ub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    ua.connect(addr).await.unwrap();
-    ub.connect(addr).await.unwrap();
     // Register both and wait for ACKs.
-    let mut buf = [0u8; 1500];
-    for (sock, tok) in [(&ua, a_tok), (&ub, b_tok)] {
-        sock.send(&Packet::Register { token: tok }.to_vec()).await.unwrap();
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await.unwrap().unwrap();
-        assert_eq!(Packet::parse(&buf[..n]), Some(Packet::Ack));
+    for (c, tok) in [(&ca, a_tok), (&cb, b_tok)] {
+        c.send_datagram(Packet::Register { token: tok }.to_vec().into()).unwrap();
+        let d = datagram(c, Duration::from_secs(2)).await.expect("ack");
+        assert_eq!(Packet::parse(&d), Some(Packet::Ack));
     }
     // Give the server a moment to process both VoiceJoins.
     wait_for("both in voice", || srv.members().iter().all(|m| m.voice.as_deref() == Some("lounge"))).await;
 
     let payload = [7u8; 40];
-    ua.send(&Packet::Audio { token: a_tok, seq: 1, codec: Codec::Opus, payload: &payload }.to_vec()).await.unwrap();
-    let n = tokio::time::timeout(Duration::from_secs(2), ub.recv(&mut buf)).await.unwrap().unwrap();
-    match Packet::parse(&buf[..n]) {
+    let audio = |token, seq| Packet::Audio { token, seq, codec: Codec::Opus, payload: &payload }.to_vec();
+    ca.send_datagram(audio(a_tok, 1).into()).unwrap();
+    let d = datagram(&cb, Duration::from_secs(2)).await.expect("relay");
+    match Packet::parse(&d) {
         Some(Packet::Relay { speaker, seq, codec, payload: p }) => {
             assert_eq!((speaker, seq, codec), (a_id, 1, Codec::Opus));
             assert_eq!(p, payload);
@@ -336,21 +355,21 @@ async fn voice_relay_and_moderation() {
         other => panic!("expected relay, got {other:?}"),
     }
 
-    // A forged token is dropped silently.
-    ua.send(&Packet::Audio { token: 12345, seq: 2, codec: Codec::Opus, payload: &payload }.to_vec()).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(300), ub.recv(&mut buf)).await.is_err());
+    // Another member's token on our connection is dropped silently.
+    ca.send_datagram(audio(b_tok, 2).into()).unwrap();
+    assert!(datagram(&cb, Duration::from_millis(300)).await.is_none());
 
     // Muted speakers are not relayed.
     write_frame(&mut a, &ClientMsg::VoiceState { muted: true, deafened: false }).await.unwrap();
     wait_for("muted", || srv.members().iter().any(|m| m.id == a_id && m.muted)).await;
-    ua.send(&Packet::Audio { token: a_tok, seq: 3, codec: Codec::Opus, payload: &payload }.to_vec()).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(300), ub.recv(&mut buf)).await.is_err());
+    ca.send_datagram(audio(a_tok, 3).into()).unwrap();
+    assert!(datagram(&cb, Duration::from_millis(300)).await.is_none());
 
     // Kick sends Bye and closes.
     assert!(srv.kick(a_id, "testing"));
     let bye = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match read_frame::<_, ServerMsg>(&mut a).await.unwrap() {
+            match read_frame::<_, ServerMsg>(&mut ar).await.unwrap() {
                 Some(ServerMsg::Bye { reason }) => break reason,
                 Some(_) => continue,
                 None => panic!("closed without bye"),
@@ -363,9 +382,13 @@ async fn voice_relay_and_moderation() {
     wait_for("a removed", || srv.members().len() == 1).await;
 
     // Probe works without joining.
-    let info = tailchat_core::net::probe(addr, Duration::from_secs(2)).await.unwrap();
+    let info = net::probe(&na, &room, room.room.as_deref(), Duration::from_secs(2)).await.unwrap();
     assert!(matches!(info, ServerMsg::ProbeInfo { members: 1, .. }));
-    drop(b);
+    // A room this endpoint doesn't host says so.
+    let other = room.clone().room("no-such-room");
+    let none = net::probe(&na, &other, Some("no-such-room"), Duration::from_secs(2)).await.unwrap();
+    assert!(matches!(none, ServerMsg::Error { ref code, .. } if code == "no_room"), "{none:?}");
+    drop((b, cb));
     srv.shutdown();
 }
 
@@ -377,9 +400,9 @@ fn on_term(s: &Session, term: u64) -> bool {
     s.state().conn.is_connected() && term_of(s) == term
 }
 
-/// Host a new room from `s` on localhost and return the address to join.
+/// Host a new room from `s` and return its invite link.
 async fn host(s: &Session, name: &str) -> String {
-    s.host(HostOptions { name: name.into(), bind: "localhost".into(), port: 0 });
+    s.host(HostOptions { name: name.into(), open: false });
     wait_for("hosting", || s.state().hosting.is_some() && s.state().conn.is_connected()).await;
     s.state().hosting.as_ref().unwrap().share[0].clone()
 }
@@ -393,7 +416,7 @@ async fn sync_fills_gaps_both_ways() {
     let home = tmp("sync");
     let alice = session("alice", &home.join("a")).await;
     let srv = start_room(None, "room-sync", 1).await;
-    alice.join(srv.local_addr().to_string());
+    alice.join(link(&srv).await);
     wait_for("connected", || alice.state().conn.is_connected()).await;
     alice.submit(None, "said on the first host");
     wait_for("echo", || has_text(&alice, "general", "said on the first host")).await;
@@ -407,11 +430,11 @@ async fn sync_fills_gaps_both_ways() {
     // A later host of the same room that never saw that message.
     let srv2 = start_room(Some(home.join("h2")), "room-sync", 2).await;
     srv2.say(None, "only the new host has this").unwrap();
-    alice.join(srv2.local_addr().to_string());
+    alice.join(link(&srv2).await);
     wait_for("host got alice's copy", || srv2.history("general", 50).iter().any(|m| m.text == "said on the first host")).await;
     wait_for("alice got the host's", || has_text(&alice, "general", "only the new host has this")).await;
     let bob = session("bob", &home.join("b")).await;
-    bob.join(srv2.local_addr().to_string());
+    bob.join(link(&srv2).await);
     wait_for("bob sees both", || {
         has_text(&bob, "general", "said on the first host") && has_text(&bob, "general", "only the new host has this")
     })
@@ -480,7 +503,7 @@ async fn leaving_host_hands_the_room_on() {
 async fn host_this_room_after_the_host_vanishes() {
     let home = tmp("takeover");
     let srv = start_room(Some(home.join("srv")), "room-gone", 1).await;
-    let addr = srv.local_addr().to_string();
+    let addr = link(&srv).await;
     let alice = session("alice", &home.join("a")).await;
     let carol = session("carol", &home.join("c")).await;
     alice.join(&addr);
@@ -517,43 +540,45 @@ async fn server_takes_the_room_back() {
     // An always-on server starts with (a copy of) the room's save: it finds
     // the room being hosted at its last address and claims it.
     let save = rooms::list(&Paths::under(&home.join("a"))).remove(0);
-    let base = ServerConfig { bind: "localhost".into(), port: 0, rate_limit: 100, ..ServerConfig::default() };
-    let node = ServerNode::start(
-        save.server_config(base),
-        save,
-        Paths::under(&home.join("srv")),
-        NodeOptions { api: false, mods: false, tailscale_bin: Some("/nonexistent/tailscale".into()) },
-    )
-    .await
-    .unwrap();
+    let node = ServerNode::start(save.server_config(local_base(0)), save, Paths::under(&home.join("srv")), node_opts()).await.unwrap();
     assert!(node.claimed_from().is_some());
     wait_for("everyone on the server", || on_term(&alice, 2) && on_term(&bob, 2)).await;
     assert_eq!(alice.state().server.as_ref().unwrap().mode, "server");
     wait_for("server has the app's history", || node.server().history("general", 50).iter().any(|m| m.text == "made in the app")).await;
     wait_for("alice stops hosting", || alice.state().hosting.is_none()).await;
     // A stale term can't take it back.
-    let err = rooms::claim(&node.local_addr().to_string(), 0, &node.save().id, 2, vec!["127.0.0.1:1".into()]).await.unwrap_err();
+    let net = test_net(SecretKey::generate(), 0).await;
+    let member = rooms::member_key(&Paths::under(&home.join("x")), &node.save().id).unwrap();
+    let addr = node.invite_link().await.without_invite().to_string();
+    let err = rooms::claim(&net, &addr, node.save(), &member, 2, vec![addr.clone()]).await.unwrap_err();
     assert!(err.to_string().contains("term"), "{err}");
+    // Without the invite, no claim at all.
+    let mut uninvited = node.save().clone();
+    uninvited.invite = Some(net::new_invite());
+    let err = rooms::claim(&net, &addr, &uninvited, &member, 9, vec![addr.clone()]).await.unwrap_err();
+    assert!(err.to_string().contains("invite"), "{err}");
     node.shutdown();
 }
 
 fn node_opts() -> NodeOptions {
-    NodeOptions { api: false, mods: false, tailscale_bin: Some("/nonexistent/tailscale".into()) }
+    NodeOptions { api: false, mods: false }
 }
 
 fn local_base(port: u16) -> ServerConfig {
-    ServerConfig { bind: "localhost".into(), port, rate_limit: 100, ..ServerConfig::default() }
+    ServerConfig {
+        bind: "localhost".into(),
+        port,
+        rate_limit: 100,
+        net: NetConfig::direct_only(),
+        // Most tests don't need the room's relay (see `serve_relay_gets_members_in`).
+        relay: RelayServeConfig { enabled: false, ..RelayServeConfig::default() },
+        ..ServerConfig::default()
+    }
 }
 
-/// A port that is free for both TCP and UDP right now.
+/// A UDP port that is free right now.
 fn free_port() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
 /// BUG-A: messages a member uploads because the host lacked them show up in
@@ -564,8 +589,8 @@ async fn uploaded_messages_show_for_the_uploader() {
     let srv = start_room(None, "room-up", 1).await;
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
-    alice.join(srv.local_addr().to_string());
-    bob.join(srv.local_addr().to_string());
+    alice.join(link(&srv).await);
+    bob.join(link(&srv).await);
     wait_for("both in", || alice.state().members.len() == 2).await;
     alice.submit(None, "everyone saw this");
     wait_for("bob has it", || has_text(&bob, "general", "everyone saw this")).await;
@@ -633,8 +658,9 @@ async fn serve_hands_off_on_shutdown_and_claims_back() {
     let node = ServerNode::start(save.server_config(local_base(0)), save, srv_paths.clone(), node_opts()).await.unwrap();
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
-    alice.join(node.local_addr().to_string());
-    bob.join(node.local_addr().to_string());
+    let invite = node.invite_link().await.to_string();
+    alice.join(&invite);
+    bob.join(&invite);
     wait_for("both in", || node.server().members().len() == 2 && on_term(&alice, 1) && on_term(&bob, 1)).await;
     alice.submit(None, "while the server ran");
     wait_for("bob has it", || has_text(&bob, "general", "while the server ran")).await;
@@ -644,10 +670,10 @@ async fn serve_hands_off_on_shutdown_and_claims_back() {
         on_term(&alice, 2) && on_term(&bob, 2) && (alice.state().hosting.is_some() || bob.state().hosting.is_some())
     })
     .await;
-    let host_share = [&alice, &bob].iter().find_map(|s| s.state().hosting.as_ref().map(|h| h.share.clone())).unwrap();
+    let host_addr = [&alice, &bob].iter().find_map(|s| s.state().hosting.as_ref().map(|h| h.addr.clone())).unwrap();
     // The server remembers where the room went.
     let saved = rooms::load(&srv_paths, &id).unwrap();
-    assert_eq!((saved.term, &saved.addrs), (2, &host_share));
+    assert_eq!((saved.term, &saved.addrs), (2, &vec![host_addr]));
 
     let node2 = ServerNode::start(saved.server_config(local_base(0)), saved, srv_paths.clone(), node_opts()).await.unwrap();
     assert!(node2.claimed_from().is_some());
@@ -660,22 +686,21 @@ async fn serve_hands_off_on_shutdown_and_claims_back() {
     bob.shutdown();
 }
 
-/// BUG-F: `serve` for a room an app on this machine hosts on the same port
-/// claims it first, then binds once the app lets go.
+/// `serve` and an app on one machine (same data folder) are different peers:
+/// serve takes the room from the app, and the app moves over like anyone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn serve_takes_a_room_hosted_on_its_own_port() {
-    let home = tmp("same-port");
-    let port = free_port();
+async fn serve_takes_a_room_from_an_app_on_the_same_machine() {
+    let home = tmp("same-machine");
     let alice = session("alice", &home.join("a")).await;
     let bob = session("bob", &home.join("b")).await;
-    alice.host(HostOptions { name: "den".into(), bind: "localhost".into(), port });
-    wait_for("hosting", || alice.state().hosting.is_some() && alice.state().conn.is_connected()).await;
-    bob.join(format!("127.0.0.1:{port}"));
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
     wait_for("both in", || alice.state().members.len() == 2).await;
 
-    let save = rooms::list(&Paths::under(&home.join("a"))).remove(0);
-    let node = ServerNode::start(save.server_config(local_base(port)), save, Paths::under(&home.join("srv")), node_opts()).await.unwrap();
-    assert_eq!(node.local_addr().port(), port);
+    let paths = Paths::under(&home.join("a"));
+    let save = rooms::list(&paths).remove(0);
+    let node = ServerNode::start(save.server_config(local_base(0)), save, paths, node_opts()).await.unwrap();
+    assert_ne!(Some(node.server().net().id().to_z32()), alice.net().map(|n| n.id().to_z32()), "serve has its own key");
     assert!(node.claimed_from().is_some());
     wait_for("everyone on the server", || on_term(&alice, 2) && on_term(&bob, 2)).await;
     assert_eq!(bob.state().server.as_ref().unwrap().mode, "server");
@@ -689,68 +714,131 @@ async fn serve_takes_a_room_hosted_on_its_own_port() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refused_rejoin_offers_no_takeover() {
     let home = tmp("refused");
-    let srv = start_room(None, "room-strict", 1).await;
-    let port = srv.local_addr().port();
+    let (key, port) = (SecretKey::generate(), free_port());
+    let config = ServerConfig { name: "test room".into(), ..ServerConfig::default() };
+    let srv = start_with(config.clone(), test_net(key.clone(), port).await, None, "room-strict", 1, None).await;
     let alice = session("alice", &home.join("a")).await;
-    alice.join(srv.local_addr().to_string());
+    alice.join(link(&srv).await);
     wait_for("in", || alice.state().conn.is_connected()).await;
     srv.shutdown();
+    srv.net().close().await;
     drop(srv);
-    // The room comes back with an allow list alice isn't on.
-    let config = ServerConfig { name: "test room".into(), allow: vec!["someone@example.com".into()], ..ServerConfig::default() };
-    let mut strict = None;
+    // The room comes back at the same endpoint with an allow list alice isn't on.
+    let config = ServerConfig { allow: vec!["notakey!".into()], ..config };
+    let mut net = None;
     for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(s) = server::start(ServerOptions {
-            config: config.clone(),
-            mode: ServerMode::Headless,
-            bind: format!("127.0.0.1:{port}").parse().unwrap(),
-            history_dir: None,
-            tailscale: None,
-            room_id: "room-strict".into(),
-            term: 2,
-        })
-        .await
-        {
-            strict = Some(s);
-            break;
+        match Net::bind(key.clone(), "localhost", port, true, &NetConfig::direct_only()).await {
+            Ok(n) => {
+                net = Some(n);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
-    let strict = strict.expect("the old server let go of its port");
-    wait_for("refused", || matches!(alice.state().conn, tailchat_core::session::ConnState::Failed { refused: true, .. })).await;
+    let strict = start_with(config, net.expect("the old endpoint let go of its port"), None, "room-strict", 2, None).await;
+    wait_for("refused", || matches!(alice.state().conn, ConnState::Failed { refused: true, .. })).await;
     assert!(alice.state().room_id().is_some());
     assert!(!alice.state().host_lost(), "no takeover offer when the host refused us");
     strict.shutdown();
 }
 
-/// BUG-D: a name that resolves to several addresses (here `localhost` → v4
-/// and v6) connects to whichever one the room listens on.
+/// Invite-only rooms (the default): the link gets you in, the bare address
+/// doesn't, and your copy keeps the invite so you can come back without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_tries_every_address_a_name_resolves_to() {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", 1)).await.map(|i| i.collect()).unwrap_or_default();
-    if !(resolved.iter().any(|a| a.is_ipv4()) && resolved.iter().any(|a| a.is_ipv6())) {
-        eprintln!("skipping: localhost doesn't resolve to both IPv4 and IPv6 here");
-        return;
-    }
-    let home = tmp("resolve-all");
-    let config = ServerConfig { name: "v6 room".into(), ..ServerConfig::default() };
-    let Ok(srv) = server::start(ServerOptions {
-        config,
-        mode: ServerMode::Headless,
-        bind: "[::1]:0".parse().unwrap(),
-        history_dir: None,
-        tailscale: None,
-        room_id: "room-v6".into(),
-        term: 1,
-    })
-    .await
-    else {
-        eprintln!("skipping: no IPv6 loopback");
-        return;
-    };
+async fn invites_and_room_profiles() {
+    let home = tmp("invites");
     let alice = session("alice", &home.join("a")).await;
-    // IPv4 is tried first and refused; the v6 address works.
-    alice.join(format!("localhost:{}", srv.local_addr().port()));
-    wait_for("connected over v6", || alice.state().conn.is_connected()).await;
-    srv.shutdown();
+    let bob = session("bob", &home.join("b")).await;
+    let mallory = session("mallory", &home.join("m")).await;
+    let invite = host(&alice, "den").await;
+    let parsed = Link::parse(&invite).unwrap();
+    assert!(parsed.invite.is_some() && parsed.room.is_some(), "{invite}");
+
+    // No invite, no entry.
+    mallory.join(parsed.without_invite().to_string());
+    wait_for("refused", || matches!(mallory.state().conn, ConnState::Failed { refused: true, .. })).await;
+
+    bob.join(&invite);
+    wait_for("bob in", || alice.state().members.len() == 2 && bob.state().conn.is_connected()).await;
+    let bob_key = bob.state().me().and_then(|m| m.identity.key.clone()).expect("bob signed in with his key");
+    assert!(bob.state().me().unwrap().identity.verified);
+    // The host remembers bob's profile; so does alice's copy.
+    let a_paths = Paths::under(&home.join("a"));
+    let id = parsed.room.clone().unwrap();
+    wait_for("profile saved", || rooms::load(&a_paths, &id).is_ok_and(|s| s.profiles.iter().any(|p| p.key == bob_key && p.nick == "bob"))).await;
+
+    // While bob is away, someone else still can't take his nick in this room.
+    bob.leave();
+    wait_for("bob gone", || alice.state().members.len() == 1).await;
+    mallory.join(&invite);
+    wait_for("mallory in", || mallory.state().conn.is_connected()).await;
+    mallory.submit(None, "/nick bob");
+    wait_for("nick decided", || alice.state().members.values().any(|m| m.nick.starts_with("bob ("))).await;
+
+    // Bob's copy kept the invite: the bare address is enough to come back.
+    let b_save = rooms::load(&Paths::under(&home.join("b")), &id).unwrap();
+    assert_eq!(b_save.invite, parsed.invite);
+    bob.join(parsed.without_invite().to_string());
+    wait_for("bob back", || bob.state().conn.is_connected()).await;
+    assert_eq!(bob.state().me().and_then(|m| m.identity.key.clone()), Some(bob_key), "same key for the same room");
+    assert_eq!(bob.state().me().map(|m| m.nick.clone()).as_deref(), Some("bob"));
+    alice.shutdown();
+    bob.shutdown();
+    mallory.shutdown();
+}
+
+/// `serve` runs a relay for its room and puts it in the invite link, so a
+/// member who can't reach the server directly gets in through the server's
+/// own relay (here: a link with no direct addresses at all, and a member
+/// whose own configured relay is dead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_relay_gets_members_in() {
+    let home = tmp("serve-relay");
+    let relay_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let relay_url = format!("http://127.0.0.1:{relay_port}/");
+    let mut base = local_base(0);
+    base.relay = RelayServeConfig { enabled: true, port: relay_port, url: Some(relay_url.clone()) };
+    let save = rooms::RoomSave::new(&ServerConfig { name: "relayed".into(), ..ServerConfig::default() });
+    let node = ServerNode::start(save.server_config(base), save, Paths::under(&home.join("srv")), node_opts()).await.unwrap();
+    assert_eq!(node.relay_url().as_deref(), Some(relay_url.as_str()));
+    let invite = node.invite_link().await;
+    let relays: Vec<String> = invite.addr.relay_urls().map(|u| u.to_string()).collect();
+    assert_eq!(relays.len(), 1, "the link names only the server's own relay: {relays:?}");
+    assert!(relays[0].starts_with(&format!("{relay_url}?token=")), "with its token: {relays:?}");
+    // The link survives being written out and read back.
+    assert_eq!(Link::parse(&invite.to_string()).unwrap().addr, invite.addr);
+
+    // Strangers can't use the relay: no token, or a wrong one, gets them
+    // nowhere; the link's token does.
+    let stranger = Net::bind(SecretKey::generate(), "localhost", 0, false, &NetConfig::relays(["http://127.0.0.1:1".to_string()]))
+        .await
+        .unwrap();
+    let via = |url: &str| iroh::EndpointAddr::from_parts(invite.addr.id, [iroh::TransportAddr::Relay(url.parse().unwrap())]);
+    for bad in [relay_url.clone(), format!("{relay_url}?token=nope")] {
+        assert!(stranger.connect(via(&bad), Duration::from_secs(3)).await.is_err(), "{bad} let a stranger in");
+    }
+    stranger.connect(via(&relays[0]), Duration::from_secs(10)).await.expect("the link's token opens the relay");
+    stranger.close().await;
+
+    // Only the relay: no direct addresses to try.
+    let relay_only = Link::new(iroh::EndpointAddr::from_parts(
+        invite.addr.id,
+        invite.addr.relay_urls().cloned().map(iroh::TransportAddr::Relay),
+    ))
+    .room(invite.room.clone().unwrap())
+    .invite(invite.invite.clone());
+    let config = AppConfig {
+        nick: Some("alice".into()),
+        bind: "localhost".into(),
+        // A relay that isn't there: the room's relay must come from the link.
+        net: NetConfig::relays(["http://127.0.0.1:1".to_string()]),
+        ..AppConfig::default()
+    };
+    let alice = Session::start(SessionOptions { paths: Paths::under(&home.join("a")), config, client_name: "test".into() }).await.unwrap();
+    alice.join(relay_only.to_string());
+    wait_for("alice in through the relay", || alice.state().conn.is_connected() && node.server().members().len() == 1).await;
+    alice.submit(None, "hello via relay");
+    wait_for("server has it", || node.server().history("general", 10).iter().any(|m| m.text == "hello via relay")).await;
+    alice.shutdown();
+    node.close().await;
 }

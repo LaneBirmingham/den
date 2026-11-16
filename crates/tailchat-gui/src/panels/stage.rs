@@ -80,7 +80,7 @@ impl Panel for Stage {
                             );
                         }
                         if m.identity.verified {
-                            resp.on_hover_text(m.identity.login.clone().unwrap_or_default());
+                            resp.on_hover_text(format!("key {}…", m.identity.short().unwrap_or_default()));
                         }
                     }
                 });

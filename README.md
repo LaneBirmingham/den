@@ -1,18 +1,38 @@
 # tailchat
 
-Minimal voice + text chat for people on the same [Tailscale](https://tailscale.com)
-tailnet. One Rust binary, three ways to run it:
+Minimal peer-to-peer voice + text chat. No accounts, no service to sign up
+for, nothing to install but the app. One Rust binary, three ways to run it:
 
 | You want to… | Run |
 | --- | --- |
-| Hang out with friends, one of you hosts | `tailchat host` (others: `tailchat join <your-machine>`) |
+| Hang out with friends, one of you hosts | `tailchat host`, then share the invite link (others: `tailchat join '<link>'`) |
 | A room that's always up | `tailchat serve` on a server, headless, with an admin console |
 | Keep a room going when its host leaves | nothing: everyone keeps a copy, and anyone can host it next |
-| Chat from a terminal / over SSH | `tailchat chat <machine>` |
+| Chat from a terminal / over SSH | `tailchat chat '<link>'` |
 
-Tailscale does the hard parts: addressing (`join lanes-mac-mini`), encryption
-(WireGuard), NAT traversal, and identity — the room checks every connection
-with `tailscale whois`, so members show up as who they really are.
+[iroh](https://iroh.computer) does the networking: every app is a QUIC
+endpoint named by a public key, connections are end-to-end encrypted, and NAT
+hole-punching gets most peers a direct connection. Peers that can't reach
+each other directly (strict NATs, some mobile networks) go through a relay,
+which only ever sees encrypted traffic:
+
+* **Rooms with a `serve`** use the server's own relay (built in, same port
+  number over TCP). Nothing from a third party.
+* **Rooms hosted from an app** use n0's free public relays by default, or
+  your own: run `tailchat relay` on any machine with a forwarded port and
+  put the URL it prints (token included) in the host's `[net] relays`. Members need no setup either way:
+  the invite link says which relay to use.
+
+A relay has to be reachable from outside (a forwarded port or a public IP);
+that's what lets two peers behind routers find each other. Your own relays
+aren't open to the internet: each has a token, carried in invite links, and
+admits only apps that present it.
+
+**Identity is per room.** There are no global profiles. The first time you
+join a room, your app makes a key for that room and keeps it; the room
+remembers the public half next to your nick. Signing in is signing a
+challenge with that key, so nobody else can show up as you in that room, and
+nothing links your profiles across rooms.
 
 The app is deliberately bare. Every visible piece of the UI is a removable
 panel placed by a TOML **layout**, colours and shapes come from a TOML
@@ -36,12 +56,18 @@ scripts and AI agents can drive and reshape the app without touching Rust.
 
 ```sh
 cargo build --release              # GUI + voice (default features)
-./target/release/tailchat          # opens the lobby: host, join, or pick a discovered room
+./target/release/tailchat          # opens the lobby: host, join, or reopen a saved room
 ```
 
-Friends on your tailnet run `tailchat join <your-machine-name>` (or click your
-room under *On your tailnet* in the lobby). Default port is **8245** (TCP for
-chat, UDP for voice).
+Host a room, then *room menu → Copy invite link* and send it to your friends;
+they paste it into *Join*. A link looks like
+`tailchat://<endpoint-id>?room=<id>&invite=<key>&relay=…&ip=…`.
+
+**The invite link is the key to the room.** New rooms are invite-only: the
+link carries the room's invite key, and the host admits only apps that prove
+they have it. Your app saves it with the room, so you can come back without
+the link, and any member can copy it again. Tick *Open room* (or
+`tailchat host --open`) for a room anyone with the address can join.
 
 ### Rooms belong to everyone in them
 
@@ -55,27 +81,31 @@ copies fill each other's gaps. That means:
   follows automatically. *Hand off to…* in the room menu does the same on
   purpose. The header says "you host" while the room runs on your machine.
 * **The host can vanish.** If the host drops, anyone can click
-  **Host this room** and carry on from their copy; the others find it on
-  the tailnet. Open a room later from *Your rooms* in the lobby (or
+  **Host this room** and carry on from their copy; the others find it by
+  asking every member's app they know of. Open a room later from *Your rooms* in the lobby (or
   `tailchat host --room <name>`): it joins whoever hosts it now, or hosts
   it from your copy.
-* Everyone in a room has the same rights: anyone can host it. Join rules
-  (`require_tailnet`, `allow`) travel with the room. If a host refuses you
-  because of them, there's no *Host this room*: the host is up, and would
-  refuse you again.
+* Everyone in a room has the same rights: anyone can host it. The invite
+  key, members' profiles (key → nick) and join rules (`allow`) travel with
+  the room. If a host refuses you, there's no *Host this room*: the host is
+  up, and would refuse you again.
 
 ### Persistent server
 
 ```sh
 cargo build --release -p tailchat --no-default-features   # headless: no GUI/audio deps
-tailchat serve --name "The Den" --channel general --channel lounge:voice --require-tailnet
+tailchat serve --name "The Den" --channel general --channel lounge:voice
 ```
 
-`serve` binds to the machine's tailnet IP, saves the room like any member
-would, runs server-side mods, and gives you an admin console (`help`, `who`,
-`say`, `kick`, `motd`, `reload`, …). Settings live in `server.toml`
-(`tailchat serve --write-config` writes one). See [`deploy/`](deploy) for
-systemd and Docker (Tailscale sidecar) setups.
+`serve` prints the room's invite link, saves the room like any member would,
+runs server-side mods, and gives you an admin console (`help`, `who`, `say`,
+`kick`, `motd`, `reload`, …). It listens on **UDP 8245** (the room) and
+**TCP 8245** (its relay); forward both on your router. It works out its
+public IP at start and puts its relay in the invite link; on a dynamic IP,
+give it a DNS name instead: `--relay-url box.example.com:8245` (or
+`[relay] url` in `server.toml`).
+Settings live in `server.toml` (`tailchat serve --write-config` writes one).
+See [`deploy/`](deploy) for systemd and Docker setups.
 
 A server is just the room's always-on host. Stopping it (Ctrl-C, SIGTERM,
 `quit`) hands the room to a member whose app can host, so nobody is
@@ -83,22 +113,23 @@ stranded. If it was down and someone else hosted the room meanwhile, it
 takes the room back when it starts, and the members' copies fill in what it
 missed.
 
-Join rules are saved with the room, so `--require-tailnet` and `--allow`
-stick across restarts. `--allow` replaces the saved list; `--open` clears
-both rules (combine it with `--allow` / `--require-tailnet` to set new
-ones), e.g. `tailchat serve --room den --open` to let everyone back in. To move a room you started in the
-app onto a server: `tailchat serve --adopt <your-machine>` (or copy
+Join rules are saved with the room, so `--allow` sticks across restarts.
+`--allow <key>` (repeatable; the first 8+ characters of a member's key, see
+`who`) admits only those members, on top of the invite; it replaces the
+saved list, and `--open` clears it. To move a room you started in the app
+onto a server: `tailchat serve --adopt '<invite link>'` (or copy
 `<data>/rooms/<id>/` over and run `tailchat serve --room <id>`).
 
 ### All commands
 
 ```
 tailchat [gui]                   desktop app
-tailchat host [--name | --room <saved>] [--bind --port] [--cli]
-tailchat join <addr> [--cli]
-tailchat chat <addr> | --host    terminal client
-tailchat serve [--room <saved> | --adopt <addr>] [...]   always-on host + admin console
-tailchat discover [--json]       find rooms on your tailnet
+tailchat host [--name | --room <saved>] [--open] [--cli]
+tailchat join <link> [--cli]
+tailchat chat <link> | --host    terminal client
+tailchat serve [--room <saved> | --adopt <link>] [...]   always-on host + admin console + relay
+tailchat relay [--port 3340]     a relay on its own, for rooms hosted from apps
+tailchat discover [--json]       which of your saved rooms are live
 tailchat api <method> [params]   drive a running instance (see docs/API.md)
 tailchat mods list|new|link|unlink|enable|disable|path
 tailchat config path|init        where files live / write editable defaults
@@ -107,6 +138,9 @@ tailchat devices | voice-test    audio checks
 
 Global flags: `--home <dir>` (or `TAILCHAT_HOME`) keeps config/data/state in
 one folder — handy for running several instances on one machine.
+
+In the chat box, `/invite` prints the room's invite link and `/whoami` your
+key for the room.
 
 ## Customising
 
@@ -138,9 +172,9 @@ the GUI; the headless build (`--no-default-features`) needs none of them.
 
 ```
 crates/
-  tailchat-proto   wire protocol (TCP JSON frames + UDP voice packets)
+  tailchat-proto   wire protocol (JSON frames on a QUIC stream + voice datagrams)
   tailchat-audio   capture, Opus, jitter buffers, mixing, VAD
-  tailchat-core    server, session, Tailscale, mods, control API, UI store
+  tailchat-core    server, session, P2P transport (iroh), mods, control API, UI store
   tailchat-gui     egui shell: layouts, themes, panel registry
   tailchat         the binary (app, terminal client, serve, CLI tools)
 assets/            built-in themes and layouts (compiled in)
@@ -154,9 +188,10 @@ More: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Status
 
 v0.1. Works: text channels with history, voice channels (Opus, SFU relay
-through the host), Tailscale identity, discovery, reconnect, mods, control
-API, themes/layouts with hot reload, saved rooms that any member can host
-(planned handoff, manual takeover, servers that claim their room back). Not
-yet: encryption beyond what WireGuard provides (rooms trust the tailnet),
-screen share, file transfer, mobile clients, automatic takeover when a host
-vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+through the host), P2P transport with relay fallback, invite links,
+per-room keys, reconnect, mods, control API, themes/layouts with hot reload,
+saved rooms that any member can host (planned handoff, manual takeover,
+servers that claim their room back), a relay built into `serve`. Not yet:
+signed messages (today the host relays what members say, and a malicious
+host could alter it), screen share, file transfer, mobile clients, automatic
+takeover when a host vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).

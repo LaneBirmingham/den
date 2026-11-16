@@ -110,7 +110,7 @@ fn print_event(session: &Session, ev: &Event) {
         "member.joined" | "member.left" => {
             if let Ok(m) = serde_json::from_value::<Member>(d["member"].clone()) {
                 let verb = if ev.event == "member.joined" { "joined" } else { "left" };
-                let who = m.identity.login.map(|l| format!(" ({l})")).unwrap_or_default();
+                let who = m.identity.short().map(|k| format!(" (key {k})")).unwrap_or_default();
                 println!("-- {}{who} {verb}", m.nick);
             }
         }
@@ -123,13 +123,13 @@ fn print_event(session: &Session, ev: &Event) {
                 println!(
                     "== connected to {} ({}) · channels {} · voice {} · here: {}",
                     d["room"].as_str().unwrap_or("room"),
-                    d["addr"].as_str().unwrap_or(""),
+                    tailchat_core::net::short_addr(d["addr"].as_str().unwrap_or("")),
                     text.join(" "),
                     if voice.is_empty() { "-".into() } else { voice.join(" ") },
                     people.join(", ")
                 );
             }
-            Some("connecting") => println!("== reconnecting to {}…", d["addr"].as_str().unwrap_or("")),
+            Some("connecting") => println!("== reconnecting to {}…", tailchat_core::net::short_addr(d["addr"].as_str().unwrap_or(""))),
             Some("failed") => println!("== {}", d["error"].as_str().unwrap_or("connection failed")),
             _ => {}
         },

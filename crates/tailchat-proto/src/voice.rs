@@ -1,19 +1,19 @@
-//! Binary UDP voice packets.
+//! Binary voice packets, sent as QUIC datagrams on the member's connection.
 //!
 //! All integers are big-endian. Frames are mono, 48 kHz, 20 ms.
 //!
 //! ```text
 //! client → server
-//!   REGISTER  [0x02][token:u64]                       keepalive + address learning
+//!   REGISTER  [0x02][token:u64]                       "I'm listening" (answered with ACK)
 //!   AUDIO     [0x01][token:u64][seq:u16][codec:u8][payload…]
 //! server → client
 //!   ACK       [0x04]                                  reply to REGISTER
 //!   RELAY     [0x03][speaker:u32][seq:u16][codec:u8][payload…]
 //! ```
 //!
-//! The server authenticates packets by token *and* by checking the source IP
-//! matches the member's control connection, then relays AUDIO to everyone else
-//! in the same voice channel as RELAY. It never decodes payloads.
+//! The connection already says who sent a packet (it's encrypted and tied to
+//! the member's handshake); the server relays AUDIO to everyone else in the
+//! same voice channel as RELAY. It never decodes payloads.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,7 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_MS: u32 = 20;
 /// Samples per mono frame at [`SAMPLE_RATE`].
 pub const FRAME_SAMPLES: usize = (SAMPLE_RATE / 1000 * FRAME_MS) as usize;
-/// Largest payload we ever put in a datagram (well under tailnet MTU).
+/// Largest payload we ever put in a datagram (QUIC datagrams fit ~1200 bytes).
 pub const MAX_PAYLOAD: usize = 1200;
 
 const KIND_AUDIO: u8 = 0x01;

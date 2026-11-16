@@ -5,7 +5,9 @@
 //! them can host it next time. On disk:
 //!
 //! ```text
-//! <data>/rooms/<room id>/room.toml            name, channels, join rules, term, last host
+//! <data>/rooms/<room id>/room.toml            name, channels, join rules, invite, term,
+//!                                             last host, peers, profiles
+//! <data>/rooms/<room id>/member.key           this member's key for the room (secret)
 //! <data>/rooms/<room id>/history/<chan>.jsonl recent messages, one JSON object per line
 //! ```
 //!
@@ -14,21 +16,18 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use tailchat_proto::{Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, ServerInfo, ServerMsg, clean_channel_id};
+use tailchat_proto::{Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, Member, Profile, ServerInfo, ServerMsg, clean_channel_id};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::{self, ChannelSpec, ServerConfig};
-use crate::net::{read_frame, resolve, write_frame};
+use crate::net::{self, Link, Net, SecretKey};
 use crate::paths::Paths;
-use crate::tailscale::Tailscale;
 
 /// Save format version. Bump on incompatible changes.
 pub const FORMAT: u32 = 1;
@@ -54,15 +53,30 @@ pub struct RoomSave {
     pub updated: i64,
     #[serde(default)]
     pub access: Access,
+    /// The room's invite key: only people holding it can join. Members keep
+    /// it so any of them can host and invite. `None`: an open room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
     #[serde(default)]
     pub channels: Vec<Channel>,
+    /// Where members' apps were last seen (newest first): where to look for
+    /// the room when its last host is gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
+    /// Members the room knows: the public half of each one's key and their nick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<Profile>,
 }
 
+/// How many peer addresses a save keeps.
+const MAX_PEERS: usize = 16;
+
 impl RoomSave {
-    /// A new room (fresh id, term 0) with the settings in `cfg`.
+    /// A new room (fresh id, term 0, a fresh invite key) with the settings in `cfg`.
     pub fn new(cfg: &ServerConfig) -> RoomSave {
         let mut save = RoomSave::empty(&new_id());
         save.apply_config(cfg);
+        save.invite = Some(net::new_invite());
         save
     }
 
@@ -77,7 +91,50 @@ impl RoomSave {
             addrs: Vec::new(),
             updated: crate::now_ms(),
             access: Access::default(),
+            invite: None,
             channels: Vec::new(),
+            peers: Vec::new(),
+            profiles: Vec::new(),
+        }
+    }
+
+    /// Everywhere to look for the room: its last host, then members' apps.
+    pub fn places(&self) -> Vec<String> {
+        let mut v = self.addrs.clone();
+        v.extend(self.peers.iter().filter(|p| !self.addrs.contains(p)).cloned());
+        v
+    }
+
+    /// Merge what a host says about the room's members.
+    pub fn merge_profiles(&mut self, profiles: &[Profile]) {
+        for p in profiles {
+            self.note_profile(&p.key, &p.nick, p.since);
+        }
+    }
+
+    fn note_profile(&mut self, key: &str, nick: &str, since: i64) {
+        if key.is_empty() {
+            return;
+        }
+        match self.profiles.iter_mut().find(|x| x.key == key) {
+            Some(x) => {
+                x.nick = nick.to_owned();
+                x.since = x.since.min(since);
+            }
+            None => self.profiles.push(Profile { key: key.to_owned(), nick: nick.to_owned(), since }),
+        }
+    }
+
+    /// Remember a member we saw: their profile, and where their app is (if it can host).
+    pub fn note_member(&mut self, m: &Member) {
+        if let Some(k) = m.identity.key.as_deref().filter(|_| m.identity.verified) {
+            self.note_profile(k, &m.nick, crate::now_ms());
+        }
+        if let Some(a) = m.addr.as_ref().filter(|_| m.can_host) {
+            let id = Link::parse(a).ok().map(|l| l.id());
+            self.peers.retain(|p| p != a && (id.is_none() || Link::parse(p).ok().map(|l| l.id()) != id));
+            self.peers.insert(0, a.clone());
+            self.peers.truncate(MAX_PEERS);
         }
     }
 
@@ -86,7 +143,7 @@ impl RoomSave {
         self.name = cfg.name.clone();
         self.motd = cfg.motd.clone();
         self.channels = cfg.channel_list();
-        self.access = Access { require_tailnet: cfg.require_tailnet, allow: cfg.allow.clone() };
+        self.access = Access { allow: cfg.allow.clone() };
         self.updated = crate::now_ms();
     }
 
@@ -98,7 +155,6 @@ impl RoomSave {
             name: self.name.clone(),
             motd: self.motd.clone(),
             channels,
-            require_tailnet: self.access.require_tailnet,
             allow: self.access.allow.clone(),
             ..base
         }
@@ -143,6 +199,15 @@ pub fn dir(paths: &Paths, id: &str) -> PathBuf {
 
 pub fn history_dir(paths: &Paths, id: &str) -> PathBuf {
     dir(paths, id).join("history")
+}
+
+/// This member's key for room `id`, made on first use. Only its public half
+/// ever leaves the machine.
+pub fn member_key(paths: &Paths, id: &str) -> anyhow::Result<SecretKey> {
+    if !valid_id(id) {
+        bail!("bad room id {id:?}");
+    }
+    net::load_or_create_key(&dir(paths, id).join("member.key"))
 }
 
 pub fn load(paths: &Paths, id: &str) -> anyhow::Result<RoomSave> {
@@ -339,30 +404,37 @@ impl Copy {
 /// A host currently running a room.
 #[derive(Clone, Debug)]
 pub struct LiveHost {
-    /// What to connect to.
+    /// What to connect to (a link, without the invite).
     pub addr: String,
-    /// The address that answered the probe.
-    pub sock: SocketAddr,
+    /// The host's endpoint id: the same for everyone who finds it.
+    pub id: String,
     pub server: ServerInfo,
     pub members: u32,
 }
 
-/// Look for a running host of room `id`: probe `addrs` (where it was last
-/// seen) and, with Tailscale, every online peer on `port`. See [`best_host`]
-/// for which one wins.
-pub async fn find_live(id: &str, addrs: &[String], port: u16, tailscale: Option<&Tailscale>) -> Option<LiveHost> {
+/// Look for a running host of room `id` at `places` (its last hosts and
+/// members' apps), all at once. See [`best_host`] for which one wins.
+pub async fn find_live(net: &Net, id: &str, places: &[String]) -> Option<LiveHost> {
+    let mut seen = std::collections::HashSet::new();
     let mut set = tokio::task::JoinSet::new();
-    for a in addrs.iter().cloned() {
+    for a in places {
+        let Ok(link) = Link::parse(a) else { continue };
+        if !seen.insert(link.id()) {
+            continue;
+        }
+        let (net, room) = (net.clone(), id.to_owned());
         set.spawn(async move {
-            let sock = resolve(&a, port).await.ok()?;
-            match crate::net::probe(sock, Duration::from_millis(900)).await {
-                Ok(ServerMsg::ProbeInfo { server, members, .. }) => Some(LiveHost { addr: a, sock, server, members }),
+            let link = link.without_invite().room(room.clone());
+            match net::probe(&net, &link, Some(&room), Duration::from_secs(4)).await {
+                Ok(ServerMsg::ProbeInfo { server, members, .. }) => {
+                    Some(LiveHost { addr: link.to_string(), id: link.id().to_string(), server, members })
+                }
                 Ok(other) => {
-                    tracing::debug!("{a} answered the probe with {other:?}");
+                    tracing::debug!("{} answered the probe with {other:?}", link.short());
                     None
                 }
                 Err(e) => {
-                    tracing::debug!("no room at {a} ({sock}): {e:#}");
+                    tracing::debug!("no room at {}: {e:#}", link.short());
                     None
                 }
             }
@@ -374,86 +446,58 @@ pub async fn find_live(id: &str, addrs: &[String], port: u16, tailscale: Option<
             found.push(h);
         }
     }
-    if let Some(ts) = tailscale
-        && let Ok(status) = ts.status().await
-    {
-        for r in crate::session::discover_rooms(&status, port).await {
-            let Ok(sock) = r.addr.parse() else { continue };
-            found.push(LiveHost { addr: r.addr, sock, server: r.server, members: r.members });
-        }
-    }
     best_host(found.into_iter().filter(|h| h.server.room_id == id))
 }
 
 /// The host members should be in when several run the same room: highest
 /// term; on equal terms (two members took over at once without seeing each
-/// other), an always-on `serve` beats an app, then the lowest address. Every
-/// member sees the same tailnet addresses, so they all pick the same host.
-/// (Claims stay strict: a claim must carry a higher term than the host's.)
+/// other), an always-on `serve` beats an app, then the lowest endpoint id.
+/// Everyone sees the same ids, so they all pick the same host. (Claims stay
+/// strict: a claim must carry a higher term than the host's.)
 pub fn best_host(hosts: impl IntoIterator<Item = LiveHost>) -> Option<LiveHost> {
-    hosts.into_iter().max_by_key(|h| (h.server.term, h.server.mode == "server", std::cmp::Reverse(h.sock)))
+    hosts.into_iter().max_by(|a, b| {
+        (a.server.term, a.server.mode == "server").cmp(&(b.server.term, b.server.mode == "server")).then_with(|| b.id.cmp(&a.id))
+    })
 }
 
 /// Ask the host at `addr` to move everyone to us (we host the room at a
-/// higher `term` on `ours`).
-pub async fn claim(addr: &str, port: u16, room: &str, term: u64, ours: Vec<String>) -> anyhow::Result<()> {
-    let sock = resolve(addr, port).await?;
-    let talk = async {
-        let mut s = TcpStream::connect(sock).await?;
-        write_frame(&mut s, &ClientMsg::Claim { room: room.to_owned(), term, addrs: ours }).await?;
-        read_frame::<_, ServerMsg>(&mut s).await
-    };
-    match tokio::time::timeout(Duration::from_secs(8), talk).await.context("timed out")?? {
-        Some(ServerMsg::Handoff { .. }) => Ok(()),
-        Some(ServerMsg::Error { message, .. }) => bail!("{message}"),
+/// higher `term` at `ours`). We prove our key and the invite, like a join.
+pub async fn claim(net: &Net, addr: &str, save: &RoomSave, member: &SecretKey, term: u64, ours: Vec<String>) -> anyhow::Result<()> {
+    let link = Link::parse(addr)?;
+    let invite = save.invite.as_deref().map(net::invite_key).transpose()?;
+    let room = save.id.clone();
+    let reply = net
+        .ask(link.addr, Duration::from_secs(8), |conn| {
+            let proof = net::prove(conn, &room, Some(member), invite.as_ref())?;
+            Ok(ClientMsg::Claim { room: room.clone(), term, addrs: ours, proof })
+        })
+        .await?;
+    match reply {
+        ServerMsg::Handoff { .. } => Ok(()),
+        ServerMsg::Error { message, .. } => bail!("{message}"),
         other => bail!("unexpected reply {other:?}"),
     }
 }
 
-/// A save for the room hosted at `addr`, made from its probe answer (merged
-/// into an existing save of the same room). Join rules aren't public, so they
-/// come from the existing save or stay open.
-pub async fn adopt(paths: &Paths, addr: &str, port: u16) -> anyhow::Result<RoomSave> {
-    let sock = resolve(addr, port).await?;
-    let ServerMsg::ProbeInfo { server, channels, .. } = crate::net::probe(sock, Duration::from_secs(3)).await? else {
-        bail!("{addr} did not answer like a tailchat room");
+/// A save for the room at `addr` (a link), made from its probe answer and
+/// merged into an existing save of the same room. Join rules aren't public,
+/// so they come from the existing save or stay open; the invite comes from
+/// the link or the existing save.
+pub async fn adopt(net: &Net, paths: &Paths, addr: &str) -> anyhow::Result<RoomSave> {
+    let link = Link::parse(addr)?;
+    let ServerMsg::ProbeInfo { server, channels, .. } = net::probe(net, &link, None, Duration::from_secs(5)).await? else {
+        bail!("{} did not answer like a tailchat room", link.short());
     };
     if !valid_id(&server.room_id) {
-        bail!("{addr} runs a tailchat without room ids; upgrade it first");
+        bail!("{} runs a tailchat without room ids; upgrade it first", link.short());
     }
     let mut save = load(paths, &server.room_id).unwrap_or_else(|_| RoomSave::empty(&server.room_id));
     save.update_from(&server, &channels, None);
-    save.addrs = vec![addr.to_owned()];
+    if link.invite.is_some() {
+        save.invite = link.invite.clone();
+    }
+    save.addrs = vec![link.without_invite().room(server.room_id.clone()).to_string()];
     Ok(save)
-}
-
-/// Addresses friends can use to reach a room listening on `listen`, best first.
-///
-/// These are connect targets (handoffs, saves, *Join*), so the tailnet IP
-/// comes first, then the MagicDNS name. The short name is last: on some
-/// systems (glibc) it resolves to the LAN address, which a room bound to the
-/// tailnet doesn't listen on.
-pub async fn share_addrs(listen: SocketAddr, tailscale: Option<&Tailscale>) -> Vec<String> {
-    let mut share = Vec::new();
-    let on_tailnet = listen.ip().is_unspecified() || crate::tailscale::is_tailnet_ip(listen.ip());
-    if on_tailnet
-        && let Some(ts) = tailscale
-        && let Ok(st) = ts.status().await
-        && let Some(me) = &st.me
-    {
-        let suffix = |h: String| if listen.port() == tailchat_proto::DEFAULT_PORT { h } else { format!("{h}:{}", listen.port()) };
-        if let Some(ip) = me.ipv4() {
-            share.push(format!("{ip}:{}", listen.port()));
-        }
-        if let Some(d) = &me.dns_name {
-            share.push(suffix(d.clone()));
-        }
-        share.push(suffix(me.short_name()));
-    }
-    if share.is_empty() || !listen.ip().is_unspecified() && !crate::tailscale::is_tailnet_ip(listen.ip()) {
-        share.insert(0, listen.to_string());
-    }
-    share
 }
 
 #[cfg(test)]
@@ -467,7 +511,7 @@ mod tests {
             ts: id as i64,
             author_id: Some(3),
             author: "a".into(),
-            author_login: None,
+            author_key: None,
             text: text.into(),
             kind: Default::default(),
         }
@@ -478,9 +522,10 @@ mod tests {
         let home = std::env::temp_dir().join(format!("tailchat-rooms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let paths = Paths::under(&home);
-        let mut s = RoomSave::new(&ServerConfig { name: "The Den".into(), allow: vec!["a@example.com".into()], ..ServerConfig::default() });
+        let mut s = RoomSave::new(&ServerConfig { name: "The Den".into(), allow: vec!["0123456789abcdef".into()], ..ServerConfig::default() });
+        assert!(s.invite.is_some(), "new rooms are invite-only");
         s.term = 4;
-        s.addrs = vec!["box:8245".into()];
+        s.addrs = vec![Link::new(SecretKey::generate().public().into()).to_string()];
         save(&paths, &s).unwrap();
         assert_eq!(load(&paths, &s.id).unwrap(), s);
         assert_eq!(find(&paths, "the den").unwrap().id, s.id);
@@ -495,20 +540,48 @@ mod tests {
 
     #[test]
     fn best_host_breaks_term_ties_the_same_way_everywhere() {
-        let h = |addr: &str, term: u64, mode: &str| LiveHost {
-            addr: addr.into(),
-            sock: addr.parse().unwrap(),
+        let h = |id: &str, term: u64, mode: &str| LiveHost {
+            addr: format!("tailchat://{id}"),
+            id: id.into(),
             server: ServerInfo { name: "r".into(), motd: None, version: "x".into(), mode: mode.into(), room_id: "r".into(), term },
             members: 1,
         };
-        let pick = |v: Vec<LiveHost>| best_host(v).map(|x| x.addr);
-        assert_eq!(pick(vec![h("100.0.0.9:1", 3, "host"), h("100.0.0.1:1", 2, "server")]).as_deref(), Some("100.0.0.9:1"));
-        // Same term: the order they were found in doesn't matter.
-        let a = vec![h("100.0.0.9:1", 3, "host"), h("100.0.0.2:1", 3, "host")];
-        let b = vec![h("100.0.0.2:1", 3, "host"), h("100.0.0.9:1", 3, "host")];
-        assert_eq!(pick(a), pick(b));
-        assert_eq!(pick(vec![h("100.0.0.2:1", 3, "host"), h("100.0.0.9:1", 3, "server")]).as_deref(), Some("100.0.0.9:1"));
+        let pick = |v: Vec<LiveHost>| best_host(v).map(|x| x.id);
+        assert_eq!(pick(vec![h("9", 3, "host"), h("1", 2, "server")]).as_deref(), Some("9"));
+        // Same term: the order they were found in doesn't matter, and the lowest id wins.
+        let a = vec![h("9", 3, "host"), h("2", 3, "host")];
+        let b = vec![h("2", 3, "host"), h("9", 3, "host")];
+        assert_eq!(pick(a.clone()), pick(b));
+        assert_eq!(pick(a).as_deref(), Some("2"));
+        assert_eq!(pick(vec![h("2", 3, "host"), h("9", 3, "server")]).as_deref(), Some("9"));
         assert!(pick(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn saves_remember_profiles_and_peers() {
+        let mut s = RoomSave::empty("r");
+        s.merge_profiles(&[Profile { key: "k1".into(), nick: "ann".into(), since: 5 }]);
+        s.merge_profiles(&[Profile { key: "k1".into(), nick: "anna".into(), since: 9 }]);
+        assert_eq!(s.profiles, vec![Profile { key: "k1".into(), nick: "anna".into(), since: 5 }]);
+        let peer = Link::new(SecretKey::generate().public().into()).to_string();
+        let m = Member {
+            id: 1,
+            nick: "bo".into(),
+            identity: tailchat_proto::Identity { key: Some("k2".into()), verified: true },
+            voice: None,
+            muted: false,
+            deafened: false,
+            client: String::new(),
+            codecs: Vec::new(),
+            can_host: true,
+            addr: Some(peer.clone()),
+        };
+        s.note_member(&m);
+        s.note_member(&m);
+        assert_eq!(s.peers, vec![peer.clone()]);
+        assert_eq!(s.profiles.len(), 2);
+        s.addrs = vec!["tailchat://host".into()];
+        assert_eq!(s.places(), vec!["tailchat://host".to_string(), peer]);
     }
 
     #[test]

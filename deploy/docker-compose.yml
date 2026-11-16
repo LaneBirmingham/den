@@ -1,38 +1,23 @@
-# A persistent room on its own tailnet node ("tailchat"), using the official
-# Tailscale container as a sidecar. Friends join with `tailchat join tailchat`.
+# A persistent room. It prints its invite link on start:
 #
-#   TS_AUTHKEY=tskey-auth-… docker compose -f deploy/docker-compose.yml up -d
-#   docker compose -f deploy/docker-compose.yml exec tailchat tailchat api state.get
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml logs tailchat | grep "join with"
+#   docker compose -f deploy/docker-compose.yml exec tailchat tailchat api --server state.get
+#
+# Forward UDP 8245 (the room) and TCP 8245 (its relay) on your router. With a
+# dynamic IP, add `"--relay-url", "box.example.com:8245"` (a DDNS name).
 services:
-  tailscale:
-    image: tailscale/tailscale:stable
-    hostname: tailchat
-    environment:
-      - TS_AUTHKEY=${TS_AUTHKEY:?set TS_AUTHKEY}
-      - TS_STATE_DIR=/var/lib/tailscale
-      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
-      - TS_USERSPACE=false          # real tun device, so tailchat can bind the 100.x address
-    volumes:
-      - ts-state:/var/lib/tailscale
-      - ts-socket:/var/run/tailscale
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    cap_add: [NET_ADMIN, SYS_MODULE]
-    restart: unless-stopped
-
   tailchat:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    network_mode: service:tailscale   # share the sidecar's tailnet interface
-    depends_on: [tailscale]
+    ports:
+      - "8245:8245/udp"
+      - "8245:8245/tcp"
     volumes:
-      - ts-socket:/var/run/tailscale  # for `tailscale whois`
-      - data:/data                    # config, saved room, mods
-    command: ["serve", "--no-console", "--name", "tailchat", "--require-tailnet"]
-    restart: unless-stopped           # retries until the tailnet IP is up
+      - data:/data                    # config, endpoint key, saved room, mods
+    command: ["serve", "--no-console", "--name", "tailchat"]
+    restart: unless-stopped
 
 volumes:
-  ts-state:
-  ts-socket:
   data:

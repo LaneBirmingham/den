@@ -1,6 +1,6 @@
 [package]
 name = "tailchat"
-description = "Minimal, moddable voice + text chat over Tailscale"
+description = "Minimal, moddable peer-to-peer voice + text chat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://gitea.birmosserver.com/BobLobster/tail-chat"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [workspace.dependencies]
 tailchat-proto = { path = "crates/tailchat-proto" }
@@ -34,6 +34,10 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 egui = "0.37"
 cpal = "0.18"
 opus = "0.4"
+iroh = "1.4"
+iroh-relay = { version = "1.4", default-features = false, features = ["server"] }
+data-encoding = "2"
+bytes = "1"
 
 [profile.release]
 lto = "thin"

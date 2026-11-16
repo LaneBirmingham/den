@@ -1,25 +1,24 @@
 use egui::{RichText, TextEdit, Ui};
+use tailchat_core::net::short_addr;
 use tailchat_core::session::{ConnState, HostOptions};
 
 use super::{Panel, PanelCx};
 use crate::icons;
 use crate::kit::{self, Face, W};
 
-/// The screen before you're in a room: reopen a saved room, join one, pick
-/// a room discovered on your tailnet, or host a new one.
+/// The screen before you're in a room: reopen a saved room, join one by
+/// invite link, or host a new one.
 #[derive(Default)]
 pub struct Lobby {
     init: bool,
     nick: String,
     room: String,
     addr: String,
-    bind: String,
-    port: String,
+    /// Host without an invite key (anyone with the address may join).
+    open: bool,
     /// Saved room waiting for a second click on "forget".
     confirm_forget: Option<String>,
 }
-
-const BINDS: &[(&str, &str)] = &[("tailnet", "Tailnet only"), ("localhost", "This computer"), ("all", "All interfaces")];
 
 impl Panel for Lobby {
     fn title(&self) -> String {
@@ -37,10 +36,7 @@ impl Panel for Lobby {
             self.init = true;
             self.nick = cx.state.nick.clone();
             self.room = format!("{}'s room", cx.state.nick);
-            self.addr = cfg.recent.first().cloned().unwrap_or_default();
-            self.bind = "tailnet".into();
-            self.port = cfg.port.to_string();
-            if cx.state.discovery.scanned_at.is_none() && cx.session.tailscale().is_some() && cfg.modules.discovery {
+            if cx.state.discovery.scanned_at.is_none() && !cx.state.rooms.is_empty() && cfg.modules.discovery {
                 cx.actions.session(|s| s.scan());
             }
         }
@@ -53,7 +49,7 @@ impl Panel for Lobby {
                 kit::icon(ui.painter(), r.center(), icons::CHAT_CIRCLE, 28.0, p.accent_text);
                 ui.add_space(8.0);
                 ui.label(RichText::new("tailchat").font(kit::font(28.0, W::Semibold)).color(p.text));
-                ui.label(cx.muted("Voice and text over your tailnet"));
+                ui.label(cx.muted("Peer-to-peer voice and text"));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| super::header::view_menu(ui, cx));
@@ -76,7 +72,9 @@ impl Lobby {
             ConnState::Connecting { addr, .. } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("connecting to {addr}…"));
+                    // Before there's a host to dial, `addr` says what's happening instead.
+                    let what = if addr.contains("://") || !addr.ends_with('…') { format!("connecting to {}…", short_addr(addr)) } else { addr.clone() };
+                    ui.label(what);
                     if ui.small_button("cancel").clicked() {
                         cx.actions.session(|s| s.leave());
                     }
@@ -91,7 +89,7 @@ impl Lobby {
         let raised = !cx.in_card;
         card(ui, &p, raised, |ui| {
             ui.horizontal(|ui| {
-                Face::new(&self.nick, 36.0, p.panel).presence(if cx.state.tailnet.is_some() { p.ok } else { p.muted }).show(ui, &p);
+                Face::new(&self.nick, 36.0, p.panel).presence(if cx.state.net.is_some() { p.ok } else { p.muted }).show(ui, &p);
                 ui.add_space(4.0);
                 ui.label(RichText::new("Nick").font(kit::font(14.0, W::Medium)));
                 let r = ui.add(TextEdit::singleline(&mut self.nick).desired_width(200.0));
@@ -100,12 +98,18 @@ impl Lobby {
                     cx.actions.session(move |s| s.set_nick(&n));
                 }
             });
-            if let Some(ts) = &cx.state.tailnet {
-                let me = ts.me.as_ref().map(|m| format!("{} · {}", m.short_name(), m.ipv4().map(|i| i.to_string()).unwrap_or_default()));
-                let line = format!("Tailscale {}{}", ts.backend_state, me.map(|m| format!(" — {m}")).unwrap_or_default());
-                ui.label(cx.small(line));
-            } else if cx.session.tailscale().is_none() {
-                ui.label(RichText::new("Tailscale CLI not found — rooms will only work on localhost/LAN").color(p.warn).size(p.small_size));
+            match &cx.state.net {
+                Some(n) => {
+                    let via = match (&n.relay, n.relays_on) {
+                        (Some(r), _) => format!("reachable directly or via {}", r.trim_end_matches('/').trim_start_matches("https://")),
+                        (None, true) => "no relay yet — direct connections only".to_owned(),
+                        (None, false) => "relays off — direct connections only".to_owned(),
+                    };
+                    ui.label(cx.small(format!("device {} · {via}", n.short)));
+                }
+                None => {
+                    ui.label(cx.small("starting the network…"));
+                }
             }
         });
 
@@ -118,7 +122,7 @@ impl Lobby {
         card(ui, &p, raised, |ui| {
             title(ui, "Join a room", &p);
             ui.horizontal(|ui| {
-                let r = ui.add(TextEdit::singleline(&mut self.addr).hint_text("machine name or host:port").desired_width(300.0));
+                let r = ui.add(TextEdit::singleline(&mut self.addr).hint_text("paste an invite link").desired_width(300.0));
                 let go = kit::primary_button(ui, "Join", !self.addr.trim().is_empty(), &p).clicked()
                     || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.addr.trim().is_empty());
                 if go {
@@ -127,20 +131,11 @@ impl Lobby {
                     cx.actions.session(move |s| s.join(a));
                 }
             });
-            if !cfg.recent.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(cx.small("recent:"));
-                    for r in cfg.recent.iter().take(5) {
-                        if ui.small_button(r).clicked() {
-                            self.addr = r.clone();
-                        }
-                    }
-                });
-            }
-            if cfg.modules.discovery && cx.session.tailscale().is_some() {
+            ui.label(cx.small("Ask someone in the room for its invite link (room menu → Copy invite link)."));
+            if cfg.modules.discovery && !cx.state.rooms.is_empty() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(cx.small("On your tailnet"));
+                    ui.label(cx.small("Your rooms that are live now"));
                     if cx.state.discovery.scanning {
                         ui.spinner();
                     } else if kit::icon_button(ui, icons::ARROW_CLOCKWISE, "Scan again", kit::Tone::Plain, 24.0, &p).clicked() {
@@ -152,7 +147,7 @@ impl Lobby {
                 }
                 let rooms = cx.state.discovery.rooms.clone();
                 if rooms.is_empty() && cx.state.discovery.scanned_at.is_some() && !cx.state.discovery.scanning {
-                    ui.label(cx.small("no rooms found"));
+                    ui.label(cx.small("none of your rooms are being hosted right now"));
                 }
                 for room in rooms {
                     ui.horizontal(|ui| {
@@ -165,7 +160,7 @@ impl Lobby {
                         let saved = cx.state.rooms.iter().any(|r| r.id == room.server.room_id);
                         ui.label(cx.small(format!(
                             "{} · {} online{}{}",
-                            room.peer.short_name(),
+                            room.host,
                             room.members,
                             if room.server.mode == "server" { " · server" } else { "" },
                             if saved { " · saved" } else { "" }
@@ -179,35 +174,20 @@ impl Lobby {
         card(ui, &p, raised, |ui| {
             title(ui, "Host a room", &p);
             ui.label(cx.small(
-                "Runs the room on this computer; friends join with your machine name. Everyone keeps a copy, so anyone can host it later.",
+                "Runs the room on this computer; friends join with its invite link. Everyone keeps a copy, so anyone can host it later.",
             ));
             egui::Grid::new("host-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Name");
                 ui.add(TextEdit::singleline(&mut self.room).desired_width(240.0));
                 ui.end_row();
-                ui.label("Reachable from");
-                let shown = BINDS.iter().find(|(k, _)| *k == self.bind).map(|(_, l)| l.to_string()).unwrap_or_else(|| self.bind.clone());
-                egui::ComboBox::from_id_salt("host-bind").selected_text(shown).show_ui(ui, |ui| {
-                    for (k, l) in BINDS {
-                        ui.selectable_value(&mut self.bind, k.to_string(), *l);
-                    }
-                });
-                ui.end_row();
-                ui.label("Port");
-                ui.add(TextEdit::singleline(&mut self.port).desired_width(80.0));
-                ui.end_row();
             });
-            let port = self.port.trim().parse::<u16>().ok();
-            if port.is_none() {
-                ui.label(RichText::new("port must be a number").color(p.warn).size(p.small_size));
-            }
+            ui.checkbox(&mut self.open, "Open room (no invite key: anyone who finds the address can join)");
             ui.add_space(4.0);
-            if kit::primary_button(ui, "Host", port.is_some() && !matches!(cx.state.conn, ConnState::Connecting { .. }), &p).clicked() {
+            if kit::primary_button(ui, "Host", !matches!(cx.state.conn, ConnState::Connecting { .. }), &p).clicked() {
                 self.save_nick(cx);
                 let opts = HostOptions {
                     name: if self.room.trim().is_empty() { format!("{}'s room", self.nick) } else { self.room.trim().to_owned() },
-                    bind: self.bind.clone(),
-                    port: port.unwrap_or(cfg.port),
+                    open: self.open,
                 };
                 cx.actions.session(move |s| s.host(opts));
             }
@@ -233,8 +213,8 @@ impl Lobby {
                 ui.label(RichText::new(&room.name).strong());
                 let live = cx.state.discovery.rooms.iter().find(|d| d.server.room_id == room.id);
                 let line = match (live, room.addrs.first()) {
-                    (Some(d), _) => format!("live on {} · {} online", d.peer.short_name(), d.members),
-                    (None, Some(a)) => format!("last hosted at {a}"),
+                    (Some(d), _) => format!("live on {} · {} online", d.host, d.members),
+                    (None, Some(a)) => format!("last hosted by {}", short_addr(a)),
                     (None, None) => "not hosted yet".into(),
                 };
                 ui.label(cx.small(line));

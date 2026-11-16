@@ -58,14 +58,16 @@ the connection streams events. The token is compared in constant time.
 | `ui.screenshot` | `path?` | PNG of the app window (GUI only). Written on the next frame the window draws; with the display off or the window hidden the OS may not draw one, and the file never appears |
 | `mods.list` / `mods.reload` | | |
 | `mods.run` | `command, args?` | run a mod command |
-| `session.host` | `name?, bind?, port?` | host a new room |
-| `session.join` | `addr` | |
+| `session.host` | `name?, open?` | host a new room (invite-only unless `open`) |
+| `session.join` | `addr` | an invite link, or a room's address (uses the saved invite) |
+| `session.invite` | | `{invite}`: the invite link for the room you're in |
 | `session.leave` | | leave; if you host, another member takes the room over |
 | `session.handoff` | `to?` | while hosting: hand the room to member `to` (default: the first who can host) |
 | `rooms.list` | | rooms saved on this machine |
 | `rooms.open` | `room` | id or name: join its live host, or host it from your copy ("Host this room") |
 | `rooms.forget` | `room` | delete a saved room and its history |
-| `tailnet.status` / `tailnet.discover` | | peers / find rooms (`addr` is the tailnet `ip:port` to connect to; show `peer` names to people) |
+| `net.status` | | this app's endpoint: `id`, `short`, `relay`, `direct` addresses |
+| `rooms.discover` | | look for live hosts of your saved rooms; results in `state.get` → `discovery` (`addr` is the link to join; show `host` to people) |
 | `config.get` | | |
 | `api.methods`, `api.ping`, `events.subscribe` | | built in everywhere |
 

@@ -1,20 +1,20 @@
-# systemd unit for a persistent room on a Linux machine already on your tailnet.
+# systemd unit for a persistent room on a Linux machine.
 #
 #   sudo useradd --system --home /var/lib/tailchat --create-home tailchat
-#   sudo tailscale set --operator=tailchat      # lets the service run `tailscale whois`
 #   sudo install -m755 target/release/tailchat /usr/local/bin/
 #   sudo cp deploy/tailchat.service /etc/systemd/system/ && sudo systemctl enable --now tailchat
-#   journalctl -u tailchat -f
+#   journalctl -u tailchat | grep "join with"     # the invite link
+#
+# Open UDP 8245 (the room) and TCP 8245 (its relay) in the firewall, and
+# forward both on the router.
 [Unit]
 Description=tailchat room
-Wants=network-online.target tailscaled.service
-After=network-online.target tailscaled.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 User=tailchat
 Environment=TAILCHAT_HOME=/var/lib/tailchat
-# Wait for a tailnet address before binding to it.
-ExecStartPre=/bin/sh -c 'for i in $(seq 60); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/local/bin/tailchat serve --no-console
 Restart=on-failure
 RestartSec=5

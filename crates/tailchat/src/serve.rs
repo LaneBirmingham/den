@@ -1,9 +1,9 @@
 //! `tailchat serve`: an always-on host for a room, with an admin console.
 //!
 //! Which room: `--room <id|name>` (a saved room, e.g. one copied from a
-//! member's data folder), `--adopt <addr>` (the room someone is hosting
-//! there right now), or by default the saved room named like the config's
-//! `name` (created on first run).
+//! member's data folder), `--adopt <invite>` (the room someone is hosting
+//! right now), or by default the saved room named like the config's `name`
+//! (created on first run).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tailchat_core::config::{self, ChannelSpec, ServerConfig};
 use tailchat_core::events::Event;
+use tailchat_core::net::{Net, SecretKey};
 use tailchat_core::paths::Paths;
 use tailchat_core::proto::{ChannelKind, ChatMessage, Member, MessageKind};
 use tailchat_core::rooms::{self, RoomSave};
@@ -29,32 +30,39 @@ pub struct ServeArgs {
     /// channels and join rules win over server.toml's; flags still override.
     #[arg(long, conflicts_with = "adopt")]
     room: Option<String>,
-    /// Take over the room hosted at this address (`machine` or `host:port`).
-    /// Members' copies fill in its history as they move over.
+    /// Take over the room this invite link points at (someone is hosting it
+    /// now). Members' copies fill in its history as they move over.
     #[arg(long)]
     adopt: Option<String>,
     #[arg(long)]
     name: Option<String>,
-    /// tailnet (default), localhost, all, or an IP.
+    /// all (default), localhost, or an IP.
     #[arg(long)]
     bind: Option<String>,
+    /// UDP port (default 8245), and the TCP port of the room's relay. Forward
+    /// both on your router so everyone can reach the room.
     #[arg(long)]
     port: Option<u16>,
+    /// The address members reach this server's relay at, e.g.
+    /// `box.example.com:8245` (default: worked out from the public IP).
+    #[arg(long)]
+    relay_url: Option<String>,
+    /// Don't run a relay for the room (members who can't connect directly
+    /// use the relays in `[net]` instead).
+    #[arg(long)]
+    no_relay: bool,
     #[arg(long)]
     motd: Option<String>,
     /// Channels, replacing the config's list: `general`, `lounge:voice`. Repeatable.
     #[arg(long = "channel")]
     channels: Vec<String>,
-    /// Only admit peers identified by Tailscale. Saved with the room.
-    #[arg(long)]
-    require_tailnet: bool,
-    /// Only admit these tailnet logins (repeatable). Replaces the room's saved
-    /// allow list.
+    /// Only admit these member keys (repeatable; a prefix of 8+ characters
+    /// is enough, see `who`). Replaces the room's saved allow list. Joining
+    /// still needs the invite link.
     #[arg(long = "allow")]
     allow: Vec<String>,
-    /// Clear the room's join rules (allow list and require-tailnet) before
-    /// applying `--allow` / `--require-tailnet`. `--open` alone admits anyone
-    /// who can reach the port.
+    /// Clear the room's allow list before applying `--allow`: anyone with
+    /// the invite link can join.
     #[arg(long)]
     open: bool,
     /// Don't load server-side mods.
@@ -84,7 +92,11 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
             save
         }
         (None, Some(addr)) => {
-            let save = rooms::adopt(&paths, addr, cfg.port).await.with_context(|| format!("adopting the room at {addr}"))?;
+            // A throwaway endpoint, just to ask the room what it is.
+            let net = Net::bind(SecretKey::generate(), "all", 0, false, &cfg.net).await?;
+            let save = rooms::adopt(&net, &paths, addr).await.with_context(|| format!("adopting the room at {addr}"));
+            net.close().await;
+            let save = save?;
             cfg = save.server_config(cfg);
             save
         }
@@ -113,6 +125,12 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
     if let Some(v) = args.port {
         cfg.port = v;
     }
+    if args.relay_url.is_some() {
+        cfg.relay.url = args.relay_url;
+    }
+    if args.no_relay {
+        cfg.relay.enabled = false;
+    }
     if args.motd.is_some() {
         cfg.motd = args.motd;
     }
@@ -130,7 +148,7 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
             })
             .collect();
     }
-    apply_join_rules(&mut cfg, args.open, args.require_tailnet, args.allow);
+    apply_join_rules(&mut cfg, args.open, args.allow);
     if args.write_config {
         config::save(&path, &cfg)?;
         println!("wrote {}", path.display());
@@ -138,7 +156,7 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
     }
 
     let node =
-        ServerNode::start(cfg.clone(), save, paths.clone(), NodeOptions { api: !args.no_api, mods: !args.no_mods, tailscale_bin: None })
+        ServerNode::start(cfg.clone(), save, paths.clone(), NodeOptions { api: !args.no_api, mods: !args.no_mods })
             .await?;
     print_banner(&node, &cfg, &paths, !args.no_console).await;
 
@@ -176,13 +194,11 @@ pub async fn run(args: ServeArgs, paths: Paths) -> anyhow::Result<()> {
 }
 
 /// Join rules from flags. They're saved with the room, so they persist across
-/// restarts: `--allow` replaces the saved list, `--open` clears both rules.
-fn apply_join_rules(cfg: &mut ServerConfig, open: bool, require_tailnet: bool, allow: Vec<String>) {
+/// restarts: `--allow` replaces the saved list, `--open` clears it.
+fn apply_join_rules(cfg: &mut ServerConfig, open: bool, allow: Vec<String>) {
     if open {
-        cfg.require_tailnet = false;
         cfg.allow.clear();
     }
-    cfg.require_tailnet |= require_tailnet;
     if !allow.is_empty() {
         cfg.allow = allow;
     }
@@ -205,16 +221,22 @@ pub(crate) async fn wait_for_signal() {
 }
 
 async fn print_banner(node: &ServerNode, cfg: &ServerConfig, paths: &Paths, console: bool) {
-    let addr = node.local_addr();
-    println!("tailchat {} — room \"{}\" on {addr} (tcp+udp)", tailchat_core::VERSION, cfg.name);
-    // Best first: the tailnet IP and MagicDNS name work from anywhere, this machine included.
-    for (i, a) in node.save().addrs.iter().take(2).enumerate() {
-        println!("  {}tailchat join {a}", if i == 0 { "join with:  " } else { "            " });
+    let link = node.invite_link().await;
+    let net = node.server().net();
+    let addr = net.addr();
+    println!("tailchat {} — room \"{}\" as {} (udp {:?})", tailchat_core::VERSION, cfg.name, link.short(), net.bound());
+    println!("  join with:  tailchat join '{link}'");
+    if link.invite.is_some() {
+        println!("              (that link is the key to the room: share it only with people you want in)");
+    }
+    match (node.relay_url(), addr.relay_urls().next()) {
+        (Some(r), _) => println!("  relay:      {r} (this server's own; its TCP port must be reachable from outside)"),
+        (None, Some(r)) => println!("  relay:      {r} (for peers that can't connect directly)"),
+        (None, None) => println!("  relay:      none (peers must reach this machine directly)"),
     }
     let rules = &node.save().access;
-    if rules.require_tailnet || !rules.allow.is_empty() {
-        let allow = if rules.allow.is_empty() { "anyone on the tailnet".to_owned() } else { rules.allow.join(", ") };
-        println!("  admits:     {allow} (change with --allow / --open)");
+    if !rules.allow.is_empty() {
+        println!("  admits:     keys {} (change with --allow / --open)", rules.allow.join(", "));
     }
     let channels: Vec<String> = node
         .server()
@@ -251,12 +273,7 @@ fn log_event(ev: &Event, quiet: bool) {
         }
         "member.joined" => {
             if let Ok(m) = serde_json::from_value::<Member>(d["member"].clone()) {
-                let who = m
-                    .identity
-                    .login
-                    .clone()
-                    .map(|l| format!("{l} on {}", m.identity.node.clone().unwrap_or_default()))
-                    .unwrap_or_else(|| "unverified".into());
+                let who = m.identity.short().map(|k| format!("key {k}")).unwrap_or_else(|| "no key".into());
                 println!("+ [{}] {} joined ({who})", m.id, m.nick);
             }
         }
@@ -288,7 +305,7 @@ async fn console_command(node: &ServerNode, line: &str) -> bool {
             }
             for m in members {
                 let voice = m.voice.map(|v| format!(" ~{v}{}", if m.muted { " (muted)" } else { "" })).unwrap_or_default();
-                let who = m.identity.login.unwrap_or_else(|| "unverified".into());
+                let who = m.identity.key.clone().map(|k| format!("key {k}")).unwrap_or_else(|| "no key".into());
                 println!("[{}] {} — {who}{voice} · {}", m.id, m.nick, m.client);
             }
         }
@@ -367,19 +384,18 @@ mod tests {
 
     #[test]
     fn join_rule_flags_can_relax_saved_rules() {
-        let saved = ServerConfig { require_tailnet: true, allow: vec!["a@x".into(), "b@x".into()], ..ServerConfig::default() };
-        let rules = |open, req, allow: &[&str]| {
+        let saved = ServerConfig { allow: vec!["aaaaaaaa".into(), "bbbbbbbb".into()], ..ServerConfig::default() };
+        let rules = |open, allow: &[&str]| {
             let mut c = saved.clone();
-            apply_join_rules(&mut c, open, req, allow.iter().map(|s| s.to_string()).collect());
-            (c.require_tailnet, c.allow)
+            apply_join_rules(&mut c, open, allow.iter().map(|s| s.to_string()).collect());
+            c.allow
         };
         // A plain restart keeps what was saved.
-        assert_eq!(rules(false, false, &[]), (true, vec!["a@x".to_string(), "b@x".to_string()]));
+        assert_eq!(rules(false, &[]), vec!["aaaaaaaa".to_string(), "bbbbbbbb".to_string()]);
         // --allow replaces the list instead of adding to it.
-        assert_eq!(rules(false, false, &["c@x"]), (true, vec!["c@x".to_string()]));
-        // --open clears both; flags after it set new ones.
-        assert_eq!(rules(true, false, &[]), (false, vec![]));
-        assert_eq!(rules(true, true, &[]), (true, vec![]));
-        assert_eq!(rules(true, false, &["c@x"]), (false, vec!["c@x".to_string()]));
+        assert_eq!(rules(false, &["cccccccc"]), vec!["cccccccc".to_string()]);
+        // --open clears it; --allow after it sets a new one.
+        assert_eq!(rules(true, &[]), Vec::<String>::new());
+        assert_eq!(rules(true, &["cccccccc"]), vec!["cccccccc".to_string()]);
     }
 }

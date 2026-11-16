@@ -27,7 +27,7 @@ impl Panel for Status {
                 ui.label(cx.small(format!("· {ms} ms")));
             }
             if let Some(h) = &cx.state.hosting {
-                ui.label(cx.small(format!("· hosting on {}", h.listen)));
+                ui.label(cx.small(format!("· hosting as {}", tailchat_core::net::short_addr(&h.addr))));
             }
             if let Some(v) = cx.voice {
                 let codec = v.tx_codec.map(|c| format!("{c:?}")).unwrap_or_else(|| "—".into());

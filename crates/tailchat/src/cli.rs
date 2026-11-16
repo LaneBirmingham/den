@@ -9,39 +9,62 @@ use tailchat_core::api::{ApiClient, list_instances};
 use tailchat_core::config::{self, AppConfig, ServerConfig};
 use tailchat_core::mods::{self, ModsFile};
 use tailchat_core::paths::Paths;
+use tailchat_core::net::{Net, SecretKey};
 use tailchat_core::session::discover_rooms;
-use tailchat_core::tailscale::Tailscale;
 
+/// Which saved rooms someone is hosting right now.
 pub async fn discover(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let cfg: AppConfig = config::load_or_default(&paths.config_file())?;
-    let ts = Tailscale::locate(cfg.tailscale_bin.as_deref()).context("tailscale CLI not found")?;
-    let status = ts.status().await?;
-    let rooms = discover_rooms(&status, cfg.port).await;
+    let saves = tailchat_core::rooms::list(paths);
+    let count = saves.len();
+    // A throwaway endpoint: probing needs no identity.
+    let net = Net::bind(SecretKey::generate(), &cfg.bind, 0, false, &cfg.net).await?;
+    let rooms = discover_rooms(&net, saves).await;
+    net.close().await;
     if as_json {
         println!("{}", serde_json::to_string_pretty(&rooms)?);
         return Ok(());
     }
-    let online = status.peers.iter().filter(|p| p.online).count();
-    println!("tailnet {} — probed {} online peer(s) + this machine on port {}", status.tailnet.unwrap_or_default(), online, cfg.port);
+    println!("looked for {count} saved room(s) at their last hosts and members' apps");
     if rooms.is_empty() {
-        println!("no rooms found. Host one with `tailchat host` or `tailchat serve`.");
+        println!("none are live. Host one with `tailchat host` or `tailchat serve`, or join one with an invite link.");
     }
     for r in rooms {
-        let me = if r.peer.is_self { " (this machine)" } else { "" };
-        let saved = match tailchat_core::rooms::load(paths, &r.server.room_id) {
-            Ok(s) => format!(" · saved (term {})", s.term),
-            Err(_) => " · not saved".into(),
-        };
+        let term = tailchat_core::rooms::load(paths, &r.server.room_id).map(|s| s.term).unwrap_or_default();
         println!(
-            "  {:<28} {:<24} {} member(s) · {} · term {}{saved}{me}\n    tailchat join {}",
-            r.server.name,
-            r.peer.short_name(),
-            r.members,
-            r.server.mode,
-            r.server.term,
-            r.addr
+            "  {:<28} host {:<12} {} member(s) · {} · term {} (yours {term})\n    tailchat join '{}'",
+            r.server.name, r.host, r.members, r.server.mode, r.server.term, r.addr
         );
     }
+    Ok(())
+}
+
+/// `tailchat relay`: a relay and nothing else, until Ctrl-C / SIGTERM.
+pub async fn relay(paths: &Paths, port: u16, bind: &str) -> anyhow::Result<()> {
+    use tailchat_core::relay::{self, LocalRelay};
+    let token = relay::load_token(&paths.data)?;
+    let r = LocalRelay::start(tailchat_core::net::bind_ip(bind)?, port, token).await?;
+    println!("tailchat {} — relay on TCP {}", tailchat_core::VERSION, r.addr);
+    // Work out the public address the way an app would (a throwaway endpoint
+    // asks the configured relays what they see).
+    let net = Net::bind(SecretKey::generate(), "all", 0, false, &Default::default()).await?;
+    let public = relay::discover_public_url(&net, r.addr.port(), std::time::Duration::from_secs(5)).await;
+    net.close().await;
+    match &public {
+        Some(u) => println!("  public:   {u} (if TCP {} is forwarded to this machine)", r.addr.port()),
+        None => println!("  public:   unknown; use http://<your public IP or DNS name>:{}", r.addr.port()),
+    }
+    let base = match public {
+        Some(u) => u,
+        None => relay::parse_url(&format!("box.example.com:{}", r.addr.port()))?,
+    };
+    println!("  use it:   whoever hosts a room adds it to config.toml:");
+    println!("              [net]\n              relays = [\"{}\"]", r.url(&base));
+    println!("            members need nothing: invite links carry the relay and its token.");
+    println!("  access:   only apps with that token (from you, or from an invite link) get in;");
+    println!("            delete {} to change it", paths.data.join("relay.key").display());
+    crate::serve::wait_for_signal().await;
+    r.shutdown().await;
     Ok(())
 }
 

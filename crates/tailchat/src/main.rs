@@ -1,9 +1,10 @@
 //! `tailchat` — one binary, several frontends over the same core.
 //!
 //! * `tailchat` / `tailchat gui`        the desktop app (egui shell)
-//! * `tailchat host` / `join <addr>`    the app, hosting or joining straight away
-//! * `tailchat chat <addr>`             a line-based terminal client
+//! * `tailchat host` / `join <invite>`  the app, hosting or joining straight away
+//! * `tailchat chat <invite>`           a line-based terminal client
 //! * `tailchat serve`                   an always-on host for a room, with an admin console
+//! * `tailchat relay`                   a relay on its own, for rooms hosted from apps
 //! * `tailchat api <method> [params]`   drive any running instance (mods, scripts, agents)
 //! * `tailchat discover | mods | config | devices | voice-test`
 
@@ -20,7 +21,7 @@ use tailchat_core::paths::Paths;
 use tailchat_core::session::{HostOptions, Session, SessionOptions};
 
 #[derive(Parser)]
-#[command(name = "tailchat", version, about = "Minimal, moddable voice + text chat over Tailscale")]
+#[command(name = "tailchat", version, about = "Minimal, moddable peer-to-peer voice + text chat")]
 struct Cli {
     /// Keep config, data and state under this directory (same as TAILCHAT_HOME).
     #[arg(long, global = true, env = "TAILCHAT_HOME", hide_env_values = true)]
@@ -48,7 +49,7 @@ enum Cmd {
         #[arg(long)]
         cli: bool,
     },
-    /// Join a room by tailnet name or address, e.g. `tailchat join lanes-mac-mini`.
+    /// Join a room by invite link, e.g. `tailchat join 'tailchat://…?room=…&invite=…'`.
     Join {
         addr: String,
         /// Use the terminal client instead of the GUI.
@@ -57,7 +58,7 @@ enum Cmd {
     },
     /// Terminal chat client (text; `/voice` works when built with voice).
     Chat {
-        /// Room address. Omit with --host to host one.
+        /// Invite link. Omit with --host to host one.
         addr: Option<String>,
         #[command(flatten)]
         room: HostArgs,
@@ -67,7 +68,17 @@ enum Cmd {
     },
     /// Run an always-on host for a room, with an admin console.
     Serve(serve::ServeArgs),
-    /// Find rooms on your tailnet.
+    /// Run a relay on its own, for rooms hosted from apps: whoever hosts
+    /// sets `[net] relays = ["http://<this machine>:<port>"]`.
+    Relay {
+        /// TCP port (forward it on your router).
+        #[arg(long, default_value_t = 3340)]
+        port: u16,
+        /// all (default), localhost, or an IP.
+        #[arg(long, default_value = "all")]
+        bind: String,
+    },
+    /// Which of your saved rooms someone is hosting right now.
     Discover {
         #[arg(long)]
         json: bool,
@@ -105,23 +116,17 @@ struct HostArgs {
     /// host it from your copy.
     #[arg(long, conflicts_with = "name")]
     room: Option<String>,
-    /// tailnet (default), localhost, all, or an IP.
-    #[arg(long, default_value = "tailnet")]
-    bind: String,
-    #[arg(long)]
-    port: Option<u16>,
+    /// A new room without an invite key: anyone who has its address can join.
+    #[arg(long, conflicts_with = "room")]
+    open: bool,
 }
 
 impl HostArgs {
-    fn start(&self, cfg: &AppConfig, nick: &str) -> Start {
+    fn start(&self, nick: &str) -> Start {
         if let Some(room) = &self.room {
             return Start::Open(room.clone());
         }
-        Start::Host(HostOptions {
-            name: self.name.clone().unwrap_or_else(|| format!("{nick}'s room")),
-            bind: self.bind.clone(),
-            port: self.port.unwrap_or(cfg.port),
-        })
+        Start::Host(HostOptions { name: self.name.clone().unwrap_or_else(|| format!("{nick}'s room")), open: self.open })
     }
 }
 
@@ -149,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Host { room, cli: term }) => {
             let cfg = load_config(&paths, cli.nick.clone())?;
             let nick = cfg.nick.clone().unwrap_or_else(config::os_username);
-            run_app(&rt, &paths, cli.nick, room.start(&cfg, &nick), term)
+            run_app(&rt, &paths, cli.nick, room.start(&nick), term)
         }
         Some(Cmd::Join { addr, cli: term }) => run_app(&rt, &paths, cli.nick, Start::Join(addr), term),
         Some(Cmd::Chat { addr, room, host }) => {
@@ -157,14 +162,15 @@ fn main() -> anyhow::Result<()> {
                 (_, true) => {
                     let cfg = load_config(&paths, cli.nick.clone())?;
                     let nick = cfg.nick.clone().unwrap_or_else(config::os_username);
-                    room.start(&cfg, &nick)
+                    room.start(&nick)
                 }
                 (Some(a), false) => Start::Join(a),
-                (None, false) => anyhow::bail!("give a room address, or --host to host one"),
+                (None, false) => anyhow::bail!("give an invite link, or --host to host one"),
             };
             run_app(&rt, &paths, cli.nick, start, true)
         }
         Some(Cmd::Serve(args)) => rt.block_on(serve::run(args, paths)),
+        Some(Cmd::Relay { port, bind }) => rt.block_on(cli::relay(&paths, port, &bind)),
         Some(Cmd::Discover { json }) => rt.block_on(cli::discover(&paths, json)),
         Some(Cmd::Api(args)) => rt.block_on(cli::api(args, &paths)),
         Some(Cmd::Mods { cmd }) => rt.block_on(cli::mods(cmd, &paths)),
@@ -175,9 +181,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn init_logging(verbose: u8, quiet_default: bool) {
+    // iroh reports network weather (NAT changes, relay hops) as warnings:
+    // only show those when asked for detail.
     let default = match (verbose, quiet_default) {
-        (0, true) => "warn",
-        (0, false) | (1, _) => "info",
+        (0, true) => "warn,iroh=error",
+        (0, false) => "info,iroh=error",
+        (1, _) => "info",
         _ => "debug",
     };
     let filter =
@@ -224,7 +233,7 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     }
     let session = start_session(rt, paths, nick, "tailchat-cli")?;
     if matches!(start, Start::Lobby) {
-        anyhow::bail!("this build has no GUI: use `tailchat chat <addr>` or `tailchat chat --host`");
+        anyhow::bail!("this build has no GUI: use `tailchat chat <invite>` or `tailchat chat --host`");
     }
     apply_start(&session, start);
     let res = rt.block_on(term::run(session.clone()));

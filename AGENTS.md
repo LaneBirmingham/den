@@ -51,6 +51,7 @@ the GUI exists (`tailchat serve` and `tailchat chat` have none).
   `crates/tailchat-gui/src/panels/mod.rs` and placed in `assets/layouts/*`.
   Panels read state and queue `Actions`; they never block or lock.
 * Integration tests live in `crates/tailchat-core/tests/room.rs` and run real
-  servers on localhost; use `tailscale_bin: Some("/nonexistent/tailscale")`.
+  servers on loopback; use `bind: "localhost"` and `NetConfig::direct_only()`
+  (see the `session` and `test_net` helpers) so tests never touch relays.
 * Visual check: `TAILCHAT_HOME=$(mktemp -d) TAILCHAT_SCREENSHOT=/tmp/x.png
   TAILCHAT_SCREENSHOT_EXIT=1 cargo run -- host --bind localhost`.

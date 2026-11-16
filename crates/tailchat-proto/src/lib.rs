@@ -1,13 +1,20 @@
 //! Wire protocol for tailchat.
 //!
-//! Two channels run between a client and a room server, both over the tailnet:
+//! A client and a room server talk over one encrypted, peer-to-peer QUIC
+//! connection (iroh: dialed by public key, hole-punched, relayed as a last
+//! resort; ALPN [`ALPN`]). It carries two things:
 //!
-//! * **Control** — a TCP stream of length-prefixed JSON frames ([`ClientMsg`] /
-//!   [`ServerMsg`]). Text chat, membership, voice signalling and mod-defined
-//!   `app` messages all travel here.
-//! * **Voice** — UDP datagrams on the same port number carrying codec frames
-//!   (see [`voice`]). The server relays them without decoding, so a headless
+//! * **Control** — one bidirectional stream of length-prefixed JSON frames
+//!   ([`ClientMsg`] / [`ServerMsg`]). Text chat, membership, voice signalling
+//!   and mod-defined `app` messages all travel here.
+//! * **Voice** — unreliable QUIC datagrams carrying codec frames (see
+//!   [`voice`]). The server relays them without decoding, so a headless
 //!   server needs no audio stack.
+//!
+//! **No accounts.** Each member makes a key pair per room and proves it on
+//! join by signing the connection ([`Proof`]); the room remembers the public
+//! half next to the member's nick ([`Profile`]). Rooms with an invite key
+//! only admit people who hold it (it travels in invite links).
 //!
 //! Everything here is plain data: no I/O, no async runtime. Any frontend or
 //! alternative implementation can speak the protocol from this crate alone.
@@ -26,8 +33,10 @@ use serde_json::Value;
 pub mod voice;
 
 /// Bumped on breaking wire changes. Servers reject mismatched majors.
-pub const PROTOCOL_VERSION: u32 = 2;
-/// Default TCP (control) and UDP (voice) port. "TAIL" on a phone keypad.
+pub const PROTOCOL_VERSION: u32 = 3;
+/// QUIC application protocol name for tailchat connections.
+pub const ALPN: &[u8] = b"tailchat/3";
+/// Default UDP port for `tailchat serve` (apps pick a free one). "TAIL" on a phone keypad.
 pub const DEFAULT_PORT: u16 = 8245;
 /// Largest control frame either side will accept.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -46,18 +55,46 @@ pub type ChannelId = String;
 /// Who a member is, as far as the server can tell.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Identity {
-    /// Tailnet login (e.g. `alice@example.com`) when verified via `tailscale whois`.
+    /// The member's public key for this room (hex). Members make one key pair
+    /// per room; there are no global accounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login: Option<String>,
-    /// Tailnet display name when verified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    /// Machine name on the tailnet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    /// True when the server resolved the peer through Tailscale.
+    pub key: Option<String>,
+    /// The member proved they hold `key` (signed this connection with it).
     #[serde(default)]
     pub verified: bool,
+}
+
+impl Identity {
+    /// The first 8 characters of the key, for showing people.
+    pub fn short(&self) -> Option<&str> {
+        self.key.as_deref().map(|k| &k[..k.len().min(8)])
+    }
+}
+
+/// Proof of keys, signed over the connection it travels on (so it can't be
+/// replayed elsewhere). See the `tailchat-core` `net` module for the exact bytes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct Proof {
+    /// The member's public key for this room (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Signature by `key` (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    /// Signature by the room's invite key (hex): proves the sender was invited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+}
+
+/// A member as the room remembers them: the public half of their key and the
+/// nick it belongs to. Every member's copy of the room keeps the list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub key: String,
+    pub nick: String,
+    /// Unix ms the room first saw this key.
+    #[serde(default)]
+    pub since: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -82,6 +119,10 @@ pub struct Member {
     /// The member's app can take over hosting (sent `features: ["host"]`).
     #[serde(default)]
     pub can_host: bool,
+    /// Where the member's app can be reached (an address link, see `hello`),
+    /// so members can find the room again whoever ends up hosting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -125,8 +166,9 @@ pub struct ChatMessage {
     pub author_id: Option<MemberId>,
     /// Nick at the time of sending.
     pub author: String,
+    /// The author's room key (see [`Identity::key`]) when the host verified it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author_login: Option<String>,
+    pub author_key: Option<String>,
     pub text: String,
     #[serde(default)]
     pub kind: MessageKind,
@@ -150,22 +192,36 @@ pub struct ServerInfo {
     pub term: u64,
 }
 
-/// Who may join. Travels with the room so the next host applies the same rules.
+/// Who may join (besides holding the invite key, if the room has one).
+/// Travels with the room so the next host applies the same rules.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Access {
-    /// Reject peers that cannot be identified through Tailscale.
-    #[serde(default)]
-    pub require_tailnet: bool,
-    /// If non-empty, only these tailnet logins may join.
+    /// If non-empty, only these member keys may join: a full key, or a prefix
+    /// of at least 8 characters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
 
-/// Where and how to send voice datagrams for this session.
+impl Access {
+    /// Whether `key` passes the allow list.
+    pub fn allows(&self, key: Option<&str>) -> bool {
+        self.allow.is_empty()
+            || key.is_some_and(|k| {
+                self.allow.iter().any(|a| {
+                    let a = a.trim();
+                    a.len() >= 8 && k.len() >= a.len() && k[..a.len()].eq_ignore_ascii_case(a)
+                })
+            })
+    }
+}
+
+/// How voice works for this session: datagrams on the same connection.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VoiceSetup {
+    /// Unused since protocol 3 (voice shares the connection); kept for the format.
+    #[serde(default)]
     pub udp_port: u16,
-    /// Random per-session token that authenticates UDP packets.
+    /// Per-session token carried in voice packets.
     pub token: u64,
     /// Fixed frame duration in milliseconds.
     pub frame_ms: u32,
@@ -193,16 +249,32 @@ pub enum ClientMsg {
         /// Optional capability flags for forward compatibility.
         #[serde(default)]
         features: Vec<String>,
+        /// The room to join. One app can host several rooms on one address;
+        /// without it, the host's only room.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
+        /// The member's room key and, for rooms with one, the invite.
+        #[serde(default)]
+        proof: Proof,
+        /// Where the member's own app can be reached (shared with the room).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addr: Option<String>,
     },
-    /// Ask for public room info and close. Used by tailnet discovery.
-    Probe,
+    /// Ask for public room info and close. Used to find a room's live host.
+    Probe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
+    },
     /// First frame, instead of `hello`: "I host this room now, at a higher
     /// term; send everyone to `addrs`". Answered with `handoff` (accepted) or
-    /// `error`, then closed. The claimant must pass the room's [`Access`].
+    /// `error`, then closed. The claimant must hold the invite and pass the
+    /// room's [`Access`].
     Claim {
         room: String,
         term: u64,
         addrs: Vec<String>,
+        #[serde(default)]
+        proof: Proof,
     },
     Send {
         channel: ChannelId,
@@ -275,6 +347,10 @@ pub enum ServerMsg {
         /// The room's join rules, so members can save and re-apply them.
         #[serde(default)]
         access: Access,
+        /// Every member the room knows: key → nick. Members save it, so the
+        /// next host keeps nicks with their owners.
+        #[serde(default)]
+        profiles: Vec<Profile>,
     },
     ProbeInfo {
         server: ServerInfo,
@@ -414,13 +490,28 @@ mod tests {
 
     #[test]
     fn room_messages_shape() {
-        let v = serde_json::to_value(ServerMsg::Handoff { to: vec!["box:8245".into()], term: 3 }).unwrap();
-        assert_eq!(v, serde_json::json!({"type": "handoff", "to": ["box:8245"], "term": 3}));
+        let v = serde_json::to_value(ServerMsg::Handoff { to: vec!["tailchat://abc".into()], term: 3 }).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "handoff", "to": ["tailchat://abc"], "term": 3}));
+        // A bare probe still parses.
+        let probe: ClientMsg = serde_json::from_value(serde_json::json!({"type": "probe"})).unwrap();
+        assert_eq!(probe, ClientMsg::Probe { room: None });
         let back: ClientMsg = serde_json::from_value(serde_json::json!({"type": "sync", "channel": "general", "have": [1, 2]})).unwrap();
         assert_eq!(back, ClientMsg::Sync { channel: "general".into(), have: vec![1, 2] });
         // Older peers' server info still parses.
         let info: ServerInfo = serde_json::from_value(serde_json::json!({"name": "den", "version": "0.1.0"})).unwrap();
         assert_eq!((info.room_id.as_str(), info.term), ("", 0));
+    }
+
+    #[test]
+    fn allow_list_matches_key_prefixes() {
+        let key = "0123456789abcdef0123456789abcdef";
+        assert!(Access::default().allows(None));
+        let a = Access { allow: vec!["01234567".into()] };
+        assert!(a.allows(Some(key)));
+        assert!(!a.allows(None));
+        assert!(!a.allows(Some("ffffffffffffffff")));
+        // Too-short entries never match (they'd admit too many keys).
+        assert!(!Access { allow: vec!["0123".into()] }.allows(Some(key)));
     }
 
     #[test]

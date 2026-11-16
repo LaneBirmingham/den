@@ -4,7 +4,7 @@
 //! built-in modules are on). `server.toml` drives a room server. Both are
 //! optional; every field has a default.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -13,12 +13,15 @@ use tailchat_proto::{Channel, ChannelKind, DEFAULT_PORT};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
-    /// Display nick. Defaults to the tailnet display name, then the OS user.
+    /// Display nick. Defaults to the OS user.
     pub nick: Option<String>,
-    /// Port used when hosting and when an address has no port.
+    /// Where the app listens: `all` (default), `localhost`, or an IP.
+    pub bind: String,
+    /// UDP port the app listens on (for rooms it hosts). 0 picks a free one;
+    /// a taken port falls back to a free one.
     pub port: u16,
-    /// Path to the `tailscale` CLI if it is not on PATH.
-    pub tailscale_bin: Option<PathBuf>,
+    /// Relays and other network settings.
+    pub net: NetConfig,
     /// Recently joined addresses, newest first.
     pub recent: Vec<String>,
     pub voice: VoiceConfig,
@@ -30,8 +33,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
             nick: None,
-            port: DEFAULT_PORT,
-            tailscale_bin: None,
+            bind: "all".into(),
+            port: 0,
+            net: NetConfig::default(),
             recent: Vec::new(),
             voice: VoiceConfig::default(),
             ui: UiConfig::default(),
@@ -99,7 +103,7 @@ pub struct Modules {
     pub mods: bool,
     /// Expose the local control API (mods need this to call back in).
     pub api: bool,
-    /// Probe tailnet peers for rooms.
+    /// Look for live hosts of your saved rooms (in the lobby).
     pub discovery: bool,
     /// Built-in slash commands (`/nick`, `/voice`, …).
     pub slash_commands: bool,
@@ -116,19 +120,47 @@ impl Default for Modules {
 pub struct ServerConfig {
     pub name: String,
     pub motd: Option<String>,
-    /// `tailnet` (default: the machine's Tailscale IPv4), `localhost`, `all`, or an IP.
+    /// `all` (default), `localhost`, or an IP to listen on.
     pub bind: String,
+    /// UDP port (`tailchat serve`; forward it on your router for the most
+    /// direct connections). Apps use their own `port` setting.
     pub port: u16,
     pub channels: Vec<ChannelSpec>,
     /// Messages kept per channel (memory, disk and replay on join).
     pub history_limit: usize,
-    /// Reject peers that cannot be identified through Tailscale.
-    pub require_tailnet: bool,
-    /// If non-empty, only these tailnet logins may join.
+    /// If non-empty, only these member keys may join (a key or a prefix of
+    /// at least 8 characters; members see theirs with `/whoami`).
     pub allow: Vec<String>,
     pub max_members: usize,
     /// Messages a member may send per 10 seconds.
     pub rate_limit: u32,
+    /// Relays and other network settings (`tailchat serve`).
+    pub net: NetConfig,
+    /// The relay `tailchat serve` runs for its room's members.
+    pub relay: RelayServeConfig,
+}
+
+/// `tailchat serve` runs a relay next to the room, so members who can't
+/// reach it directly (strict NATs, UDP blocked) come in through the server
+/// itself instead of a third party. It needs its TCP port reachable from
+/// outside (forwarded on the router).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct RelayServeConfig {
+    pub enabled: bool,
+    /// TCP port. 0: the same number as the room's UDP `port`.
+    pub port: u16,
+    /// The address members use to reach it, e.g. `http://home.example.com:8245`
+    /// (a DNS name survives IP changes), or an `https://` URL when a reverse
+    /// proxy terminates TLS in front of it. Unset: `http://<public IP>:<port>`,
+    /// with the public IP worked out at start.
+    pub url: Option<String>,
+}
+
+impl Default for RelayServeConfig {
+    fn default() -> Self {
+        RelayServeConfig { enabled: true, port: 0, url: None }
+    }
 }
 
 impl Default for ServerConfig {
@@ -136,17 +168,18 @@ impl Default for ServerConfig {
         ServerConfig {
             name: "tailchat".into(),
             motd: None,
-            bind: "tailnet".into(),
+            bind: "all".into(),
             port: DEFAULT_PORT,
             channels: vec![
                 ChannelSpec { id: "general".into(), name: None, kind: ChannelKind::Text, topic: None },
                 ChannelSpec { id: "lounge".into(), name: None, kind: ChannelKind::Voice, topic: None },
             ],
             history_limit: 500,
-            require_tailnet: false,
             allow: Vec::new(),
             max_members: 64,
             rate_limit: 20,
+            net: NetConfig::default(),
+            relay: RelayServeConfig::default(),
         }
     }
 }
@@ -156,6 +189,55 @@ impl ServerConfig {
     pub fn channel_list(&self) -> Vec<Channel> {
         let mut seen = std::collections::HashSet::new();
         self.channels.iter().map(ChannelSpec::to_channel).filter(|c| !c.id.is_empty() && seen.insert(c.id.clone())).collect()
+    }
+}
+
+/// How tailchat reaches people. Connections are peer-to-peer (hole-punched
+/// QUIC); a relay carries the traffic only when two peers can't reach each
+/// other directly, and never sees inside it (it's end-to-end encrypted).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct NetConfig {
+    /// `["default"]`: n0's free public relays. `[]`: no relays (direct
+    /// connections only: LAN, public IPs, forwarded ports). Or your own relay
+    /// URLs, e.g. `["http://box.example.com:3340"]` from `tailchat relay`.
+    /// The `TAILCHAT_RELAYS` environment variable overrides this
+    /// (`default`, `none`, or comma-separated URLs).
+    pub relays: Vec<String>,
+    /// Relays added by the program (a server's own relay), kept whatever
+    /// `TAILCHAT_RELAYS` says.
+    #[serde(skip)]
+    pub extra_relays: Vec<String>,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        NetConfig { relays: vec!["default".into()], extra_relays: Vec::new() }
+    }
+}
+
+impl NetConfig {
+    /// No relays: direct connections only (tests, LAN-only setups).
+    pub fn direct_only() -> NetConfig {
+        NetConfig { relays: Vec::new(), extra_relays: Vec::new() }
+    }
+
+    /// Just these relays.
+    pub fn relays(urls: impl IntoIterator<Item = String>) -> NetConfig {
+        NetConfig { relays: urls.into_iter().collect(), extra_relays: Vec::new() }
+    }
+
+    /// The relay list after applying `TAILCHAT_RELAYS`, plus `extra_relays`.
+    pub fn effective_relays(&self) -> Vec<String> {
+        let mut v = match std::env::var("TAILCHAT_RELAYS") {
+            Ok(v) if !v.trim().is_empty() => match v.trim() {
+                "none" | "off" => Vec::new(),
+                other => other.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
+            },
+            _ => self.relays.clone(),
+        };
+        v.extend(self.extra_relays.iter().cloned());
+        v
     }
 }
 

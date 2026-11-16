@@ -17,19 +17,21 @@
 //! * [`mods`] — manifest-declared extensions: slash commands, event hooks,
 //!   panels, startup daemons, themes and layouts.
 //! * [`ui`] — the declarative widget store mod panels write into.
-//! * [`tailscale`] — tailnet discovery and identity via the local `tailscale` CLI.
+//! * [`net`] — the peer-to-peer transport (iroh): one endpoint per process,
+//!   links, per-room key proofs, framing.
+//! * [`relay`] — a relay of our own (`serve` runs one; so does `tailchat relay`).
 
 pub mod api;
 pub mod config;
 pub mod events;
 pub mod mods;
 pub mod net;
+pub mod relay;
 pub mod paths;
 pub mod rooms;
 pub mod server;
 pub mod server_node;
 pub mod session;
-pub mod tailscale;
 pub mod ui;
 #[cfg(feature = "voice")]
 pub mod voice;

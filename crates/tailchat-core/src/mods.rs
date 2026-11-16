@@ -457,7 +457,7 @@ impl ModRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        crate::tailscale::hide_console(&mut cmd);
+        hide_console(&mut cmd);
         let mut child = cmd.spawn().with_context(|| format!("starting {:?} for mod {}", l.argv, l.m.manifest.id))?;
         if let (Some(input), Some(mut pipe)) = (l.stdin, child.stdin.take()) {
             let _ = pipe.write_all(input.as_bytes()).await;
@@ -568,7 +568,7 @@ impl ModRuntime {
         let mut env = self.base_env(host, m);
         env.push(("TAILCHAT_EVENT".into(), "startup".into()));
         cmd.envs(env).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true);
-        crate::tailscale::hide_console(&mut cmd);
+        hide_console(&mut cmd);
         match cmd.spawn() {
             Ok(child) => {
                 tracing::info!("mod {} daemon started: {argv:?}", m.manifest.id);
@@ -792,6 +792,16 @@ elif mode == "hook":
     )?;
     Ok(())
 }
+
+/// Don't flash a console window for mod processes on Windows.
+#[cfg(windows)]
+fn hide_console(cmd: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_cmd: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

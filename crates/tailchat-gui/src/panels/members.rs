@@ -6,7 +6,7 @@ use crate::icons;
 use crate::kit::{self, Face, W};
 
 /// Everyone in the room, with what they're doing (talking, muted, in which
-/// voice channel) and their tailnet identity on hover.
+/// voice channel) and their room key on hover.
 ///
 /// Settings (`[panel."core.members"]`): `group_voice` (default true) folds the
 /// people in your own voice channel into one row, since the voice card already
@@ -105,14 +105,9 @@ fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, talking: bool, behind: 
     }
     let g = kit::line(ui, status, kit::font(12.0, W::Regular), color, right - x);
     kit::put(ui.painter(), &g, x, rect.center().y + 9.0, color);
-    let who = if m.identity.verified {
-        format!(
-            "Verified by Tailscale: {}{}",
-            m.identity.login.clone().unwrap_or_default(),
-            m.identity.node.as_ref().map(|n| format!(" on {n}")).unwrap_or_default()
-        )
-    } else {
-        "Not verified through Tailscale".to_owned()
+    let who = match (m.identity.verified, m.identity.short()) {
+        (true, Some(k)) => format!("Signed in with key {k}… (this room's profile for {})", m.nick),
+        _ => "No key: anyone could be using this nick".to_owned(),
     };
     resp.on_hover_text(who);
 }

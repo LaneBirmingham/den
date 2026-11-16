@@ -118,14 +118,13 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
     egui::Popup::menu(resp).width(240.0).show(|ui| {
         ui.set_min_width(220.0);
         if let Some(h) = cx.state.hosting.clone() {
-            ui.label(cx.small(format!("You're hosting on {}", h.listen)));
-            for addr in h.share.iter().take(3) {
-                if ui.button(format!("{}  Copy {addr}", icons::COPY)).on_hover_text("the address friends paste into Join").clicked() {
-                    ui.ctx().copy_text(addr.clone());
-                    let a = addr.clone();
-                    cx.actions.session(move |s| s.notice(tailchat_core::proto::NoticeLevel::Info, format!("copied {a}")));
-                    ui.close();
-                }
+            ui.label(cx.small(format!("You're hosting as {}", tailchat_core::net::short_addr(&h.addr))));
+            if let Some(link) = h.share.first().cloned()
+                && ui.button(format!("{}  Copy invite link", icons::COPY)).on_hover_text("friends paste this into Join; anyone with it can join").clicked()
+            {
+                ui.ctx().copy_text(link);
+                cx.actions.session(|s| s.notice(tailchat_core::proto::NoticeLevel::Info, "copied the invite link".into()));
+                ui.close();
             }
             let others: Vec<(u32, String)> = cx.state.can_take_over().map(|m| (m.id, m.nick.clone())).collect();
             if others.is_empty() {
@@ -152,7 +151,18 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
             ui.separator();
         } else if let ConnState::Connected { addr } = &cx.state.conn {
             let ms = cx.state.latency_ms.map(|m| format!(" · {m} ms")).unwrap_or_default();
-            ui.label(cx.small(format!("Connected to {addr}{ms}")));
+            ui.label(cx.small(format!("Connected to {}{ms}", tailchat_core::net::short_addr(addr))));
+            if ui.button(format!("{}  Copy invite link", icons::COPY)).on_hover_text("friends paste this into Join; anyone with it can join").clicked() {
+                let ctx = ui.ctx().clone();
+                cx.actions.session(move |s| match s.invite_link() {
+                    Some(link) => {
+                        ctx.copy_text(link);
+                        s.notice(tailchat_core::proto::NoticeLevel::Info, "copied the invite link".into());
+                    }
+                    None => s.notice(tailchat_core::proto::NoticeLevel::Warn, "no invite link for this room".into()),
+                });
+                ui.close();
+            }
             ui.separator();
         }
         view_items(ui, cx);

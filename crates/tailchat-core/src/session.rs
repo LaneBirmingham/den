@@ -11,12 +11,12 @@
 //! anything a built-in panel can do, a mod or an agent can do too.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use iroh::endpoint::Connection;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -25,7 +25,6 @@ use tailchat_proto::{
     Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, Member, MemberId, MessageKind, NoticeLevel,
     PROTOCOL_VERSION, ServerInfo, ServerMsg, VoiceSetup,
 };
-use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::AbortHandle;
@@ -34,11 +33,10 @@ use crate::api::{self, ApiFuture, ApiHandler, ApiServer, MethodDoc, doc, param_s
 use crate::config::{self, AppConfig, ServerConfig};
 use crate::events::{Event, names};
 use crate::mods::{ModHost, ModRuntime};
-use crate::net::{read_frame, resolve_all, write_frame};
+use crate::net::{self, Link, Net, read_frame, write_frame};
 use crate::paths::Paths;
 use crate::rooms::{self, RoomSave};
 use crate::server::{self, HandoffState, ServerHandle, ServerMode, ServerOptions};
-use crate::tailscale::{TailnetPeer, TailnetStatus, Tailscale};
 use crate::ui::{UiStore, Widget};
 
 const MAX_LOCAL_MESSAGES: usize = 2000;
@@ -56,7 +54,9 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/unmute", "unmute your mic"),
     ("/deafen", "mute everything"),
     ("/undeafen", "hear again"),
-    ("/connect <host[:port]>", "join another room"),
+    ("/connect <invite>", "join another room"),
+    ("/invite", "show this room's invite link"),
+    ("/whoami", "show your key for this room"),
     ("/disconnect", "leave the room (hands it off if you host it)"),
     ("/handoff [nick]", "hand hosting to another member"),
     ("/takeover", "host this room from your copy (when its host is gone)"),
@@ -94,9 +94,11 @@ pub struct HostInfo {
     pub name: String,
     pub room_id: String,
     pub term: u64,
-    pub listen: SocketAddr,
-    /// Addresses friends can paste into *Join*, best first.
+    /// Invite links friends can paste into *Join* (they carry the room's
+    /// invite key, so share them only with people you want in).
     pub share: Vec<String>,
+    /// Where this room is (no invite key): what members use to get back in.
+    pub addr: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
@@ -137,14 +139,30 @@ pub struct VoiceStatsView {
     pub rx_packets: u64,
 }
 
+/// One of your saved rooms that someone is hosting right now.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct DiscoveredRoom {
-    pub peer: TailnetPeer,
-    /// Where to connect (`tailnet-ip:port`, the address that answered). Show
-    /// `peer.short_name()` to people.
+    /// Where to connect (the host that answered, as a link).
     pub addr: String,
+    /// Short form of the host's endpoint id, for showing people.
+    pub host: String,
     pub server: ServerInfo,
     pub members: u32,
+}
+
+/// This app's network endpoint.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct NetView {
+    /// Endpoint id (z-base-32): what peers dial.
+    pub id: String,
+    /// Short form, for showing people.
+    pub short: String,
+    /// The relay this endpoint is reachable through, if any.
+    pub relay: Option<String>,
+    /// Direct addresses peers can try.
+    pub direct: Vec<String>,
+    /// Relays are configured (otherwise direct connections only).
+    pub relays_on: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -177,7 +195,8 @@ pub struct SessionState {
     pub new_since: HashMap<ChannelId, i64>,
     pub voice: VoiceView,
     pub latency_ms: Option<u32>,
-    pub tailnet: Option<TailnetStatus>,
+    /// Our network endpoint, once it's up.
+    pub net: Option<NetView>,
     pub discovery: DiscoveryView,
     /// Rooms saved on this machine (every room you've been in), newest first.
     pub rooms: Vec<RoomSave>,
@@ -202,7 +221,7 @@ impl SessionState {
             new_since: HashMap::new(),
             voice: VoiceView::default(),
             latency_ms: None,
-            tailnet: None,
+            net: None,
             discovery: DiscoveryView::default(),
             rooms: Vec::new(),
             revision: 0,
@@ -297,15 +316,15 @@ pub struct SessionOptions {
 #[derive(Clone, Debug)]
 pub struct HostOptions {
     pub name: String,
-    /// `tailnet`, `localhost`, `all`, or an IP.
-    pub bind: String,
-    pub port: u16,
+    /// Anyone who can reach you may join (no invite key). Off by default.
+    pub open: bool,
 }
 
 struct ConnSlot {
     task: Option<AbortHandle>,
     outbox: Option<mpsc::UnboundedSender<ClientMsg>>,
-    server_ip: Option<IpAddr>,
+    /// The connection to the host (voice datagrams use it too).
+    link: Option<Connection>,
     voice: Option<VoiceSetup>,
 }
 
@@ -315,7 +334,8 @@ struct Inner {
     rt: Handle,
     paths: Paths,
     client_name: String,
-    tailscale: Option<Tailscale>,
+    /// Our endpoint: started on first use (joining or hosting).
+    net: tokio::sync::OnceCell<Net>,
     config: RwLock<AppConfig>,
     state: RwLock<SessionState>,
     events: broadcast::Sender<Event>,
@@ -357,28 +377,11 @@ enum End {
     Moved { to: Vec<String>, term: u64 },
 }
 
-/// Where a room listening on `listen` can be reached from this machine.
-fn connect_addr(listen: SocketAddr) -> String {
-    if listen.ip().is_unspecified() { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen.port()) } else { listen }.to_string()
-}
-
 impl Session {
     /// Create a session on `rt`, start the control API and mods per config.
     pub async fn start(opts: SessionOptions) -> anyhow::Result<Session> {
-        let tailscale = Tailscale::locate(opts.config.tailscale_bin.as_deref());
-        let tailnet = match &tailscale {
-            Some(ts) => ts.status().await.ok(),
-            None => None,
-        };
-        let nick = opts
-            .config
-            .nick
-            .clone()
-            .or_else(|| tailnet.as_ref().and_then(|t| t.me.as_ref()?.owner_name.clone()))
-            .map(|n| n.split_whitespace().next().unwrap_or(&n).to_owned())
-            .unwrap_or_else(config::os_username);
+        let nick = opts.config.nick.clone().unwrap_or_else(config::os_username);
         let mut state = SessionState::new(tailchat_proto::clean_nick(&nick));
-        state.tailnet = tailnet;
         state.rooms = rooms::list(&opts.paths);
         state.voice.mode = opts.config.voice.mode.clone();
         let (events, _) = broadcast::channel(1024);
@@ -387,13 +390,13 @@ impl Session {
             rt: Handle::current(),
             paths: opts.paths.clone(),
             client_name: opts.client_name,
-            tailscale,
+            net: tokio::sync::OnceCell::new(),
             config: RwLock::new(opts.config),
             state: RwLock::new(state),
             events,
             listeners: RwLock::new(Vec::new()),
             epoch: AtomicU64::new(0),
-            conn: Mutex::new(ConnSlot { task: None, outbox: None, server_ip: None, voice: None }),
+            conn: Mutex::new(ConnSlot { task: None, outbox: None, link: None, voice: None }),
             hosted: Mutex::new(None),
             ui: Arc::new(UiStore::default()),
             mods: RwLock::new(Arc::new(ModRuntime::empty(&opts.paths))),
@@ -421,6 +424,13 @@ impl Session {
         if modules.mods {
             session.reload_mods();
         }
+        // Bring the endpoint up now, so joining and hosting are quick.
+        let inner = session.inner.clone();
+        session.inner.rt.spawn(async move {
+            if let Err(e) = inner.net().await {
+                tracing::warn!("network: {e:#}");
+            }
+        });
         Ok(session)
     }
 
@@ -446,8 +456,9 @@ impl Session {
         self.inner.mods.read().clone()
     }
 
-    pub fn tailscale(&self) -> Option<&Tailscale> {
-        self.inner.tailscale.as_ref()
+    /// Our network endpoint, if it's up.
+    pub fn net(&self) -> Option<Net> {
+        self.inner.net.get().cloned()
     }
 
     pub fn runtime(&self) -> &Handle {
@@ -489,7 +500,8 @@ impl Session {
 
     // ----- connecting ----------------------------------------------------
 
-    /// Connect to a room (`host`, `host:port`, MagicDNS name, IP).
+    /// Connect to a room by link: an invite (`tailchat://…?room=…&invite=…`)
+    /// or a host address.
     pub fn join(&self, addr: impl Into<String>) {
         let addr = addr.into().trim().to_owned();
         self.inner.connect(vec![addr]);
@@ -503,9 +515,12 @@ impl Session {
         self.inner.update(|s| s.conn = ConnState::Connecting { addr: "starting room…".into(), attempt: 0 });
         self.inner.rt.spawn(async move {
             let base: ServerConfig = config::load_or_default(&me.paths().server_config_file()).unwrap_or_default();
-            let save = RoomSave::new(&ServerConfig { name: opts.name.clone(), ..base });
-            match me.inner.start_hosting(save, 1, &opts.bind, opts.port).await {
-                Ok(info) => me.join(connect_addr(info.listen)),
+            let mut save = RoomSave::new(&ServerConfig { name: opts.name.clone(), ..base });
+            if opts.open {
+                save.invite = None;
+            }
+            match me.inner.start_hosting(save, 1).await {
+                Ok(info) => me.join(info.addr),
                 Err(e) => me.inner.host_failed(e),
             }
         });
@@ -521,7 +536,7 @@ impl Session {
         };
         let hosting = self.state().hosting.clone();
         if let Some(h) = hosting.filter(|h| h.room_id == save.id) {
-            self.join(connect_addr(h.listen));
+            self.join(h.addr);
             return;
         }
         // Stay on the room screen if this is the room we're already looking at.
@@ -536,8 +551,10 @@ impl Session {
         self.inner.update(|s| s.conn = ConnState::Connecting { addr: name, attempt: 0 });
         let me = self.clone();
         self.inner.rt.spawn(async move {
-            let port = me.config().port;
-            let live = rooms::find_live(&save.id, &save.addrs, port, me.inner.tailscale.as_ref()).await;
+            let live = match me.inner.net().await {
+                Ok(net) => rooms::find_live(&net, &save.id, &save.places()).await,
+                Err(e) => return me.inner.host_failed(e),
+            };
             if me.inner.stale(epoch) {
                 return;
             }
@@ -549,11 +566,10 @@ impl Session {
                 return;
             }
             let term = save.term + 1;
-            let (bind, port) = me.inner.default_bind();
-            match me.inner.start_hosting(save, term, &bind, port).await {
+            match me.inner.start_hosting(save, term).await {
                 Ok(info) if !me.inner.stale(epoch) => {
                     me.notice(NoticeLevel::Info, format!("you're hosting {} now", info.name));
-                    me.join(connect_addr(info.listen));
+                    me.join(info.addr);
                 }
                 Ok(_) => {}
                 Err(e) => me.inner.host_failed(e),
@@ -629,31 +645,22 @@ impl Session {
         self.inner.emit(names::HOSTING_CHANGED, json!({"hosting": null}));
     }
 
-    /// Probe tailnet peers for rooms; results land in `state().discovery`.
+    /// Look for live hosts of every saved room; results land in `state().discovery`.
     pub fn scan(&self) {
-        let Some(ts) = self.inner.tailscale.clone() else {
-            self.inner.update(|s| s.discovery.error = Some("Tailscale CLI not found".into()));
-            return;
-        };
         if !self.config().modules.discovery {
             return;
         }
         let inner = self.inner.clone();
-        let port = self.config().port;
         inner.update(|s| {
             s.discovery.scanning = true;
             s.discovery.error = None;
         });
         self.inner.rt.spawn(async move {
-            let status = ts.status().await;
-            let res = match &status {
-                Ok(st) => Ok(discover_rooms(st, port).await),
+            let res = match inner.net().await {
+                Ok(net) => Ok(discover_rooms(&net, rooms::list(&inner.paths)).await),
                 Err(e) => Err(format!("{e:#}")),
             };
             inner.update(|s| {
-                if let Ok(st) = status {
-                    s.tailnet = Some(st);
-                }
                 s.discovery.scanning = false;
                 s.discovery.scanned_at = Some(crate::now_ms());
                 match res {
@@ -763,6 +770,22 @@ impl Session {
             "undeafen" => self.set_deafened(false),
             "connect" if !arg.is_empty() => self.join(arg),
             "disconnect" => self.leave(),
+            "invite" => match self.invite_link() {
+                Some(link) => self.notice(NoticeLevel::Info, format!("invite link (anyone with it can join):\n{link}")),
+                None => self.notice(NoticeLevel::Warn, "not in a room yet".into()),
+            },
+            "whoami" => {
+                let st = self.state();
+                let line = match (st.me(), st.room_id()) {
+                    (Some(m), Some(_)) => match &m.identity.key {
+                        Some(k) => format!("you're {} in this room, key {k}", m.nick),
+                        None => format!("you're {} (no key)", m.nick),
+                    },
+                    _ => "not in a room".into(),
+                };
+                drop(st);
+                self.notice(NoticeLevel::Info, line);
+            }
             "handoff" => {
                 let found = self.state().members.values().find(|m| m.nick.eq_ignore_ascii_case(arg)).map(|m| m.id);
                 match (arg.is_empty(), found) {
@@ -798,6 +821,24 @@ impl Session {
             _ => return false,
         }
         true
+    }
+
+    /// An invite link to the room we're in: where it's hosted now, plus our
+    /// saved invite key (if the room has one).
+    pub fn invite_link(&self) -> Option<String> {
+        let st = self.state();
+        if let Some(h) = st.hosting.as_ref().filter(|h| Some(h.room_id.as_str()) == st.room_id()) {
+            return h.share.first().cloned();
+        }
+        let id = st.room_id()?.to_owned();
+        let addr = match &st.conn {
+            ConnState::Connected { addr } | ConnState::Connecting { addr, .. } | ConnState::Failed { addr, .. } => addr.clone(),
+            ConnState::Idle => return None,
+        };
+        drop(st);
+        let save = rooms::load(&self.inner.paths, &id).ok();
+        let link = Link::parse(&addr).ok().or_else(|| save.as_ref().and_then(|s| s.addrs.first()).and_then(|a| Link::parse(a).ok()))?;
+        Some(link.room(id).invite(save.and_then(|s| s.invite)).to_string())
     }
 
     pub fn set_nick(&self, nick: &str) {
@@ -978,6 +1019,10 @@ impl Session {
                     None => tracing::info!("closing"),
                 }
                 me.shutdown();
+                // Close the endpoint properly so peers see us go at once.
+                if let Some(net) = me.inner.net.get() {
+                    net.close().await;
+                }
             })
             .await;
     }
@@ -1020,29 +1065,26 @@ pub fn split_args(s: &str) -> Vec<String> {
     out
 }
 
-/// Probe every online peer (and ourselves) for a room on `port`.
-pub async fn discover_rooms(status: &TailnetStatus, port: u16) -> Vec<DiscoveredRoom> {
+/// Which of `saves` someone is hosting right now (looked for at each one's
+/// last hosts and members' apps).
+pub async fn discover_rooms(net: &Net, saves: Vec<RoomSave>) -> Vec<DiscoveredRoom> {
     let mut set = tokio::task::JoinSet::new();
-    for peer in status.me.iter().chain(status.peers.iter()).filter(|p| p.online) {
-        let Some(ip) = peer.ipv4() else { continue };
-        let peer = peer.clone();
+    for save in saves {
+        let net = net.clone();
         set.spawn(async move {
-            let addr = SocketAddr::new(ip, port);
-            match crate::net::probe(addr, Duration::from_millis(900)).await {
-                // Connect where the probe answered; `peer` has the name to show.
-                Ok(ServerMsg::ProbeInfo { server, members, .. }) => Some(DiscoveredRoom { addr: addr.to_string(), peer, server, members }),
-                _ => None,
-            }
+            let live = rooms::find_live(&net, &save.id, &save.places()).await?;
+            let host = Link::parse(&live.addr).map(|l| l.short()).unwrap_or_default();
+            Some(DiscoveredRoom { addr: live.addr, host, server: live.server, members: live.members })
         });
     }
-    let mut rooms = Vec::new();
+    let mut found = Vec::new();
     while let Some(r) = set.join_next().await {
         if let Ok(Some(room)) = r {
-            rooms.push(room);
+            found.push(room);
         }
     }
-    rooms.sort_by(|a, b| b.peer.is_self.cmp(&a.peer.is_self).then(a.peer.host_name.cmp(&b.peer.host_name)));
-    rooms
+    found.sort_by(|a, b| a.server.name.cmp(&b.server.name));
+    found
 }
 
 /// Connect to the first of `addrs` that answers; reconnect with backoff;
@@ -1135,34 +1177,26 @@ async fn run_addrs(inner: &Arc<Inner>, epoch: u64, addrs: &[String], was_connect
 
 /// One connection. `Err` means we never got in (try the next address).
 async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mut bool) -> anyhow::Result<End> {
-    let port = inner.config.read().port;
-    // A name can resolve to several addresses (LAN and tailnet): try each.
-    let mut stream = None;
-    let mut last = None;
-    for sock in resolve_all(addr, port).await? {
-        let res = tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(sock))
-            .await
-            .with_context(|| format!("timed out connecting to {sock}"))
-            .and_then(|r| r.with_context(|| format!("connecting to {sock}")));
-        match res {
-            Ok(s) => {
-                stream = Some((s, sock));
-                break;
-            }
-            Err(e) => {
-                tracing::info!("{addr}: {e:#}");
-                last = Some(e);
-            }
-        }
-        if inner.stale(epoch) {
-            break;
-        }
-    }
-    let Some((stream, sock)) = stream else {
-        return Err(last.unwrap_or_else(|| anyhow::anyhow!("{addr} has no addresses")));
+    let link = Link::parse(addr)?;
+    let net = inner.net().await?;
+    // Which room: the link's, else the one we're in (a handoff), else ask.
+    let room = match link.room.clone().or_else(|| inner.state.read().room_id().map(str::to_owned)) {
+        Some(r) => r,
+        None => match net::probe(&net, &link, None, Duration::from_secs(10)).await? {
+            ServerMsg::ProbeInfo { server, .. } if rooms::valid_id(&server.room_id) => server.room_id,
+            ServerMsg::Error { message, .. } => return Ok(End::Refused(message)),
+            other => bail!("{} didn't answer like a tailchat room: {other:?}", link.short()),
+        },
     };
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = stream.into_split();
+    // Our key for this room, and the invite: from the link, else our copy.
+    let member = rooms::member_key(&inner.paths, &room)?;
+    let invite = match link.invite.clone().or_else(|| rooms::load(&inner.paths, &room).ok().and_then(|s| s.invite)) {
+        Some(i) => Some((i.clone(), net::invite_key(&i)?)),
+        None => None,
+    };
+    let me_addr = net.link().await.to_string();
+    let conn = net.connect(link.addr.clone(), Duration::from_secs(10)).await?;
+    let (mut wr, mut rd) = conn.open_bi().await.context("opening a stream")?;
     let nick = inner.state.read().nick.clone();
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
@@ -1170,6 +1204,9 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
         client: inner.client_name.clone(),
         codecs: codecs(),
         features: vec![FEATURE_HOST.into()],
+        room: Some(room.clone()),
+        proof: net::prove(&conn, &room, Some(&member), invite.as_ref().map(|(_, k)| k))?,
+        addr: Some(me_addr),
     };
     write_frame(&mut wr, &hello).await?;
     let first: ServerMsg = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd))
@@ -1179,14 +1216,20 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     match first {
         ServerMsg::Welcome { .. } => {}
         ServerMsg::Error { code, message } => {
-            tracing::info!("{addr} refused us ({code}): {message}");
+            tracing::info!("{} refused us ({code}): {message}", link.short());
+            // Nobody hosts the room there (any more): keep looking.
+            if code == "no_room" {
+                return Ok(End::Retry(message));
+            }
             return Ok(End::Refused(message));
         }
         ServerMsg::Handoff { to, term } => return Ok(End::Moved { to, term }),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
+    // What to remember for getting back in: the room's address, and its invite.
+    let shown = link.without_invite().room(room).to_string();
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
-    if !inner.on_welcome(epoch, addr, sock.ip(), first, tx.clone()) {
+    if !inner.on_welcome(epoch, &shown, conn.clone(), invite.map(|(i, _)| i), first, tx.clone()) {
         return Ok(End::Final("superseded".into()));
     }
     *was_connected = true;
@@ -1289,7 +1332,7 @@ fn local_line(channel: &str, text: String) -> ChatMessage {
         ts: crate::now_ms(),
         author_id: None,
         author: "tailchat".into(),
-        author_login: None,
+        author_key: None,
         text,
         kind: MessageKind::System,
     }
@@ -1323,12 +1366,22 @@ impl Inner {
         self.notice(NoticeLevel::Error, format!("could not host: {error}"));
     }
 
-    /// Where to host when someone hands us the room: the tailnet if we're on
-    /// one, else this machine only.
-    fn default_bind(&self) -> (String, u16) {
-        let on_tailnet = self.state.read().tailnet.as_ref().and_then(|t| t.me.as_ref()?.ipv4()).is_some();
-        let bind = if self.tailscale.is_some() && on_tailnet { "tailnet" } else { "localhost" };
-        (bind.into(), self.config.read().port)
+    /// Our endpoint, started on first use with this machine's device key.
+    async fn net(&self) -> anyhow::Result<Net> {
+        let net = self
+            .net
+            .get_or_try_init(|| async {
+                let key = net::load_or_create_key(&self.paths.data.join("device.key"))?;
+                let cfg = self.config.read().clone();
+                Net::bind(key, &cfg.bind, cfg.port, false, &cfg.net).await
+            })
+            .await?
+            .clone();
+        if self.state.read().net.is_none() {
+            let view = net_view(&net.ready_addr().await, net.relays_on());
+            self.update(|s| s.net = Some(view));
+        }
+        Ok(net)
     }
 
     fn refresh_rooms(&self) {
@@ -1341,8 +1394,7 @@ impl Inner {
         let (room_id, local) = {
             let s = self.state.read();
             let id = s.room_id().map(str::to_owned);
-            let local =
-                s.hosting.as_ref().filter(|h| h.term == term && Some(h.room_id.as_str()) == id.as_deref()).map(|h| connect_addr(h.listen));
+            let local = s.hosting.as_ref().filter(|h| h.term == term && Some(h.room_id.as_str()) == id.as_deref()).map(|h| h.addr.clone());
             (id, local)
         };
         if let Some(id) = &room_id
@@ -1366,13 +1418,13 @@ impl Inner {
     }
 
     /// Look for the live host of the room we were in (by room id): where the
-    /// save says it was last, and on the tailnet.
+    /// save says it was last, and at every member's app we know of.
     async fn locate(&self) -> Option<String> {
         let id = self.state.read().room_id()?.to_owned();
-        let saved = rooms::load(&self.paths, &id).map(|s| s.addrs).unwrap_or_default();
-        let port = self.config.read().port;
-        tracing::info!("looking for room {id} (last at {saved:?}{})", if self.tailscale.is_some() { " and on the tailnet" } else { "" });
-        let found = rooms::find_live(&id, &saved, port, self.tailscale.as_ref()).await;
+        let places = rooms::load(&self.paths, &id).map(|s| s.places()).unwrap_or_default();
+        let net = self.net().await.ok()?;
+        tracing::info!("looking for room {id} in {} places", places.len());
+        let found = rooms::find_live(&net, &id, &places).await;
         match &found {
             Some(h) => tracing::info!("room {id} is live at {} (term {})", h.addr, h.server.term),
             None => tracing::info!("room {id} isn't live anywhere we looked"),
@@ -1381,13 +1433,21 @@ impl Inner {
     }
 
     /// Save what the host told us about the room and open our copy of it.
-    fn remember_room(&self, server: &ServerInfo, channels: &[Channel], access: &Access, addr: &str) {
+    fn remember_room(&self, welcome: Welcome<'_>, addr: &str, invite: Option<String>) {
+        let Welcome { server, channels, access, members, profiles } = welcome;
         if !rooms::valid_id(&server.room_id) {
             *self.copy.lock() = None;
             return;
         }
         let mut save = rooms::load(&self.paths, &server.room_id).unwrap_or_else(|_| RoomSave::empty(&server.room_id));
         save.update_from(server, channels, Some(access));
+        if invite.is_some() {
+            save.invite = invite;
+        }
+        save.merge_profiles(profiles);
+        for m in members {
+            save.note_member(m);
+        }
         // Our own server already recorded its share addresses.
         let ours = self.state.read().hosting.as_ref().is_some_and(|h| h.room_id == server.room_id && h.term == server.term);
         if !ours {
@@ -1435,14 +1495,13 @@ impl Inner {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 let save = rooms::load(&me.paths, &id).context("no saved copy of this room")?;
-                let (bind, port) = me.default_bind();
-                me.start_hosting(save, term, &bind, port).await
+                me.start_hosting(save, term).await
             }
             .await;
             match res {
                 Ok(info) => {
                     me.notice(NoticeLevel::Info, format!("you're hosting {} now", info.name));
-                    me.send(ClientMsg::HostReady { term, addrs: info.share });
+                    me.send(ClientMsg::HostReady { term, addrs: vec![info.addr] });
                 }
                 Err(e) => {
                     me.notice(NoticeLevel::Warn, format!("couldn't take over hosting: {e:#}"));
@@ -1556,7 +1615,7 @@ impl Inner {
             t.abort();
         }
         slot.outbox = None;
-        slot.server_ip = None;
+        slot.link = None;
         slot.voice = None;
         drop(slot);
         self.stop_engine();
@@ -1570,6 +1629,7 @@ impl Inner {
         {
             let mut slot = self.conn.lock();
             slot.outbox = None;
+            slot.link = None;
             slot.voice = None;
         }
         self.stop_engine();
@@ -1586,11 +1646,12 @@ impl Inner {
         self: &Arc<Self>,
         epoch: u64,
         addr: &str,
-        server_ip: IpAddr,
+        link: Connection,
+        invite: Option<String>,
         msg: ServerMsg,
         tx: mpsc::UnboundedSender<ClientMsg>,
     ) -> bool {
-        let ServerMsg::Welcome { server, you, voice, channels, members, access, .. } = msg else {
+        let ServerMsg::Welcome { server, you, voice, channels, members, access, profiles, .. } = msg else {
             return false;
         };
         {
@@ -1599,12 +1660,12 @@ impl Inner {
                 return false;
             }
             slot.outbox = Some(tx);
-            slot.server_ip = Some(server_ip);
+            slot.link = Some(link);
             slot.voice = Some(voice);
         }
         let motd = server.motd.clone();
         let room = server.name.clone();
-        self.remember_room(&server, &channels, &access, addr);
+        self.remember_room(Welcome { server: &server, channels: &channels, access: &access, members: &members, profiles: &profiles }, addr, invite);
         let prev_me = self.prev_me.lock().replace(you);
         self.update(|s| {
             // Same room (reconnect, or the room moved host): keep what's on
@@ -1705,6 +1766,7 @@ impl Inner {
             }
             ServerMsg::HostRequest { term } => self.on_host_request(term),
             ServerMsg::MemberJoined { member } => {
+                self.note_member(&member);
                 let line = format!("{} joined", member.nick);
                 let data = json!({"member": member});
                 self.update(|s| {
@@ -1733,6 +1795,7 @@ impl Inner {
                 }
             }
             ServerMsg::MemberUpdated { member } => {
+                self.note_member(&member);
                 let data = json!({"member": member});
                 let (mine, voice_before) = self.update(|s| {
                     let mine = s.me == Some(member.id);
@@ -1780,33 +1843,40 @@ impl Inner {
         }
     }
 
+    /// Remember a member in our copy of the room (profile, where their app is).
+    fn note_member(&self, m: &Member) {
+        let Some(id) = self.state.read().room_id().map(str::to_owned) else { return };
+        if let Ok(mut save) = rooms::load(&self.paths, &id) {
+            let before = (save.profiles.clone(), save.peers.clone());
+            save.note_member(m);
+            if (save.profiles.clone(), save.peers.clone()) != before {
+                let _ = rooms::save(&self.paths, &save);
+            }
+        }
+    }
+
     /// Run `save` in this process at `term`, and keep the save up to date.
-    async fn start_hosting(self: &Arc<Self>, mut save: RoomSave, term: u64, bind: &str, port: u16) -> anyhow::Result<HostInfo> {
-        let bind_addr = server::resolve_bind(bind, port, self.tailscale.as_ref()).await?;
+    async fn start_hosting(self: &Arc<Self>, mut save: RoomSave, term: u64) -> anyhow::Result<HostInfo> {
+        let net = self.net().await?;
         // Limits come from server.toml; name, channels and rules from the room.
         let base: ServerConfig = config::load_or_default(&self.paths.server_config_file()).unwrap_or_default();
-        let config = save.server_config(ServerConfig { bind: bind.to_owned(), port, ..base });
+        let config = save.server_config(base);
         let handle = server::start(ServerOptions {
             config,
             mode: ServerMode::Host,
-            bind: bind_addr,
+            net,
             history_dir: Some(rooms::history_dir(&self.paths, &save.id)),
-            tailscale: self.tailscale.clone(),
             room_id: save.id.clone(),
             term,
+            invite: save.invite.clone(),
+            profiles: save.profiles.clone(),
         })
-        .await
-        .map_err(|e| {
-            if format!("{e:#}").contains("in use") {
-                anyhow::anyhow!("port {port} is already in use — is another room running here? ({e:#})")
-            } else {
-                e
-            }
-        })?;
-        let listen = handle.local_addr();
-        let share = rooms::share_addrs(listen, self.tailscale.as_ref()).await;
+        .await?;
+        let link = handle.link().await;
+        let share = vec![link.to_string()];
+        let addr = link.without_invite().to_string();
         save.term = term;
-        save.addrs = share.clone();
+        save.addrs = vec![addr.clone()];
         save.updated = crate::now_ms();
         if let Err(e) = rooms::save(&self.paths, &save) {
             tracing::warn!("saving room: {e:#}");
@@ -1814,7 +1884,7 @@ impl Inner {
         if let Some(old) = self.hosted.lock().replace(handle.clone()) {
             old.shutdown();
         }
-        let info = HostInfo { name: save.name.clone(), room_id: save.id.clone(), term, listen, share };
+        let info = HostInfo { name: save.name.clone(), room_id: save.id.clone(), term, share, addr };
         self.emit(names::HOSTING_CHANGED, json!({"hosting": info}));
         let saved = rooms::list(&self.paths);
         self.update(|s| {
@@ -1845,10 +1915,10 @@ impl Inner {
         if self.voice.lock().is_some() {
             return;
         }
-        let (ip, setup) = {
+        let (link, setup) = {
             let slot = self.conn.lock();
-            match (slot.server_ip, slot.voice.clone()) {
-                (Some(ip), Some(v)) => (ip, v),
+            match (slot.link.clone(), slot.voice.clone()) {
+                (Some(l), Some(v)) => (l, v),
                 _ => return,
             }
         };
@@ -1858,9 +1928,9 @@ impl Inner {
             (s.voice.muted, s.voice.deafened)
         };
         let me = self.clone();
+        let rt = self.rt.clone();
         self.rt.spawn_blocking(move || {
-            let server = SocketAddr::new(ip, setup.udp_port);
-            match crate::voice::VoiceLink::start(server, setup.token, settings) {
+            match crate::voice::VoiceLink::start(link, setup.token, settings, &rt) {
                 Ok(link) => {
                     link.engine().set_muted(muted);
                     link.engine().set_deafened(deafened);
@@ -2021,15 +2091,16 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("mods.list", "{}", "Installed mods and their status"),
     doc("mods.run", "{command, args?}", "Run a mod slash command"),
     doc("mods.reload", "{}", "Rescan mods and restart their processes"),
-    doc("session.host", "{name?, bind?, port?}", "Host a new room from this app"),
-    doc("session.join", "{addr}", "Join a room"),
+    doc("session.host", "{name?, open?}", "Host a new room from this app (invite-only unless open)"),
+    doc("session.join", "{addr}", "Join a room by invite link or address"),
+    doc("session.invite", "{}", "The invite link for the room you're in"),
     doc("session.leave", "{}", "Leave the room (hands it to another member if you host it)"),
     doc("session.handoff", "{to?}", "While hosting: hand the room to member `to` (default: the first who can host)"),
     doc("rooms.list", "{}", "Rooms saved on this machine"),
     doc("rooms.open", "{room}", "Join a saved room's live host, or host it from your copy (\"Host this room\")"),
     doc("rooms.forget", "{room}", "Delete a saved room and its history"),
-    doc("tailnet.status", "{}", "Tailnet peers"),
-    doc("tailnet.discover", "{}", "Probe peers for rooms (async; see state.get discovery)"),
+    doc("net.status", "{}", "This app's network endpoint (id, relay, direct addresses)"),
+    doc("rooms.discover", "{}", "Look for live hosts of saved rooms (async; see state.get discovery)"),
     doc("config.get", "{}", "Current config.toml values"),
 ];
 
@@ -2180,15 +2251,17 @@ impl ApiHandler for SessionApi {
                 Ok(json!({"mods": s.mods().active().count()}))
             }
             "session.host" => {
-                let cfg = s.config();
                 let nick = s.state().nick.clone();
                 s.host(HostOptions {
                     name: param_str(&p, "name").unwrap_or_else(|| format!("{nick}'s room")),
-                    bind: param_str(&p, "bind").unwrap_or_else(|| "tailnet".into()),
-                    port: p["port"].as_u64().map(|v| v as u16).unwrap_or(cfg.port),
+                    open: p["open"].as_bool().unwrap_or(false),
                 });
                 Ok(json!({"starting": true}))
             }
+            "session.invite" => match s.invite_link() {
+                Some(link) => Ok(json!({"invite": link})),
+                None => Err("not in a room".into()),
+            },
             "session.handoff" => {
                 s.handoff(p["to"].as_u64().map(|v| v as MemberId));
                 Ok(json!({"requested": true}))
@@ -2209,8 +2282,8 @@ impl ApiHandler for SessionApi {
                 s.leave();
                 Ok(json!({"left": true}))
             }
-            "tailnet.status" => ok(&s.state().tailnet),
-            "tailnet.discover" => {
+            "net.status" => ok(&s.state().net),
+            "rooms.discover" => {
                 s.scan();
                 Ok(json!({"scanning": true}))
             }
@@ -2218,6 +2291,25 @@ impl ApiHandler for SessionApi {
             other => Err(format!("unknown method {other} (see api.methods)")),
         };
         ready(res)
+    }
+}
+
+/// What a `welcome` says about the room, for saving.
+struct Welcome<'a> {
+    server: &'a ServerInfo,
+    channels: &'a [Channel],
+    access: &'a Access,
+    members: &'a [Member],
+    profiles: &'a [tailchat_proto::Profile],
+}
+
+fn net_view(addr: &net::EndpointAddr, relays_on: bool) -> NetView {
+    NetView {
+        id: addr.id.to_z32(),
+        short: addr.id.fmt_short().to_string(),
+        relay: addr.relay_urls().next().map(crate::relay::without_token),
+        direct: addr.ip_addrs().map(|a| a.to_string()).collect(),
+        relays_on,
     }
 }
 

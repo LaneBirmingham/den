@@ -10,38 +10,41 @@
 //! `app` messages, and forwards voice datagrams between members of the same
 //! voice channel without decoding them (an SFU, not a mixer).
 //!
+//! It listens through the process's [`Net`] endpoint (which routes
+//! connections to it by room id), checks each member's key proof and the
+//! room's invite, and keeps the room's profiles (key → nick).
+//!
 //! A room isn't tied to one server: it has an id and a term, members sync
 //! history with it on join, and it can hand everyone over to another host
 //! ([`ServerHandle::hand_off`], or a `claim` from a host with a higher term).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use bytes::Bytes;
+use iroh::endpoint::Connection;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
 use tailchat_proto::voice::{self, Packet};
 use tailchat_proto::{
     Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
-    MessageKind, PROTOCOL_VERSION, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
+    MessageKind, PROTOCOL_VERSION, Profile, Proof, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
 };
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::config::ServerConfig;
-use crate::net::{read_frame, write_frame};
+use crate::net::{self, Incoming, Link, Net, PublicKey, Registration, read_frame, write_frame};
 use crate::rooms;
-use crate::tailscale::{Tailscale, WhoIs};
 
 /// History sent to a member on join, per text channel.
 const JOIN_HISTORY: usize = 100;
 const OUTBOX_FRAMES: usize = 1024;
-const WHOIS_TTL: Duration = Duration::from_secs(300);
+/// Most profiles a room keeps (oldest unused ones go first).
+const MAX_PROFILES: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,14 +65,19 @@ impl ServerMode {
 pub struct ServerOptions {
     pub config: ServerConfig,
     pub mode: ServerMode,
-    pub bind: SocketAddr,
+    /// The endpoint to serve on (shared with everything else this process does).
+    pub net: Net,
     /// Load and persist history as JSON lines here (a room save's `history/`).
     pub history_dir: Option<PathBuf>,
-    pub tailscale: Option<Tailscale>,
     /// Stable room id (see [`rooms`]).
     pub room_id: String,
     /// This host's term: one more than the room's previous host.
     pub term: u64,
+    /// The room's invite key (see [`net::new_invite`]). With one, only people
+    /// holding it can join; without, anyone who can reach the host.
+    pub invite: Option<String>,
+    /// Members the room already knows (from the save).
+    pub profiles: Vec<Profile>,
 }
 
 /// Progress of handing the room to another host.
@@ -122,28 +130,11 @@ pub enum ServerEvent {
     },
 }
 
-/// Resolve a bind spec (`tailnet`, `localhost`, `all`, or an IP) to a socket address.
-pub async fn resolve_bind(spec: &str, port: u16, tailscale: Option<&Tailscale>) -> anyhow::Result<SocketAddr> {
-    let ip: IpAddr = match spec.trim() {
-        "" | "tailnet" | "tailscale" => {
-            let ts = tailscale.context("the tailscale CLI was not found; install Tailscale or bind with `localhost`/`all`")?;
-            ts.self_ipv4()
-                .await
-                .context("asking tailscale for this machine's address")?
-                .context("Tailscale is not connected; run `tailscale up` or bind with `localhost`/`all`")?
-        }
-        "localhost" | "loopback" => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        "all" | "any" | "0.0.0.0" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        other => other.parse().with_context(|| format!("bind must be tailnet, localhost, all or an IP, got {other:?}"))?,
-    };
-    Ok(SocketAddr::new(ip, port))
-}
-
 struct Conn {
     member: Member,
-    ip: IpAddr,
     token: u64,
-    udp: Option<SocketAddr>,
+    /// The member's connection: voice datagrams go out on it.
+    link: Connection,
     tx: mpsc::Sender<Arc<[u8]>>,
     kick: Option<oneshot::Sender<String>>,
     sent: VecDeque<Instant>,
@@ -159,6 +150,8 @@ struct Room {
     last_id: u64,
     /// Member asked to take over, and at which term.
     pending: Option<(MemberId, u64)>,
+    /// Everyone the room knows, by key.
+    profiles: HashMap<String, Profile>,
 }
 
 impl Room {
@@ -172,8 +165,12 @@ impl Room {
         v
     }
 
-    fn unique_nick(&self, wanted: &str, except: Option<MemberId>) -> String {
-        let taken = |n: &str| self.members.values().any(|c| Some(c.member.id) != except && c.member.nick.eq_ignore_ascii_case(n));
+    /// `wanted`, or `wanted (2)`… if someone here uses it or another key owns it.
+    fn unique_nick(&self, wanted: &str, except: Option<MemberId>, key: Option<&str>) -> String {
+        let taken = |n: &str| {
+            self.members.values().any(|c| Some(c.member.id) != except && c.member.nick.eq_ignore_ascii_case(n))
+                || self.profiles.values().any(|p| Some(p.key.as_str()) != key && p.nick.eq_ignore_ascii_case(n))
+        };
         if !taken(wanted) {
             return wanted.to_owned();
         }
@@ -220,6 +217,27 @@ impl Room {
         added
     }
 
+    /// Remember that `key` goes by `nick`.
+    fn remember(&mut self, key: Option<&str>, nick: &str) {
+        let Some(key) = key else { return };
+        let since = self.profiles.get(key).map(|p| p.since).unwrap_or_else(crate::now_ms);
+        self.profiles.insert(key.to_owned(), Profile { key: key.to_owned(), nick: nick.to_owned(), since });
+        if self.profiles.len() > MAX_PROFILES {
+            let online: HashSet<String> = self.members.values().filter_map(|c| c.member.identity.key.clone()).collect();
+            if let Some(oldest) =
+                self.profiles.values().filter(|p| !online.contains(&p.key)).min_by_key(|p| p.since).map(|p| p.key.clone())
+            {
+                self.profiles.remove(&oldest);
+            }
+        }
+    }
+
+    fn profile_list(&self) -> Vec<Profile> {
+        let mut v: Vec<Profile> = self.profiles.values().cloned().collect();
+        v.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.key.cmp(&b.key)));
+        v
+    }
+
     fn push_history(&mut self, msg: ChatMessage, limit: usize) {
         let h = self.history.entry(msg.channel.clone()).or_default();
         h.push_back(msg);
@@ -256,13 +274,14 @@ struct Shared {
     info: Mutex<ServerInfo>,
     cfg: ServerConfig,
     events: broadcast::Sender<ServerEvent>,
-    udp: Arc<UdpSocket>,
-    local_addr: SocketAddr,
-    tailscale: Option<Tailscale>,
+    net: Net,
+    /// The room's invite key, and its public half (what joiners must sign with).
+    invite: Option<(String, PublicKey)>,
+    /// Routes this room's connections here; dropped on shutdown.
+    route: Mutex<Option<Registration>>,
     persist: Option<mpsc::UnboundedSender<ChatMessage>>,
     shutdown: watch::Sender<bool>,
     handoff: watch::Sender<HandoffState>,
-    whois: Mutex<HashMap<IpAddr, (Instant, Option<WhoIs>)>>,
 }
 
 /// Cheap, cloneable handle to a running server.
@@ -271,24 +290,11 @@ pub struct ServerHandle {
     shared: Arc<Shared>,
 }
 
-/// TCP and UDP on the same port. With port 0 the OS picks the TCP port, and
-/// that number can already be taken for UDP, so try a few.
-async fn bind_tcp_udp(bind: SocketAddr) -> anyhow::Result<(TcpListener, UdpSocket)> {
-    let mut tries = if bind.port() == 0 { 8 } else { 1 };
-    loop {
-        let listener = TcpListener::bind(bind).await.with_context(|| format!("binding TCP {bind}"))?;
-        let local = listener.local_addr()?;
-        match UdpSocket::bind(local).await {
-            Ok(udp) => return Ok((listener, udp)),
-            Err(e) if tries > 1 && e.kind() == std::io::ErrorKind::AddrInUse => tries -= 1,
-            Err(e) => return Err(e).with_context(|| format!("binding UDP {local} for voice")),
-        }
-    }
-}
-
 pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
-    let (listener, udp) = bind_tcp_udp(opts.bind).await?;
-    let local_addr = listener.local_addr()?;
+    let invite = match &opts.invite {
+        Some(s) => Some((s.clone(), net::invite_key(s).context("the room's invite key")?.public())),
+        None => None,
+    };
 
     let channels = opts.config.channel_list();
     if channels.is_empty() {
@@ -315,39 +321,44 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
     let (events, _) = broadcast::channel(1024);
     let (shutdown, _) = watch::channel(false);
     let (handoff, _) = watch::channel(HandoffState::None);
-    let room = Room { members: HashMap::new(), tokens: HashMap::new(), channels, history, next_member: 1, last_id, pending: None };
+    let profiles = opts.profiles.into_iter().filter(|p| !p.key.is_empty()).map(|p| (p.key.clone(), p)).collect();
+    let room =
+        Room { members: HashMap::new(), tokens: HashMap::new(), channels, history, next_member: 1, last_id, pending: None, profiles };
+    let room_id = info.room_id.clone();
     let shared = Arc::new(Shared {
         room: Mutex::new(room),
         info: Mutex::new(info),
         cfg: opts.config,
         events,
-        udp: Arc::new(udp),
-        local_addr,
-        tailscale: opts.tailscale,
+        net: opts.net.clone(),
+        invite,
+        route: Mutex::new(None),
         persist,
         shutdown,
         handoff,
-        whois: Mutex::new(HashMap::new()),
     });
 
-    tokio::spawn(accept_loop(shared.clone(), listener));
-    tokio::spawn(udp_loop(shared.clone()));
-    tracing::info!("room {:?} listening on {local_addr} (tcp+udp)", shared.cfg.name);
+    let (tx, rx) = mpsc::channel(64);
+    *shared.route.lock() = Some(opts.net.register(&room_id, tx));
+    tokio::spawn(accept_loop(shared.clone(), rx));
+    tracing::info!(
+        "room {:?} ({room_id}) hosted on endpoint {}{}",
+        shared.cfg.name,
+        opts.net.id().fmt_short(),
+        if shared.invite.is_some() { ", invite only" } else { "" }
+    );
     Ok(ServerHandle { shared })
 }
 
-async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
+async fn accept_loop(shared: Arc<Shared>, mut rx: mpsc::Receiver<Incoming>) {
     let mut stop = shared.shutdown.subscribe();
     loop {
         tokio::select! {
-            res = listener.accept() => match res {
-                Ok((stream, peer)) => {
-                    tokio::spawn(handle_conn(shared.clone(), stream, peer));
+            inc = rx.recv() => match inc {
+                Some(inc) => {
+                    tokio::spawn(handle_conn(shared.clone(), inc));
                 }
-                Err(e) => {
-                    tracing::warn!("accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
+                None => break,
             },
             _ = stop.changed() => break,
         }
@@ -358,54 +369,61 @@ fn reject(code: &str, message: impl Into<String>) -> ServerMsg {
     ServerMsg::Error { code: code.into(), message: message.into() }
 }
 
-async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
-    let _ = stream.set_nodelay(true);
-    let (mut rd, mut wr) = stream.into_split();
+/// Answer a connection's first frame and close it.
+async fn answer(inc: Incoming, reply: &ServerMsg) {
+    let Incoming { conn, mut send, .. } = inc;
+    let _ = write_frame(&mut send, reply).await;
+    net::finish(&conn, send).await;
+}
 
-    let first = tokio::time::timeout(Duration::from_secs(10), read_frame::<_, ClientMsg>(&mut rd)).await;
-    let (nick, client, codecs, features) = match first {
-        Ok(Ok(Some(ClientMsg::Probe))) => {
+async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
+    let peer = inc.conn.remote_id().fmt_short().to_string();
+    let first = inc.first.clone();
+    let (nick, client, codecs, features, proof, addr) = match first {
+        ClientMsg::Probe { .. } => {
             let (members, channels) = {
                 let room = shared.room.lock();
                 (room.members.len() as u32, room.channels.clone())
             };
             let info = shared.info.lock().clone();
-            let _ = write_frame(&mut wr, &ServerMsg::ProbeInfo { server: info, members, channels }).await;
+            answer(inc, &ServerMsg::ProbeInfo { server: info, members, channels }).await;
             return;
         }
-        Ok(Ok(Some(ClientMsg::Claim { room, term, addrs }))) => {
-            let reply = shared.claim(peer.ip(), &room, term, addrs).await;
-            let _ = write_frame(&mut wr, &reply).await;
+        ClientMsg::Claim { room, term, addrs, proof } => {
+            let reply = shared.claim(&inc.conn, &peer, &room, term, addrs, &proof);
+            answer(inc, &reply).await;
             return;
         }
-        Ok(Ok(Some(ClientMsg::Hello { version, nick, client, codecs, features }))) => {
+        ClientMsg::Hello { version, nick, client, codecs, features, proof, addr, .. } => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("protocol {version} not supported (server speaks {PROTOCOL_VERSION})");
-                let _ = write_frame(&mut wr, &reject("version", msg)).await;
+                answer(inc, &reject("version", msg)).await;
                 return;
             }
             // Late arrivals after a handoff are sent on to the new host.
             let moved = shared.handoff.borrow().clone();
             if let HandoffState::Moved { to, term } = moved {
-                let _ = write_frame(&mut wr, &ServerMsg::Handoff { to, term }).await;
+                answer(inc, &ServerMsg::Handoff { to, term }).await;
                 return;
             }
-            (nick, client, codecs, features)
+            (nick, client, codecs, features, proof, addr)
         }
         _ => {
-            let _ = write_frame(&mut wr, &reject("handshake", "expected hello")).await;
+            answer(inc, &reject("handshake", "expected hello")).await;
             return;
         }
     };
 
-    let identity = shared.identify(peer.ip()).await;
-    if let Some(refusal) = shared.refusal(&identity) {
+    let (identity, invited) = shared.identify(&inc.conn, &proof);
+    if let Some(refusal) = shared.refusal(&identity, invited) {
         if let ServerMsg::Error { code, .. } = &refusal {
             tracing::info!("refused {nick:?} from {peer} ({}): {code}", describe_identity(&identity));
         }
-        let _ = write_frame(&mut wr, &refusal).await;
+        answer(inc, &refusal).await;
         return;
     }
+    let Incoming { conn: link, send: mut wr, recv: mut rd, .. } = inc;
+    let addr = addr.filter(|a| a.len() <= 1024 && Link::parse(a).is_ok());
 
     let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(OUTBOX_FRAMES);
     let (kick_tx, mut kick_rx) = oneshot::channel::<String>();
@@ -424,7 +442,8 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                 }
             };
             let wanted = clean_nick(&nick);
-            let nick = room.unique_nick(&wanted, None);
+            let nick = room.unique_nick(&wanted, None, identity.key.as_deref());
+            room.remember(identity.key.as_deref(), &nick);
             let member = Member {
                 id,
                 nick,
@@ -435,14 +454,15 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                 client: client.chars().take(64).collect(),
                 codecs,
                 can_host: features.iter().any(|f| f == FEATURE_HOST),
+                addr,
             };
-            let mut conn = Conn { member: member.clone(), ip: peer.ip(), token, udp: None, tx, kick: Some(kick_tx), sent: VecDeque::new() };
+            let mut conn = Conn { member: member.clone(), token, link: link.clone(), tx, kick: Some(kick_tx), sent: VecDeque::new() };
             // Welcome and history go into the outbox before anything else can.
             let welcome = ServerMsg::Welcome {
                 version: PROTOCOL_VERSION,
                 server: shared.info.lock().clone(),
                 you: id,
-                voice: VoiceSetup { udp_port: shared.local_addr.port(), token, frame_ms: voice::FRAME_MS },
+                voice: VoiceSetup { udp_port: 0, token, frame_ms: voice::FRAME_MS },
                 channels: room.channels.clone(),
                 members: {
                     let mut m = room.members();
@@ -450,6 +470,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                     m
                 },
                 access: shared.access(),
+                profiles: room.profile_list(),
             };
             send_to(&mut conn, &frame(&welcome));
             let text_channels: Vec<ChannelId> =
@@ -467,6 +488,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     let Some(member) = registered else {
         tracing::info!("refused {nick:?} from {peer}: the room is full");
         let _ = write_frame(&mut wr, &reject("full", "room is full")).await;
+        net::finish(&link, wr).await;
         return;
     };
     let id = member.id;
@@ -479,8 +501,9 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                 break;
             }
         }
-        let _ = wr.shutdown().await;
+        let _ = wr.finish();
     });
+    let voice = tokio::spawn(voice_loop(shared.clone(), id, link.clone()));
 
     let mut stop = shared.shutdown.subscribe();
     let reason: String = loop {
@@ -488,6 +511,8 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
             res = read_frame::<_, ClientMsg>(&mut rd) => match res {
                 Ok(Some(msg)) => shared.handle(id, msg),
                 Ok(None) => break "left".into(),
+                // The app closed the connection on purpose (quit, leave): a normal goodbye.
+                Err(_) if matches!(link.close_reason(), Some(iroh::endpoint::ConnectionError::ApplicationClosed(_))) => break "left".into(),
                 Err(e) => break format!("connection error: {e}"),
             },
             r = &mut kick_rx => break r.map(|r| format!("kicked: {r}")).unwrap_or_else(|_| "kicked".into()),
@@ -511,8 +536,12 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         }
         conn.map(|c| c.member)
     };
-    // Dropping the Conn closed the outbox; let the writer flush (Bye) and finish.
+    // Dropping the Conn closed the outbox; let the writer flush (Bye) and
+    // finish, give the member a moment to read it, then close.
+    voice.abort();
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), link.closed()).await;
+    link.close(0u32.into(), b"bye");
     if let Some(member) = removed {
         tracing::info!("{} left ({reason})", member.nick);
         let _ = shared.events.send(ServerEvent::MemberLeft { member, reason });
@@ -520,37 +549,41 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
 }
 
 fn describe_identity(id: &Identity) -> String {
-    match (&id.login, &id.node) {
-        (Some(l), Some(n)) => format!("{l} on {n}"),
-        (Some(l), None) => l.clone(),
-        (None, Some(n)) => format!("unverified, {n}"),
-        _ => "unverified".into(),
+    match id.short() {
+        Some(k) if id.verified => format!("key {k}"),
+        _ => "no key".into(),
     }
 }
 
 impl Shared {
     fn access(&self) -> Access {
-        Access { require_tailnet: self.cfg.require_tailnet, allow: self.cfg.allow.clone() }
+        Access { allow: self.cfg.allow.clone() }
+    }
+
+    /// Check a key proof made on `conn`: who it is, and whether they hold the invite.
+    fn identify(&self, conn: &Connection, proof: &Proof) -> (Identity, bool) {
+        let room = self.info.lock().room_id.clone();
+        let v = net::verify(conn, &room, proof, self.invite.as_ref().map(|(_, pk)| pk));
+        (Identity { verified: v.key.is_some(), key: v.key }, v.invited)
     }
 
     /// The room's join rules: why `identity` may not come in, if it may not.
     /// Every way in (joining, claiming) goes through here.
-    fn refusal(&self, identity: &Identity) -> Option<ServerMsg> {
-        if self.cfg.require_tailnet && !identity.verified {
-            return Some(reject("not_tailnet", "this room only admits tailnet members"));
+    fn refusal(&self, identity: &Identity, invited: bool) -> Option<ServerMsg> {
+        if self.invite.is_some() && !invited {
+            return Some(reject("not_invited", "this room needs an invite: ask a member for a link"));
         }
-        let listed = identity.login.as_ref().is_some_and(|l| self.cfg.allow.iter().any(|a| a.eq_ignore_ascii_case(l)));
-        if !self.cfg.allow.is_empty() && !listed {
+        if !self.access().allows(identity.key.as_deref()) {
             return Some(reject("not_allowed", "you are not on this room's allow list"));
         }
         None
     }
 
     /// Another peer hosts this room at a higher term and wants everyone.
-    async fn claim(&self, ip: IpAddr, room: &str, term: u64, addrs: Vec<String>) -> ServerMsg {
-        let identity = self.identify(ip).await;
-        if let Some(refusal) = self.refusal(&identity) {
-            tracing::info!("refused a claim from {ip} ({})", describe_identity(&identity));
+    fn claim(&self, conn: &Connection, peer: &str, room: &str, term: u64, addrs: Vec<String>, proof: &Proof) -> ServerMsg {
+        let (identity, invited) = self.identify(conn, proof);
+        if let Some(refusal) = self.refusal(&identity, invited) {
+            tracing::info!("refused a claim from {peer} ({})", describe_identity(&identity));
             return refusal;
         }
         let (id, current) = {
@@ -561,13 +594,13 @@ impl Shared {
             return reject("wrong_room", "this server hosts a different room");
         }
         if term <= current {
-            tracing::info!("refused a claim from {ip} at term {term}: this room is at term {current}");
+            tracing::info!("refused a claim from {peer} at term {term}: this room is at term {current}");
             return reject("stale_term", format!("this room is already at term {current}"));
         }
         if addrs.is_empty() || addrs.len() > 8 {
             return reject("bad_claim", "a claim needs 1-8 addresses");
         }
-        tracing::info!("room claimed at term {term} by {} ({})", addrs[0], describe_identity(&identity));
+        tracing::info!("room claimed at term {term} by {peer} ({})", describe_identity(&identity));
         self.finish_handoff(addrs.clone(), term);
         ServerMsg::Handoff { to: addrs, term }
     }
@@ -584,24 +617,6 @@ impl Shared {
         let _ = self.events.send(ServerEvent::Moved { to, term });
     }
 
-    async fn identify(&self, ip: IpAddr) -> Identity {
-        let ip = ip.to_canonical();
-        if ip.is_loopback() {
-            return Identity { node: Some("localhost".into()), ..Identity::default() };
-        }
-        let Some(ts) = &self.tailscale else {
-            return Identity::default();
-        };
-        if let Some((at, cached)) = self.whois.lock().get(&ip).cloned()
-            && at.elapsed() < WHOIS_TTL
-        {
-            return whois_identity(cached);
-        }
-        let who = ts.whois(ip).await.unwrap_or(None);
-        self.whois.lock().insert(ip, (Instant::now(), who.clone()));
-        whois_identity(who)
-    }
-
     fn reply(&self, room: &mut Room, id: MemberId, msg: &ServerMsg) {
         if let Some(c) = room.members.get_mut(&id) {
             send_to(c, &frame(msg));
@@ -611,7 +626,7 @@ impl Shared {
     fn handle(&self, id: MemberId, msg: ClientMsg) {
         let mut room = self.room.lock();
         match msg {
-            ClientMsg::Hello { .. } | ClientMsg::Probe => {
+            ClientMsg::Hello { .. } | ClientMsg::Probe { .. } => {
                 self.reply(&mut room, id, &reject("handshake", "already joined"));
             }
             ClientMsg::Ping { nonce } => self.reply(&mut room, id, &ServerMsg::Pong { nonce }),
@@ -644,14 +659,14 @@ impl Shared {
                 }
                 conn.sent.push_back(now);
                 let author = conn.member.nick.clone();
-                let author_login = conn.member.identity.login.clone();
+                let author_key = conn.member.identity.key.clone();
                 let message = ChatMessage {
                     id: room.next_id(),
                     channel,
                     ts: crate::now_ms(),
                     author_id: Some(id),
                     author,
-                    author_login,
+                    author_key,
                     text,
                     kind: MessageKind::User,
                 };
@@ -663,7 +678,9 @@ impl Shared {
             }
             ClientMsg::SetNick { nick } => {
                 let wanted = clean_nick(&nick);
-                let nick = room.unique_nick(&wanted, Some(id));
+                let key = room.members.get(&id).and_then(|c| c.member.identity.key.clone());
+                let nick = room.unique_nick(&wanted, Some(id), key.as_deref());
+                room.remember(key.as_deref(), &nick);
                 self.update_member(&mut room, id, |m| m.nick = nick);
             }
             ClientMsg::VoiceJoin { channel } => match room.channel(&channel) {
@@ -786,56 +803,36 @@ impl Shared {
     }
 }
 
-fn whois_identity(who: Option<WhoIs>) -> Identity {
-    match who {
-        Some(w) => Identity { verified: w.login.is_some(), login: w.login, display_name: w.display_name, node: w.node },
-        None => Identity::default(),
-    }
-}
-
-async fn udp_loop(shared: Arc<Shared>) {
-    let mut stop = shared.shutdown.subscribe();
-    let mut buf = vec![0u8; 2048];
+/// One member's voice: datagrams on their connection. The connection says
+/// who's speaking, so the packet's token isn't needed to tell.
+async fn voice_loop(shared: Arc<Shared>, speaker: MemberId, link: Connection) {
     let mut out = Vec::with_capacity(1500);
-    let ack = Packet::Ack.to_vec();
-    loop {
-        let (n, src) = tokio::select! {
-            r = shared.udp.recv_from(&mut buf) => match r {
-                Ok(v) => v,
-                // Windows reports ICMP port-unreachable as a recv error; ignore and carry on.
-                Err(_) => continue,
-            },
-            _ = stop.changed() => break,
-        };
-        match Packet::parse(&buf[..n]) {
-            Some(Packet::Register { token }) => {
-                let ok = {
-                    let mut room = shared.room.lock();
-                    authenticate(&mut room, token, src).is_some()
-                };
-                if ok {
-                    let _ = shared.udp.send_to(&ack, src).await;
-                }
+    let ack = Bytes::from(Packet::Ack.to_vec());
+    while let Ok(d) = link.read_datagram().await {
+        match Packet::parse(&d) {
+            Some(Packet::Register { .. }) => {
+                let _ = link.send_datagram(ack.clone());
             }
             Some(Packet::Audio { token, seq, codec, payload }) => {
                 if payload.len() > voice::MAX_PAYLOAD {
                     continue;
                 }
-                let targets: Vec<SocketAddr> = {
-                    let mut room = shared.room.lock();
-                    let Some(speaker) = authenticate(&mut room, token, src) else { continue };
-                    let Some(conn) = room.members.get(&speaker) else { continue };
+                let targets: Vec<Connection> = {
+                    let room = shared.room.lock();
+                    // The connection says who speaks; the token must agree.
+                    let Some(conn) = room.members.get(&speaker).filter(|c| c.token == token) else { continue };
                     let (Some(vc), false) = (conn.member.voice.clone(), conn.member.muted) else { continue };
                     voice::audio_to_relay(speaker, seq, codec, payload, &mut out);
                     room.members
                         .values()
                         .filter(|c| c.member.id != speaker && !c.member.deafened)
                         .filter(|c| c.member.voice.as_deref() == Some(vc.as_str()))
-                        .filter_map(|c| c.udp)
+                        .map(|c| c.link.clone())
                         .collect()
                 };
+                let pkt = Bytes::copy_from_slice(&out);
                 for t in targets {
-                    let _ = shared.udp.send_to(&out, t).await;
+                    let _ = t.send_datagram(pkt.clone());
                 }
             }
             _ => {}
@@ -843,21 +840,29 @@ async fn udp_loop(shared: Arc<Shared>) {
     }
 }
 
-/// Match a token to a member, require the datagram to come from the member's
-/// control-connection IP, and remember its UDP address.
-fn authenticate(room: &mut Room, token: u64, src: SocketAddr) -> Option<MemberId> {
-    let id = *room.tokens.get(&token)?;
-    let conn = room.members.get_mut(&id)?;
-    if conn.ip.to_canonical() != src.ip().to_canonical() {
-        return None;
-    }
-    conn.udp = Some(src);
-    Some(id)
-}
-
 impl ServerHandle {
-    pub fn local_addr(&self) -> SocketAddr {
-        self.shared.local_addr
+    pub fn net(&self) -> &Net {
+        &self.shared.net
+    }
+
+    /// The room's invite key, if it has one.
+    pub fn invite(&self) -> Option<String> {
+        self.shared.invite.as_ref().map(|(s, _)| s.clone())
+    }
+
+    /// An invite link to this room (carries the invite key).
+    pub async fn link(&self) -> Link {
+        self.shared.net.link().await.room(self.room_id()).invite(self.invite())
+    }
+
+    /// Where members can reach this room (no invite key): for handoffs and saves.
+    pub async fn addrs(&self) -> Vec<String> {
+        vec![self.link().await.without_invite().to_string()]
+    }
+
+    /// Everyone the room knows (key → nick).
+    pub fn profiles(&self) -> Vec<Profile> {
+        self.shared.room.lock().profile_list()
     }
 
     pub fn info(&self) -> ServerInfo {
@@ -989,7 +994,7 @@ impl ServerHandle {
             ts: crate::now_ms(),
             author_id: None,
             author: self.shared.info.lock().name.clone(),
-            author_login: None,
+            author_key: None,
             text: text.to_owned(),
             kind: MessageKind::Server,
         };
@@ -1022,7 +1027,10 @@ impl ServerHandle {
         self.shared.info.lock().motd = motd;
     }
 
+    /// Stop serving: everyone is told (`bye`) and the room is no longer
+    /// routed here. The endpoint itself belongs to the caller.
     pub fn shutdown(&self) {
+        self.shared.route.lock().take();
         let _ = self.shared.shutdown.send(true);
     }
 }

@@ -117,7 +117,7 @@ Settings go in `[panel."<id>"]`. Every panel also accepts `fill = true|false`.
 | `core.header` | room name, online count; click for invite, View menu, leave | `style = "pill"` (a card for a sidebar) \| `"bar"` (a strip for the top slot, default) |
 | `core.channels` | text channels with unread / mention badges, voice channels with who's in them, the voice card for your channel | `style = "list" \| "conversations"` (previews), `voice` (true), `orientation = "horizontal"` (a tab strip for top/bottom slots) |
 | `core.voice` | you: mic, deafen, hang up, settings (mode, meter, gate, volume, devices) | `show_devices`, `show_meter` |
-| `core.members` | people with status lines, Tailscale identity, voice state | `group_voice` (true: fold your voice channel into one row) |
+| `core.members` | people with status lines, room key (hover), voice state | `group_voice` (true: fold your voice channel into one row) |
 | `core.messages` | message list with day and "new" dividers | `style = "cozy" \| "bubbles" \| "compact" \| "irc"`, `row = ["time","author","text"]` (compact), `time_format`, `group`, `show_system`, `header` |
 | `core.stage` | voice channels as speaker tiles with join/leave | `tile_size` (84), `show_empty` (true) |
 | `core.composer` | input with history (↑), `/command` completion (Tab) and a send button | `placeholder` (`{channel}` is substituted), `style = "field" \| "pill"`, `send_button` (true) |

@@ -10,7 +10,7 @@ Exit code 1
               ┌──────────────── Session (tailchat-core) ────────────────┐
               │ state · methods · events · UiStore · ModRuntime · voice │
               └───────┬─────────────────────────────────────┬───────────┘
-                      │ TCP frames + UDP voice              │ spawns
+                      │ iroh QUIC: frames + voice datagrams │ spawns
                       ▼                                     ▼
          ┌──── room server (same code) ────┐          mod processes
          │ in-process (`host`) or headless │          (any language)
@@ -24,27 +24,65 @@ Exit code 1
 | --- | --- | --- |
 | `tailchat-proto` | Message types, framing, voice packet format, codec negotiation | serde |
 | `tailchat-audio` | Devices, resampling, Opus/PCM codecs, VAD gate, jitter buffer + mixer | cpal, opus |
-| `tailchat-core` | Room server, client `Session`, Tailscale CLI wrapper, mods, control API, UI store | proto, tokio, (audio) |
+| `tailchat-core` | Room server, client `Session`, P2P transport (`net`, iroh), mods, control API, UI store | proto, tokio, iroh, (audio) |
 | `tailchat-gui` | egui shell: layouts, themes, panel registry, built-in panels | core, eframe |
 | `tailchat` | The binary and its subcommands | core, (gui) |
 
 The GUI and audio are optional features, so a server build is just
-`tokio` + `serde` and cross-compiles anywhere.
+`tokio` + `serde` + `iroh` and cross-compiles anywhere.
+
+## Transport (`net`)
+
+Every process runs one iroh endpoint (`net::Net`): a QUIC socket named by an
+Ed25519 key (the *endpoint id*). Peers dial an id plus hints (a relay URL,
+direct `ip:port`s); iroh hole-punches and falls back to the relay, which only
+forwards encrypted packets. ALPN is `tailchat/3`.
+
+* **Keys** — an app's endpoint key is `<data>/device.key`; `serve` uses
+  `<data>/serve.key`, so an app and a server sharing a data folder are
+  different peers. Relays: `[net] relays` = `["default"]` (iroh's public
+  relays), `[]` (direct only) or URLs; `TAILCHAT_RELAYS` overrides it. The
+  endpoint uses no DNS/pkarr discovery: links carry the addresses.
+* **Links** — `tailchat://<endpoint id>?room=<id>&invite=<key>&relay=<url>&ip=<addr>…`
+  (`net::Link`). Invite links carry the invite key; the addresses saved in
+  rooms, sent in handoffs and shown in discovery leave it out.
+* **Routing** — one endpoint can host several rooms and join others. Each
+  hosted server registers its room id; an incoming connection's first frame
+  (`hello.room`, `probe.room`, `claim.room`) picks the server, and unknown
+  rooms get `error {code: "no_room"}`. An endpoint can't dial itself, so
+  joining a room you host goes through a second, loopback-only endpoint.
+* **Relays** (`relay`) — `serve` runs an `iroh-relay` in-process (plain
+  HTTP on TCP, same port number as the room). Its endpoint is registered
+  with that relay at a loopback URL, and `Net::advertise_relays` swaps in
+  the public URL (`[relay] url`, else `http://<public IP>:<port>` once
+  address discovery finds it) wherever links are made. The other relays are
+  then dropped. Members need no config: iroh dials through any relay named
+  in an address. `tailchat relay` runs the same relay alone. Every relay is
+  gated: it admits only clients presenting its token (`relay::TokenGate`,
+  derived from `<data>/relay.key`), which rides in the relay URL's
+  `?token=` query, so links carry it and iroh sends it on connect without
+  the relay ever joining anyone's relay map (or becoming their home relay).
+* **Streams** — control is one bidirectional stream per connection carrying
+  the same length-prefixed JSON frames as before; voice uses QUIC datagrams
+  on the same connection.
 
 ## The two modes are one server
 
 `tailchat host` and `tailchat serve` run the same `server::start`. Hosting
 embeds it in the app and immediately joins it; `serve` wraps it in a
 `ServerNode` that adds server-side mods, an admin console and its own
-control API. Both bind to the machine's **tailnet IPv4** by default, so a room
-is only reachable from your tailnet.
+control API. An app hosts on its shared endpoint (any free UDP port by
+default); `serve` binds its own endpoint on UDP 8245 so it can be
+port-forwarded.
 
 ## Rooms move between hosts (`rooms`)
 
 A room is a save that every member holds, not a process:
 
 * **Save** — `<data>/rooms/<id>/room.toml` (format, id, name, motd, term,
-  last host addresses, join rules, channels) plus `history/<channel>.jsonl`
+  last host addresses, invite key, join rules, channels, members' profiles
+  and app addresses) plus `member.key` (this member's key for the room,
+  never sent) and `history/<channel>.jsonl`
   (the host's history files and every member's copy use the same format).
   A member's `Session` writes its copy as messages arrive (`rooms::Copy`);
   when it is connected to its own hosted server, the server writes instead.
@@ -68,57 +106,81 @@ A room is a save that every member holds, not a process:
   (`ServerNode::close`). The new host gets the same "you're hosting" notice
   as a manual takeover.
 * **Manual takeover** — "Host this room" (`Session::open_room`) probes the
-  room's last addresses and the tailnet for a live host with the same id;
+  room's last host addresses and every member app it knows of (`peers`,
+  learned from `member.addr`) for a live host with the same id;
   if there is none it hosts from the save at `term + 1`. If several hosts
   run the room (two members took over at once without seeing each other),
   `rooms::best_host` picks the same one for everyone: highest term, then a
-  `serve` over an app, then the lowest address. Claims stay strict (a
+  `serve` over an app, then the lowest endpoint id. Claims stay strict (a
   higher term than the host's), so equal terms never claim each other.
 * **Claim** — a peer already hosting the room at a higher term sends
-  `claim {room, term, addrs}` as its first frame; the host checks it against
-  the room's join rules, broadcasts `handoff`, and steps down. This is how
-  `serve` takes its room back after downtime (`serve --adopt <addr>` uses it
-  to move an app-hosted room onto a server). A server records where the
-  room went when it hands off, so it probes there first on its next start.
-  If the room's host holds the server's port (an app on the same machine),
-  the server claims before it binds, then binds once the port is free.
+  `claim {room, term, addrs, proof}` as its first frame; the host checks it
+  like a join (invite and allow list), broadcasts `handoff`, and steps down.
+  This is how `serve` takes its room back after downtime
+  (`serve --adopt <link>` uses it to move an app-hosted room onto a server).
+  A server records where the room went when it hands off, so it probes there
+  first on its next start.
 * **Rejoining** — a member whose host has gone looks for the room (by id)
-  at its saved addresses and on the tailnet while it retries, so it follows
+  at its saved addresses and members' apps while it retries, so it follows
   a handoff it missed. Retries update one "connection lost" line instead of
   adding one per attempt; `-v` logs every attempt and lookup.
-* **Addresses** — connect targets (share lists, handoff `to`, saves,
-  discovery `addr`) put the tailnet IP first, then the MagicDNS name; the
-  short machine name is for display. (glibc can resolve a short name to the
-  LAN address, which a tailnet-bound room doesn't listen on.) A connect
-  tries every address a name resolves to, and every candidate address,
-  before giving up.
+* **Addresses** — connect targets (handoff `to`, saves, discovery `addr`)
+  are links without the invite; the short endpoint id is for display.
 * **History files** never store `author_id`: member ids are per host. A
   member's own uploads (what the host `want`ed) are merged into its own view
   as well as the host's.
 
 Everyone has the same rights, so there are no roles to sync; join rules
-travel in `welcome` (`access`) and are enforced by whoever hosts.
+travel in `welcome` (`access`), and with the invite key and profiles, are
+enforced by whoever hosts.
+
+## Identity: a key per room
+
+There are no accounts. Each member holds an Ed25519 key per room
+(`rooms/<id>/member.key`, made on first join). On `hello` (and `claim`) the
+client sends `proof {key, sig, invite}`: signatures over
+`kind || 0 || exporter`, where the exporter is 32 bytes of TLS keying
+material from this QUIC connection (label `tailchat/3 proof`, context = room
+id). A signature can't be replayed on another connection, and the host only
+ever sees public keys, so any member can host without learning anyone's
+secret.
+
+* `sig` (kind `member`) proves the member key: `identity.key` is set and
+  `verified` is true.
+* `invite` (kind `invite`) is signed with the room's invite key, which every
+  member saves. A room with an invite key admits only proofs that carry it.
+  Rooms made without one (`--open`) admit anyone who can reach them.
+* The room keeps profiles (key → nick, `welcome.profiles`, saved by every
+  member). A nick that belongs to another key gets a ` (2)` suffix, so
+  nobody can pass as someone else in that room.
+* `allow` lists key prefixes (8+ characters); when set, only those keys get
+  in.
+
+What the host can still do: it relays everything, so a malicious host could
+drop or alter messages. Signing messages with member keys is the planned
+fix.
 
 ## Wire protocol (`tailchat-proto`)
 
-* **TCP** — `u32` big-endian length + JSON body. `ClientMsg` / `ServerMsg`
-  are tagged enums (`{"type": "send", …}`). A connection either sends
-  `probe` (discovery: get room info, close) or `hello` (version, nick,
-  codecs, features) and receives `welcome` with members, channels, join
-  rules and the voice setup (UDP port + per-member token), followed by
-  history. Room sync and handoff messages are described above.
-* **UDP** (same port) — binary voice packets: `REGISTER` (token keepalive),
-  `AUDIO` (client → server: token, seq, codec, payload), `RELAY` (server →
-  client: speaker id, seq, codec, payload), `ACK`. The server is a selective
-  forwarding unit: it never decodes audio, it checks the token *and* the
-  source IP, drops muted/deafened senders, and relays to others in the same
-  voice channel.
+* **Control stream** — `u32` big-endian length + JSON body on one QUIC
+  bidirectional stream. `ClientMsg` / `ServerMsg` are tagged enums
+  (`{"type": "send", …}`). A connection either sends `probe {room?}`
+  (discovery: get room info, close) or `hello` (version, nick, codecs,
+  features, room, proof, the app's own link) and receives `welcome` with
+  members, channels, join rules, profiles and the voice setup (a per-member
+  token), followed by history. Room sync and handoff messages are described
+  above.
+* **Voice datagrams** (same connection) — binary packets: `REGISTER`
+  (token keepalive), `AUDIO` (client → server: token, seq, codec, payload),
+  `RELAY` (server → client: speaker id, seq, codec, payload), `ACK`. The
+  server is a selective forwarding unit: it never decodes audio, takes the
+  speaker from the connection (the token must match it), drops
+  muted/deafened senders, and relays to others in the same voice channel.
 * **Codecs** — 48 kHz mono, 20 ms frames. Opus by default, raw PCM16 as a
   fallback for builds without Opus. Each client advertises what it decodes;
   senders pick the best codec every listener supports.
-* **Identity** — the server runs `tailscale whois` on each peer IP (cached
-  5 min). Members carry `identity: {login, display_name, node, verified}`.
-  `require_tailnet` rejects unverified peers; `allow` restricts to logins.
+* **Identity** — members carry `identity: {key, verified}` (see above);
+  messages carry `author_key`.
 * **App messages** — `ClientMsg::App {ns, data, channel?, to?}` lets mods
   define their own protocols (games, presence, reactions) without server
   changes; the server relays them untouched.
@@ -129,7 +191,7 @@ travel in `welcome` (`access`) and are enforced by whoever hosts.
 
 1. **Read** `session.state()` → `SessionState` (connection, server info,
    channels, members, messages, focus, unread + mentions + "new since", voice
-   (incl. when you joined), discovery, tailnet).
+   (incl. when you joined), discovery, our endpoint (`net`)).
 2. **Call** methods: `host`, `join`, `leave`, `submit` (slash commands +
    text), `send_message`, `focus_channel`, `voice_join`, `set_muted`,
    `set_voice_devices`, `run_mod_command`, `ui_action`, …

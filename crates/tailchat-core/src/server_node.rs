@@ -10,9 +10,8 @@
 //! over and their copies fill in what the server missed.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -28,13 +27,13 @@ use crate::mods::{ModHost, ModRuntime};
 use crate::paths::Paths;
 use crate::rooms::{self, RoomSave};
 use crate::server::{self, HandoffState, ServerEvent, ServerHandle, ServerMode, ServerOptions};
-use crate::tailscale::Tailscale;
+use crate::net::{self, Net};
+use crate::relay::{self, LocalRelay};
 use crate::ui::UiStore;
 
 pub struct NodeOptions {
     pub api: bool,
     pub mods: bool,
-    pub tailscale_bin: Option<PathBuf>,
 }
 
 struct NodeInner {
@@ -49,6 +48,8 @@ struct NodeInner {
     mods_enabled: bool,
     api: Mutex<Option<ApiServer>>,
     api_env: RwLock<Vec<(String, String)>>,
+    /// The relay we run for the room's members, if any.
+    relay: Mutex<Option<LocalRelay>>,
 }
 
 #[derive(Clone)]
@@ -60,60 +61,52 @@ impl ServerNode {
     /// Host `save` with the settings in `cfg`. If someone is hosting the
     /// room right now, take it over from them.
     pub async fn start(cfg: ServerConfig, mut save: RoomSave, paths: Paths, opts: NodeOptions) -> anyhow::Result<ServerNode> {
-        let tailscale = Tailscale::locate(opts.tailscale_bin.as_deref());
-        let bind = server::resolve_bind(&cfg.bind, cfg.port, tailscale.as_ref()).await?;
-        let live = rooms::find_live(&save.id, &save.addrs, cfg.port, tailscale.as_ref()).await;
+        // Its own endpoint key, so an app on the same machine (same data
+        // dir) is a different peer.
+        let key = net::load_or_create_key(&paths.data.join("serve.key"))?;
+        let relay = match cfg.relay.enabled {
+            true => {
+                let port = if cfg.relay.port == 0 { cfg.port } else { cfg.relay.port };
+                let token = relay::load_token(&paths.data)?;
+                Some(LocalRelay::start(net::bind_ip(&cfg.bind)?, port, token).await.with_context(|| {
+                    format!("is something else using TCP port {port}? (set [relay] port, or enabled = false, in server.toml)")
+                })?)
+            }
+            false => None,
+        };
+        let mut net_cfg = cfg.net.clone();
+        if let Some(r) = &relay {
+            net_cfg.extra_relays.push(r.local_url.to_string());
+        }
+        let net = Net::bind(key, &cfg.bind, cfg.port, true, &net_cfg)
+            .await
+            .with_context(|| format!("is another `tailchat serve` already using UDP port {}?", cfg.port))?;
+        let relay = match relay {
+            Some(r) => use_own_relay(&net, r, &cfg).await?,
+            None => None,
+        };
+        let live = rooms::find_live(&net, &save.id, &save.places()).await;
         let term = save.term.max(live.as_ref().map(|l| l.server.term).unwrap_or(0)) + 1;
-        let port = cfg.port;
         save.apply_config(&cfg);
-        let options = || ServerOptions {
+        let server = server::start(ServerOptions {
             config: cfg.clone(),
             mode: ServerMode::Headless,
-            bind,
+            net: net.clone(),
             history_dir: Some(rooms::history_dir(&paths, &save.id)),
-            tailscale: tailscale.clone(),
             room_id: save.id.clone(),
             term,
-        };
-        let mut claimed_from = None;
-        let server = match server::start(options()).await {
-            Ok(s) => s,
-            Err(e) if addr_in_use(&e) => {
-                // Most likely an app on this machine hosts the room on our
-                // port. Claim it first: it sends everyone here and lets go of
-                // the port a few seconds later. Members retry until we're up.
-                let Some(live) = &live else {
-                    return Err(e).context(format!("port {port} is in use by something that isn't hosting this room"));
-                };
-                tracing::info!("port {port} is in use and {} hosts this room; claiming it before binding", live.addr);
-                let ours = rooms::share_addrs(bind, tailscale.as_ref()).await;
-                rooms::claim(&live.addr, port, &save.id, term, ours).await.with_context(|| {
-                    format!(
-                        "port {port} is in use and {} (hosting this room) didn't hand it over; hand the room off there first",
-                        live.addr
-                    )
-                })?;
-                claimed_from = Some(live.addr.clone());
-                let deadline = Instant::now() + Duration::from_secs(15);
-                loop {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    match server::start(options()).await {
-                        Ok(s) => break s,
-                        Err(e) if addr_in_use(&e) && Instant::now() < deadline => continue,
-                        Err(e) => return Err(e).context(format!("{} handed the room over but kept port {port}", live.addr)),
-                    }
-                }
-            }
-            Err(e) => return Err(e),
-        };
-        let share = rooms::share_addrs(server.local_addr(), tailscale.as_ref()).await;
+            invite: save.invite.clone(),
+            profiles: save.profiles.clone(),
+        })
+        .await?;
+        let addr = server.addrs().await;
         save.term = term;
-        save.addrs = share.clone();
+        save.addrs = addr.clone();
         rooms::save(&paths, &save)?;
-        if let Some(from) = &claimed_from {
-            tracing::info!("took over the room from {from}");
-        } else if let Some(live) = live {
-            match rooms::claim(&live.addr, port, &save.id, term, share).await {
+        let mut claimed_from = None;
+        if let Some(live) = live {
+            let member = rooms::member_key(&paths, &save.id)?;
+            match rooms::claim(&net, &live.addr, &save, &member, term, addr).await {
                 Ok(()) => {
                     tracing::info!("took over the room from {}", live.addr);
                     claimed_from = Some(live.addr);
@@ -133,6 +126,7 @@ impl ServerNode {
             mods_enabled: opts.mods,
             api: Mutex::new(None),
             api_env: RwLock::new(Vec::new()),
+            relay: Mutex::new(relay),
         });
 
         let mut rx = server.subscribe();
@@ -144,6 +138,18 @@ impl ServerNode {
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                if let ServerEvent::MemberJoined { member } | ServerEvent::MemberUpdated { member } = &ev {
+                    // Keep the room's profiles and members' addresses, like an app does.
+                    if let Ok(mut s) = rooms::load(&save_paths, &room_id) {
+                        let before = (s.profiles.clone(), s.peers.clone());
+                        s.note_member(member);
+                        if (s.profiles.clone(), s.peers.clone()) != before
+                            && let Err(e) = rooms::save(&save_paths, &s)
+                        {
+                            tracing::warn!("saving room: {e:#}");
+                        }
+                    }
+                }
                 let e = match ev {
                     ServerEvent::MemberJoined { member } => Event::new(names::MEMBER_JOINED, json!({"member": member})),
                     ServerEvent::MemberLeft { member, reason } => {
@@ -190,8 +196,9 @@ impl ServerNode {
         &self.inner.server
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.inner.server.local_addr()
+    /// The invite link for this room (where it's hosted now).
+    pub async fn invite_link(&self) -> net::Link {
+        self.inner.server.link().await
     }
 
     /// The room save this node hosts (as of start-up).
@@ -248,18 +255,72 @@ impl ServerNode {
             }
             Err(e) => tracing::info!("shutting down: {e:#}"),
         }
-        self.shutdown();
+        self.stop();
+        self.inner.server.net().close().await;
+        let relay = self.inner.relay.lock().take();
+        if let Some(r) = relay {
+            r.shutdown().await;
+        }
     }
 
+    /// The relay URL members are told about (this server's own relay), if
+    /// any, without its token (that only goes out in invite links).
+    pub fn relay_url(&self) -> Option<String> {
+        self.inner.relay.lock().as_ref()?;
+        self.inner.server.net().advertised_relays()?.first().map(relay::without_token)
+    }
+
+    /// Stop now, without handing the room on. The endpoint closes in the
+    /// background (its key is this node's: a restart must not find it open).
     pub fn shutdown(&self) {
+        self.stop();
+        let net = self.inner.server.net().clone();
+        let relay = self.inner.relay.lock().take();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                net.close().await;
+                if let Some(r) = relay {
+                    r.shutdown().await;
+                }
+            });
+        }
+    }
+
+    fn stop(&self) {
         self.inner.mods.read().stop();
         self.inner.server.shutdown();
         self.inner.api.lock().take();
     }
 }
 
-fn addr_in_use(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse))
+/// Make the server's own relay the way members reach it: work out the URL
+/// they should use (config, else the public IP), tell peers that (with the
+/// relay's token, so invite links carry it), and drop
+/// the other relays (they were only there to learn the public IP). Without a
+/// usable URL, the relay is stopped and the configured relays stay.
+async fn use_own_relay(net: &Net, relay: LocalRelay, cfg: &ServerConfig) -> anyhow::Result<Option<LocalRelay>> {
+    let url = match cfg.relay.url.as_deref().filter(|u| !u.trim().is_empty()) {
+        Some(u) => Some(relay::parse_url(u)?),
+        None => relay::discover_public_url(net, relay.addr.port(), Duration::from_secs(5)).await,
+    };
+    let Some(url) = url else {
+        tracing::warn!(
+            "couldn't work out this machine's public address, so the room's relay is off; set [relay] url in server.toml \
+             (e.g. \"http://box.example.com:{}\") to turn it on",
+            relay.addr.port()
+        );
+        net.endpoint().remove_relay(&relay.local_url).await;
+        relay.shutdown().await;
+        return Ok(None);
+    };
+    for other in net::relay_map(&cfg.net)?.urls::<Vec<_>>() {
+        if other != relay.local_url {
+            net.endpoint().remove_relay(&other).await;
+        }
+    }
+    net.advertise_relays(vec![relay.url(&url)]);
+    tracing::info!("members reach this room's relay at {url} (TCP {} must be reachable)", relay.addr.port());
+    Ok(Some(relay))
 }
 
 struct NodeHost {
@@ -350,7 +411,7 @@ impl ApiHandler for NodeApi {
             "state.get" => Ok(json!({
                 "server": srv.info(),
                 "room": node.save(),
-                "listen": srv.local_addr(),
+                "endpoint": srv.net().id().to_z32(),
                 "members": srv.members(),
                 "channels": srv.channels(),
                 "mods": node.mods().active().map(|m| m.manifest.id.clone()).collect::<Vec<_>>(),

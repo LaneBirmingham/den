@@ -409,8 +409,8 @@ fn cozy(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, p: &Palette, ni
         ui.painter().galley(pos2(rect.left() + TEXT_X - 10.0 - tg.size().x, top + 3.0), tg, p.muted);
     }
     ui.painter().galley(pos2(rect.left() + TEXT_X, top + head), g, color);
-    let resp = match &m.author_login {
-        Some(login) if start && !server => resp.on_hover_text_at_pointer(login),
+    let resp = match &m.author_key {
+        Some(key) if start && !server => resp.on_hover_text_at_pointer(format!("key {}…", &key[..key.len().min(8)])),
         _ => resp,
     };
     copy_menu(&resp, &body);
@@ -518,8 +518,8 @@ fn compact_row(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, row: &[String], group
                                 .font(kit::font(p.size, W::Semibold))
                                 .color(nick_color(&m.author, p)),
                         );
-                        if let Some(login) = &m.author_login {
-                            label.on_hover_text(login);
+                        if let Some(key) = &m.author_key {
+                            label.on_hover_text(format!("key {}…", &key[..key.len().min(8)]));
                         }
                     }
                     MessageKind::Server => {
@@ -593,7 +593,7 @@ mod tests {
             ts,
             author_id: None,
             author: author.into(),
-            author_login: None,
+            author_key: None,
             text: text.into(),
             kind: MessageKind::User,
         }

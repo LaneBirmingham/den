@@ -1,6 +1,6 @@
 [package]
 name = "tailchat-core"
-description = "UI-agnostic engine for tailchat: room server, client session, Tailscale integration, control API and mods"
+description = "UI-agnostic engine for tailchat: room server, client session, peer-to-peer networking (iroh), control API and mods"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,3 +23,7 @@ directories.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 chrono.workspace = true
+iroh.workspace = true
+iroh-relay.workspace = true
+data-encoding.workspace = true
+bytes.workspace = true
