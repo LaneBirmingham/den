@@ -215,6 +215,8 @@ fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, st
     #[cfg(feature = "gui")]
     if !terminal {
         let session = start_session(rt, paths, nick, "den-gui")?;
+        #[cfg(windows)]
+        detach_own_console();
         apply_start(&session, start);
         close_on_signal(rt, &session);
         let res = {
@@ -253,6 +255,23 @@ fn close_on_signal(rt: &tokio::runtime::Runtime, session: &Session) {
         session.close().await;
         std::process::exit(0);
     });
+}
+
+/// `den` is a console program (so `den api`, `den config` … print in a
+/// shell), which makes Windows open a console window when the app is started
+/// from Explorer or a shortcut. If that console is ours alone (no shell is
+/// attached to it), let it go: the window disappears and the app runs like
+/// any other. Started from a shell, the console stays, with its logs.
+#[cfg(all(windows, feature = "gui"))]
+fn detach_own_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut pids = [0u32; 2];
+    // SAFETY: the buffer is valid for `pids.len()` entries; both calls only act on this process.
+    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    if attached == 1 {
+        tracing::debug!("started outside a shell; leaving the console");
+        unsafe { FreeConsole() };
+    }
 }
 
 fn apply_start(session: &Session, start: Start) {

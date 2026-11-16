@@ -24,3 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Leave the console window Windows opens when the app is started from Explorer.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
