@@ -1,0 +1,33 @@
+# Catppuccin Latte: the light flavour
+name = "catppuccin-latte"
+dark = false
+# dark sibling: catppuccin
+
+[colors]
+bg = "#eff1f5"
+panel = "#e6e9ef"
+surface = "#dce0e8"
+surface_hover = "#ccd0da"
+border = "#ccd0da"
+text = "#4c4f69"
+muted = "#6c6f85"
+accent = "#8839ef"
+accent_text = "#eff1f5"
+ok = "#40a02b"
+warn = "#df8e1d"
+danger = "#d20f39"
+speaking = "#40a02b"
+link = "#1e66f5"
+mention = "#ece2fb"
+
+[shape]
+rounding = 8
+spacing = 6
+padding = 10
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 17
+small_size = 12
+monospace = false

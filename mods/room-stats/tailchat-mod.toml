@@ -1,0 +1,15 @@
+id = "example.stats"
+name = "Room stats"
+version = "0.1.0"
+description = "Live message counts, pushed from a background process"
+runs_on = ["client"]
+
+# Declared without a command: the daemon below fills it through the API.
+[[panels]]
+id = "top"
+title = "Chatty"
+slot = "right"
+
+[[startup]]
+command = ["python3", "stats.py"]
+daemon = true

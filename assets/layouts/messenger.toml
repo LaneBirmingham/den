@@ -1,0 +1,29 @@
+name = "messenger"
+description = "Chat bubbles, yours on the right; a conversation list with previews"
+
+[lobby]
+center = { panels = ["core.lobby"], card = false }
+overlays = ["core.toasts"]
+
+[room]
+left = { panels = ["core.header", "core.channels", "core.voice"], size = 280, card = false }
+center = { panels = ["core.messages", "core.composer"] }
+overlays = ["core.toasts"]
+
+[panel."core.header"]
+style = "pill"
+
+[panel."core.channels"]
+style = "conversations"
+
+[panel."core.messages"]
+style = "bubbles"
+time_format = "%-I:%M %p"
+header = true
+
+[panel."core.composer"]
+placeholder = "Message #{channel}"
+style = "pill"
+
+[panel."core.voice"]
+show_devices = false

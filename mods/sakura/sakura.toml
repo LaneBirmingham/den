@@ -1,0 +1,30 @@
+name = "sakura"
+dark = false
+
+[colors]
+bg = "#fff7f9"
+panel = "#fdeef2"
+surface = "#ffffff"
+surface_hover = "#f8dde5"
+border = "#f0c9d5"
+text = "#4a2c36"
+muted = "#9a7480"
+accent = "#d94f7c"
+accent_text = "#ffffff"
+ok = "#3f9b6e"
+warn = "#c9822b"
+danger = "#c8414b"
+speaking = "#3f9b6e"
+link = "#b8406a"
+mention = "#ffe3ec"
+
+[shape]
+rounding = 12
+spacing = 8
+padding = 12
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 18
+small_size = 12

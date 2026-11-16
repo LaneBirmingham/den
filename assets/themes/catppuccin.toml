@@ -1,0 +1,35 @@
+# tailchat theme. Copy this file into <config>/themes/ (run `tailchat config init`)
+# and edit it: the app hot-reloads on save. Every key is optional.
+# Catppuccin Mocha: soothing pastels on a deep base
+name = "catppuccin"
+dark = true
+# light sibling: catppuccin-latte
+
+[colors]
+bg = "#1e1e2e"
+panel = "#181825"
+surface = "#313244"
+surface_hover = "#45475a"
+border = "#313244"
+text = "#cdd6f4"
+muted = "#9399b2"
+accent = "#cba6f7"
+accent_text = "#1e1e2e"
+ok = "#a6e3a1"
+warn = "#f9e2af"
+danger = "#f38ba8"
+speaking = "#a6e3a1"
+link = "#89b4fa"
+mention = "#3a3050"
+
+[shape]
+rounding = 8
+spacing = 6
+padding = 10
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 17
+small_size = 12
+monospace = false

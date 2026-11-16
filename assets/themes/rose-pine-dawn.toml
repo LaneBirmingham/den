@@ -1,0 +1,33 @@
+# Rosé Pine Dawn: the airy morning variant
+name = "rose-pine-dawn"
+dark = false
+# dark sibling: rose-pine
+
+[colors]
+bg = "#faf4ed"
+panel = "#fffaf3"
+surface = "#f2e9e1"
+surface_hover = "#dfdad9"
+border = "#dfdad9"
+text = "#575279"
+muted = "#797593"
+accent = "#907aa9"
+accent_text = "#faf4ed"
+ok = "#56949f"
+warn = "#ea9d34"
+danger = "#b4637a"
+speaking = "#56949f"
+link = "#d7827e"
+mention = "#f2e0e3"
+
+[shape]
+rounding = 12
+spacing = 8
+padding = 14
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 18
+small_size = 12
+monospace = false

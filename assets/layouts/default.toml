@@ -1,0 +1,68 @@
+# tailchat layout. Copy into <config>/layouts/ (run `tailchat config init`)
+# and edit: the app hot-reloads on save.
+#
+# A layout has two screens: `lobby` (not in a room) and `room`.
+# Each screen has up to five slots: top, bottom, left, right, center.
+# A slot lists panel ids, stacked in order (or shown as tabs with mode = "tabs").
+#
+# Built-in panels (remove any of them to switch it off):
+#   core.lobby  core.header  core.channels  core.voice  core.members
+#   core.messages  core.composer  core.stage  core.status  core.toasts
+# Mod panels are "<mod id>/<panel id>". Placeholders:
+#   "mods:<slot>"  every mod panel that asks for that slot
+#   "mods:*"       every mod panel not placed anywhere else
+#
+# Slots are drawn as floating cards on a canvas. `card = false` on a slot
+# leaves its panels on the canvas (they draw their own cards), and
+# `[shell] style = "flat"` goes back to edge-to-edge panels with dividers.
+name = "default"
+description = "Channels and voice on the left, chat in the middle, people on the right"
+
+[shell]
+style = "cards"   # or "flat"
+gap = 10          # space around and between cards
+
+[lobby]
+center = { panels = ["core.lobby"], card = false }
+overlays = ["core.toasts"]
+
+[room]
+left = { panels = ["core.header", "core.channels", "core.voice"], size = 250, card = false }
+right = { panels = ["core.members", "mods:*"], size = 240 }
+center = { panels = ["core.messages", "core.composer"] }
+# bottom = { panels = ["core.status"] }   # connection details bar
+overlays = ["core.toasts"]
+
+# Floating windows, e.g. a mod panel:
+# [[room.windows]]
+# panel = "example.dice/stats"
+# open = true
+
+# Per-panel settings. `fill = true/false` overrides whether a panel takes
+# leftover space in its slot; other keys belong to the panel.
+[panel."core.header"]
+style = "pill"                     # room card for a sidebar; "bar" for a top strip
+
+[panel."core.channels"]
+style = "list"                     # or "conversations" (previews, like a messenger)
+
+[panel."core.messages"]
+style = "cozy"                     # cozy | bubbles | compact | irc
+row = ["time", "author", "text"]   # token order for style = "compact"
+time_format = "%-I:%M %p"
+group = true                       # merge consecutive messages by one author
+show_system = true                 # join/leave lines and notices
+header = true                      # "# channel" and topic above the messages
+
+[panel."core.composer"]
+placeholder = "Message #{channel}"
+style = "field"                    # or "pill"
+
+[panel."core.voice"]
+show_devices = true
+
+[keys]
+ptt = "F8"                 # hold to talk (in push-to-talk mode)
+mute = "Ctrl+Shift+M"      # Ctrl means Cmd on macOS
+deafen = "Ctrl+Shift+D"
+reload = "Ctrl+Shift+R"    # reload theme + layout

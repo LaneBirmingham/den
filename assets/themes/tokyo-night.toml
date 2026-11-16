@@ -1,0 +1,33 @@
+# Tokyo Night: blue-purple city lights
+name = "tokyo-night"
+dark = true
+# light sibling: tokyo-night-day
+
+[colors]
+bg = "#1a1b26"
+panel = "#16161e"
+surface = "#24283b"
+surface_hover = "#292e42"
+border = "#292e42"
+text = "#c0caf5"
+muted = "#737aa2"
+accent = "#7aa2f7"
+accent_text = "#16161e"
+ok = "#9ece6a"
+warn = "#e0af68"
+danger = "#f7768e"
+speaking = "#9ece6a"
+link = "#7dcfff"
+mention = "#2a3150"
+
+[shape]
+rounding = 6
+spacing = 6
+padding = 10
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 17
+small_size = 12
+monospace = false

@@ -1,0 +1,18 @@
+name = "focus"
+description = "Just the conversation; people and voice in a tab strip on the right"
+
+[lobby]
+center = { panels = ["core.lobby"], card = false }
+overlays = ["core.toasts"]
+
+[room]
+top = { panels = ["core.header"] }
+right = { panels = ["core.members", "core.channels", "core.voice", "mods:*"], mode = "tabs", size = 240 }
+center = { panels = ["core.messages", "core.composer"] }
+overlays = ["core.toasts"]
+
+[panel."core.messages"]
+style = "compact"
+row = ["author", "text", "time"]
+time_format = "%-I:%M %p"
+group = true

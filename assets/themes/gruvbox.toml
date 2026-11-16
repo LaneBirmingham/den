@@ -1,0 +1,33 @@
+# Gruvbox: warm retro groove
+name = "gruvbox"
+dark = true
+# light sibling: gruvbox-light
+
+[colors]
+bg = "#282828"
+panel = "#1d2021"
+surface = "#3c3836"
+surface_hover = "#504945"
+border = "#3c3836"
+text = "#ebdbb2"
+muted = "#a89984"
+accent = "#d79921"
+accent_text = "#1d2021"
+ok = "#b8bb26"
+warn = "#fabd2f"
+danger = "#fb4934"
+speaking = "#b8bb26"
+link = "#83a598"
+mention = "#3d3527"
+
+[shape]
+rounding = 2
+spacing = 6
+padding = 10
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 17
+small_size = 12
+monospace = false

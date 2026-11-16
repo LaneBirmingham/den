@@ -1,0 +1,11 @@
+id = "example.greeter"
+name = "Greeter"
+version = "0.1.0"
+description = "Server-side: welcome people when they join"
+# Only the room server runs this, so every member doesn't greet everyone.
+runs_on = ["server"]
+
+[[hooks]]
+on = "member.joined"
+command = ["python3", "greet.py"]
+output = "send"

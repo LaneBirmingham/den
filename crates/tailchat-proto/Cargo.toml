@@ -1,0 +1,11 @@
+[package]
+name = "tailchat-proto"
+description = "Wire protocol for tailchat: framed JSON control messages and binary voice packets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

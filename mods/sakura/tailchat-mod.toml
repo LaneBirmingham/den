@@ -1,0 +1,9 @@
+id = "example.sakura"
+name = "Sakura"
+version = "0.1.0"
+description = "A soft pink theme and a centred single-column layout"
+runs_on = ["client"]
+
+# Pure reskin: no processes, just assets that show up in View → Theme / Layout.
+themes = ["sakura.toml"]
+layouts = ["focus.toml"]

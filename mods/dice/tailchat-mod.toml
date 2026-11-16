@@ -1,0 +1,20 @@
+id = "example.dice"
+name = "Dice"
+version = "0.1.0"
+description = "/roll dice and keep a tally panel"
+author = "tailchat examples"
+runs_on = ["client"]
+
+[[commands]]
+name = "roll"
+description = "Roll dice, e.g. /roll 2d6+1"
+usage = "[NdM[+K]]"
+command = ["python3", "dice.py", "roll"]
+output = "send"
+
+# Layouts place this with "example.dice/history" (or a mods: placeholder).
+[[panels]]
+id = "history"
+title = "Dice"
+slot = "right"
+command = ["python3", "dice.py", "panel"]
