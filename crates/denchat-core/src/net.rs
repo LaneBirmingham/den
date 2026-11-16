@@ -15,7 +15,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -79,6 +79,39 @@ pub fn invite_key(s: &str) -> anyhow::Result<SecretKey> {
     let bytes = BASE32_DNSSEC.decode(s.trim().to_ascii_lowercase().as_bytes()).context("bad invite key")?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("bad invite key length"))?;
     Ok(SecretKey::from_bytes(&arr))
+}
+
+/// Another process already uses this endpoint key: it's running with the
+/// same profile. Two endpoints with one id fight over the relay (it keeps
+/// only the newest) and over direct paths, so the first goes unreachable.
+#[derive(Debug, thiserror::Error)]
+#[error("Den is already running with this profile ({}); use that one, or set DEN_HOME to run another with its own profile", .dir.display())]
+pub struct AlreadyRunning {
+    pub dir: PathBuf,
+}
+
+/// Holds `<key>.lock` while it lives (the OS drops it if the process dies).
+#[derive(Debug)]
+pub struct KeyLock {
+    _file: std::fs::File,
+}
+
+/// Claim the endpoint key at `path` for this process.
+pub fn lock_key(path: &Path) -> anyhow::Result<KeyLock> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let lock = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .with_context(|| format!("opening {}", lock.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(KeyLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AlreadyRunning { dir: dir.to_path_buf() }.into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!("locking {}", lock.display()))),
+    }
 }
 
 /// Load a secret key from `path` (hex), creating it on first use.

@@ -26,5 +26,6 @@ serde_json.workspace = true
 chrono.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Leave the console window Windows opens when the app is started from Explorer.
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+# Leave the console window Windows opens when the app is started from Explorer,
+# and let an already-running app take the foreground.
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }

@@ -214,7 +214,13 @@ fn start_session(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<Strin
 fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, start: Start, terminal: bool) -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
     if !terminal {
-        let session = start_session(rt, paths, nick, "den-gui")?;
+        let session = match start_session(rt, paths, nick, "den-gui") {
+            Ok(s) => s,
+            Err(e) if e.downcast_ref::<denchat_core::net::AlreadyRunning>().is_some() => {
+                return rt.block_on(pass_to_running(paths, start)).map_err(|why| e.context(format!("{why:#}")));
+            }
+            Err(e) => return Err(e),
+        };
         #[cfg(windows)]
         detach_own_console();
         apply_start(&session, start);
@@ -272,6 +278,30 @@ fn detach_own_console() {
         tracing::debug!("started outside a shell; leaving the console");
         unsafe { FreeConsole() };
     }
+}
+
+/// The app is already running on this profile (double-clicked again, or
+/// `den join <link>` from a browser or shell): give it what this launch was
+/// for and bring its window forward, rather than starting a second copy.
+#[cfg(feature = "gui")]
+async fn pass_to_running(paths: &Paths, start: Start) -> anyhow::Result<()> {
+    let (mut api, info) = denchat_core::api::ApiClient::discover(paths, Some("client")).await?;
+    let (method, params) = match start {
+        Start::Lobby => ("api.ping", serde_json::json!({})),
+        Start::Host(o) => ("session.host", serde_json::json!({"name": o.name, "open": o.open})),
+        Start::Open(room) => ("rooms.open", serde_json::json!({"room": room})),
+        Start::Join(addr) => ("session.join", serde_json::json!({"addr": addr})),
+    };
+    api.call(method, params).await?;
+    // Windows only lets the foreground process hand the foreground on.
+    #[cfg(windows)]
+    if info.pid != 0 {
+        // SAFETY: plain Win32 call with a process id.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(info.pid) };
+    }
+    api.call("ui.raise", serde_json::json!({})).await?;
+    eprintln!("Den is already running (pid {}); passed this to it.", info.pid);
+    Ok(())
 }
 
 fn apply_start(session: &Session, start: Start) {

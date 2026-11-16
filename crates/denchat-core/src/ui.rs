@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use denchat_proto::NoticeLevel;
 use parking_lot::{Mutex, RwLock};
@@ -110,6 +110,7 @@ pub struct UiStore {
     revision: AtomicU64,
     next_toast: AtomicU64,
     screenshot: Mutex<Option<PathBuf>>,
+    raise: AtomicBool,
 }
 
 impl UiStore {
@@ -122,6 +123,17 @@ impl UiStore {
     /// Frontends call this each frame; returns a pending screenshot path once.
     pub fn take_screenshot_request(&self) -> Option<PathBuf> {
         self.screenshot.lock().take()
+    }
+
+    /// Ask the graphical frontend (if any) to bring its window to the front.
+    pub fn request_raise(&self) {
+        self.raise.store(true, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// Frontends call this each frame; true once per request.
+    pub fn take_raise_request(&self) -> bool {
+        self.raise.swap(false, Ordering::Relaxed)
     }
 
     pub fn revision(&self) -> u64 {

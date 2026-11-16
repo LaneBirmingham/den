@@ -364,6 +364,11 @@ impl eframe::App for DenApp {
             ctx.request_repaint_after(POLL);
         }
         self.keys(&ctx);
+        if self.session.ui().take_raise_request() {
+            // `den` started again on this profile: show this window instead.
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
         self.screenshots(&ctx);
 
         let session = self.session.clone();
