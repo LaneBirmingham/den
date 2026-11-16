@@ -1,23 +1,23 @@
 # Control API
 
-Every running tailchat — the app, the terminal client, a headless server —
+Every running Den — the app, the terminal client, a headless server —
 listens on a random **loopback** port for newline-delimited JSON. It's how
-mods, scripts and agents drive tailchat, and it exposes the same surface the
+mods, scripts and agents drive Den, and it exposes the same surface the
 built-in UI uses.
 
 ## Using it
 
 ```sh
-tailchat api api.methods                 # what this instance supports
-tailchat api state.get
-tailchat api message.send text="hi"      # key=value params (values parsed as JSON when possible)
-tailchat api input.submit '{"text":"/roll 2d6"}'
-tailchat api events.subscribe            # stream events until ^C
-tailchat api --list                      # running instances
-tailchat api --server state.get          # pick the headless server when both run
+den api api.methods                 # what this instance supports
+den api state.get
+den api message.send text="hi"      # key=value params (values parsed as JSON when possible)
+den api input.submit '{"text":"/roll 2d6"}'
+den api events.subscribe            # stream events until ^C
+den api --list                      # running instances
+den api --server state.get          # pick the headless server when both run
 ```
 
-`tailchat api` finds an instance via `$TAILCHAT_API`/`$TAILCHAT_API_TOKEN`
+`den api` finds an instance via `$DEN_API`/`$DEN_API_TOKEN`
 (set for mods), else `<state>/instances/<pid>.json` (newest first; stale files
 are pruned). Instance files are `0600` and contain the token.
 
@@ -73,7 +73,7 @@ the connection streams events. The token is compared in constant time.
 
 ## Server methods
 
-`tailchat serve` exposes: `state.get` (includes the room save), `members.list`, `channels.list`,
+`den serve` exposes: `state.get` (includes the room save), `members.list`, `channels.list`,
 `messages.list`, `message.send` (as the server), `notice.send`,
 `member.kick {id, reason?}`, `app.send`, `motd.set`, `mods.list`,
 `mods.reload`.

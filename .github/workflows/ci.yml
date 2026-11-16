@@ -23,4 +23,4 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Headless build
-        run: cargo build -p tailchat --no-default-features --locked
+        run: cargo build -p denchat --no-default-features --locked

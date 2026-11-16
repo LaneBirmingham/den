@@ -7,7 +7,7 @@ Exit code 1
             └───────┬───────────────┬──────────────┬────────┘
                     │ Rust calls    │              │ control API (JSON lines, loopback)
                     ▼               ▼              ▼
-              ┌──────────────── Session (tailchat-core) ────────────────┐
+              ┌──────────────── Session (denchat-core) ────────────────┐
               │ state · methods · events · UiStore · ModRuntime · voice │
               └───────┬─────────────────────────────────────┬───────────┘
                       │ iroh QUIC: frames + voice datagrams │ spawns
@@ -22,11 +22,11 @@ Exit code 1
 
 | Crate | Role | Depends on |
 | --- | --- | --- |
-| `tailchat-proto` | Message types, framing, voice packet format, codec negotiation | serde |
-| `tailchat-audio` | Devices, resampling, Opus/PCM codecs, VAD gate, jitter buffer + mixer | cpal, opus |
-| `tailchat-core` | Room server, client `Session`, P2P transport (`net`, iroh), mods, control API, UI store | proto, tokio, iroh, (audio) |
-| `tailchat-gui` | egui shell: layouts, themes, panel registry, built-in panels | core, eframe |
-| `tailchat` | The binary and its subcommands | core, (gui) |
+| `denchat-proto` | Message types, framing, voice packet format, codec negotiation | serde |
+| `denchat-audio` | Devices, resampling, Opus/PCM codecs, VAD gate, jitter buffer + mixer | cpal, opus |
+| `denchat-core` | Room server, client `Session`, P2P transport (`net`, iroh), mods, control API, UI store | proto, tokio, iroh, (audio) |
+| `denchat-gui` | egui shell: layouts, themes, panel registry, built-in panels | core, eframe |
+| `den` | The binary and its subcommands | core, (gui) |
 
 The GUI and audio are optional features, so a server build is just
 `tokio` + `serde` + `iroh` and cross-compiles anywhere.
@@ -36,14 +36,17 @@ The GUI and audio are optional features, so a server build is just
 Every process runs one iroh endpoint (`net::Net`): a QUIC socket named by an
 Ed25519 key (the *endpoint id*). Peers dial an id plus hints (a relay URL,
 direct `ip:port`s); iroh hole-punches and falls back to the relay, which only
-forwards encrypted packets. ALPN is `tailchat/3`.
+forwards encrypted packets. ALPN is `den/3`.
 
 * **Keys** — an app's endpoint key is `<data>/device.key`; `serve` uses
   `<data>/serve.key`, so an app and a server sharing a data folder are
   different peers. Relays: `[net] relays` = `["default"]` (iroh's public
-  relays), `[]` (direct only) or URLs; `TAILCHAT_RELAYS` overrides it. The
-  endpoint uses no DNS/pkarr discovery: links carry the addresses.
-* **Links** — `tailchat://<endpoint id>?room=<id>&invite=<key>&relay=<url>&ip=<addr>…`
+  relays), `[]` (direct only) or URLs; `DEN_RELAYS` overrides it.
+  `[net] port_mapping` (default `true`) lets iroh's port mapper ask the
+  router for a forwarded UDP port; `false` disables it and the router probe
+  behind `reach`. The endpoint uses no DNS/pkarr discovery: links carry the
+  addresses.
+* **Links** — `den://<endpoint id>?room=<id>&invite=<key>&relay=<url>&ip=<addr>…`
   (`net::Link`). Invite links carry the invite key; the addresses saved in
   rooms, sent in handoffs and shown in discovery leave it out.
 * **Routing** — one endpoint can host several rooms and join others. Each
@@ -57,7 +60,7 @@ forwards encrypted packets. ALPN is `tailchat/3`.
   the public URL (`[relay] url`, else `http://<public IP>:<port>` once
   address discovery finds it) wherever links are made. The other relays are
   then dropped. Members need no config: iroh dials through any relay named
-  in an address. `tailchat relay` runs the same relay alone. Every relay is
+  in an address. `den relay` runs the same relay alone. Every relay is
   gated: it admits only clients presenting its token (`relay::TokenGate`,
   derived from `<data>/relay.key`), which rides in the relay URL's
   `?token=` query, so links carry it and iroh sends it on connect without
@@ -68,7 +71,7 @@ forwards encrypted packets. ALPN is `tailchat/3`.
 
 ## The two modes are one server
 
-`tailchat host` and `tailchat serve` run the same `server::start`. Hosting
+`den host` and `den serve` run the same `server::start`. Hosting
 embeds it in the app and immediately joins it; `serve` wraps it in a
 `ServerNode` that adds server-side mods, an admin console and its own
 control API. An app hosts on its shared endpoint (any free UDP port by
@@ -175,7 +178,7 @@ There are no accounts. Each member holds an Ed25519 key per room
 (`rooms/<id>/member.key`, made on first join). On `hello` (and `claim`) the
 client sends `proof {key, sig, invite}`: signatures over
 `kind || 0 || exporter`, where the exporter is 32 bytes of TLS keying
-material from this QUIC connection (label `tailchat/3 proof`, context = room
+material from this QUIC connection (label `den/3 proof`, context = room
 id). A signature can't be replayed on another connection, and the host only
 ever sees public keys, so any member can host without learning anyone's
 secret.
@@ -195,7 +198,7 @@ What the host can still do: it relays everything, so a malicious host could
 drop or alter messages. Signing messages with member keys is the planned
 fix.
 
-## Wire protocol (`tailchat-proto`)
+## Wire protocol (`denchat-proto`)
 
 * **Control stream** — `u32` big-endian length + JSON body on one QUIC
   bidirectional stream. `ClientMsg` / `ServerMsg` are tagged enums
@@ -222,7 +225,7 @@ fix.
 
 ## Session: the only thing a frontend needs
 
-`tailchat_core::session::Session` is UI-agnostic:
+`denchat_core::session::Session` is UI-agnostic:
 
 1. **Read** `session.state()` → `SessionState` (connection, server info,
    channels, members, messages, focus, unread + mentions + "new since", voice
@@ -250,7 +253,7 @@ Mods fill panels with widgets (`heading`, `text`, `kv`, `list`, `progress`,
 Frontends render widgets however suits them; mods never draw pixels, so the
 same mod works in the GUI, a future TUI, or a web view.
 
-## The egui shell (`tailchat-gui`)
+## The egui shell (`denchat-gui`)
 
 * `Registry` maps panel ids to constructors. All built-ins (`core.*`) are
   registered exactly like a third-party Rust panel would be; `run_with`
@@ -268,16 +271,16 @@ same mod works in the GUI, a future TUI, or a web view.
 
 ## Mods
 
-A mod is a folder with `tailchat-mod.toml`. tailchat runs its commands as
-child processes with `TAILCHAT_*` env vars, feeds hook events on stdin, and
+A mod is a folder with `den-mod.toml`. Den runs its commands as
+child processes with `DEN_*` env vars, feeds hook events on stdin, and
 routes stdout (`send` to chat, `notice` as a toast, or `none`). Mods call
-back through `$TAILCHAT_BIN api …`. Mods can ship themes and layouts.
+back through `$DEN_BIN api …`. Mods can ship themes and layouts.
 `runs_on` decides client vs server. See [MODS.md](MODS.md).
 
 ## Writing another frontend
 
-Either link `tailchat-core` and drive a `Session` directly (Rust), or start
-any tailchat instance and use the control API from any language:
+Either link `denchat-core` and drive a `Session` directly (Rust), or start
+any Den instance and use the control API from any language:
 `state.get` + `events.subscribe` to render, `input.submit` / `voice.*` /
-`ui.action` to act. `tailchat chat` (≈150 lines, `crates/tailchat/src/term.rs`)
+`ui.action` to act. `den chat` (≈150 lines, `crates/denchat/src/term.rs`)
 is a complete example.

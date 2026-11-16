@@ -1,6 +1,6 @@
 # Example mods
 
-Each folder is a self-contained mod: a `tailchat-mod.toml` manifest plus
+Each folder is a self-contained mod: a `den-mod.toml` manifest plus
 whatever scripts it runs. Mods can be written in any language; these use
 Python 3 so they run on macOS, Linux and Windows unchanged.
 
@@ -14,9 +14,9 @@ Python 3 so they run on macOS, Linux and Windows unchanged.
 Try one without installing it:
 
 ```sh
-tailchat mods link ./mods/dice        # or: TAILCHAT_MODS_PATH=./mods tailchat
-tailchat mods list
+den mods link ./mods/dice        # or: DEN_MODS_PATH=./mods den
+den mods list
 ```
 
 The app picks up linked mods on start, or immediately via *View → Reload mods*
-(`tailchat api mods.reload` also works). See [docs/MODS.md](../docs/MODS.md).
+(`den api mods.reload` also works). See [docs/MODS.md](../docs/MODS.md).

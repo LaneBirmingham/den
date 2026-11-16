@@ -41,7 +41,7 @@ after a crash is a button, not automatic.
 * **Rooms remember their relay.** A room hosted by `serve` uses its relay;
   when an app hosts the room instead, it falls back to its own `[net]
   relays` (n0 by default). Saving the room's relay in the save would keep a
-  room on a standalone `tailchat relay` without per-host config.
+  room on a standalone `den relay` without per-host config.
 * **Relay access per member.** Relays admit only apps with their token,
   which travels in invite links, so anyone with a link (or a saved room)
   can relay through them, and the token can only change for everyone at
@@ -59,6 +59,6 @@ after a crash is a button, not automatic.
 
 * **A phone client.** A browser client was built and then removed (Nov 2026):
   browsers only allow the microphone on HTTPS pages, which made self-hosting
-  fiddly. When phones matter, build a native app on `tailchat-core`'s
+  fiddly. When phones matter, build a native app on `denchat-core`'s
   protocol instead.
 * Screen share and file transfer.

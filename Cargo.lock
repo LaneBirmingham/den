@@ -969,6 +969,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "denchat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "denchat-core",
+ "denchat-gui",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "denchat-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "crossbeam-channel",
+ "denchat-proto",
+ "opus",
+ "parking_lot",
+ "tracing",
+]
+
+[[package]]
+name = "denchat-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "data-encoding",
+ "denchat-audio",
+ "denchat-proto",
+ "directories",
+ "iroh",
+ "iroh-relay",
+ "parking_lot",
+ "portmapper",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "denchat-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "denchat-core",
+ "eframe",
+ "egui",
+ "parking_lot",
+ "png",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "denchat-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "der"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4968,84 +5046,6 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "tailchat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "serde_json",
- "tailchat-core",
- "tailchat-gui",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tailchat-audio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "crossbeam-channel",
- "opus",
- "parking_lot",
- "tailchat-proto",
- "tracing",
-]
-
-[[package]]
-name = "tailchat-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chrono",
- "data-encoding",
- "directories",
- "iroh",
- "iroh-relay",
- "parking_lot",
- "portmapper",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "tailchat-audio",
- "tailchat-proto",
- "thiserror 2.0.21",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "tailchat-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "eframe",
- "egui",
- "parking_lot",
- "png",
- "serde",
- "serde_json",
- "tailchat-core",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "tailchat-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]

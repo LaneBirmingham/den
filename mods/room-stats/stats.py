@@ -2,12 +2,12 @@
 """Long-running mod: stream events from the control API and keep a panel fresh.
 
 Same pattern any external tool (or AI agent) can use:
-  tailchat api events.subscribe '{"events": ["message.*"]}'   -> JSON lines
-  tailchat api ui.panel.set '{"panel": "...", "widgets": [...]}'
+  den api events.subscribe '{"events": ["message.*"]}'   -> JSON lines
+  den api ui.panel.set '{"panel": "...", "widgets": [...]}'
 """
 import collections, json, os, subprocess
 
-EXE = os.environ["TAILCHAT_BIN"]
+EXE = os.environ["DEN_BIN"]
 PANEL = "example.stats/top"
 counts = collections.Counter()
 

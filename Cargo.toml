@@ -1,20 +1,20 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-default-members = ["crates/tailchat"]
+default-members = ["crates/denchat"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://gitea.birmosserver.com/BobLobster/tail-chat"
+repository = "https://gitea.birmosserver.com/BobLobster/den"
 rust-version = "1.91"
 
 [workspace.dependencies]
-tailchat-proto = { path = "crates/tailchat-proto" }
-tailchat-core = { path = "crates/tailchat-core" }
-tailchat-audio = { path = "crates/tailchat-audio" }
-tailchat-gui = { path = "crates/tailchat-gui" }
+denchat-proto = { path = "crates/denchat-proto" }
+denchat-core = { path = "crates/denchat-core" }
+denchat-audio = { path = "crates/denchat-audio" }
+denchat-gui = { path = "crates/denchat-gui" }
 
 anyhow = "1"
 thiserror = "2"

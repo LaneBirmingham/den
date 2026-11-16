@@ -1,4 +1,4 @@
-# tailchat layout. Copy into <config>/layouts/ (run `tailchat config init`)
+# Den layout. Copy into <config>/layouts/ (run `den config init`)
 # and edit: the app hot-reloads on save.
 #
 # A layout has two screens: `lobby` (not in a room) and `room`.

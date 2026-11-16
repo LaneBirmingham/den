@@ -1,13 +1,13 @@
 # A persistent room. It prints its invite link on start:
 #
 #   docker compose -f deploy/docker-compose.yml up -d
-#   docker compose -f deploy/docker-compose.yml logs tailchat | grep "join with"
-#   docker compose -f deploy/docker-compose.yml exec tailchat tailchat api --server state.get
+#   docker compose -f deploy/docker-compose.yml logs den | grep "join with"
+#   docker compose -f deploy/docker-compose.yml exec den den api --server state.get
 #
 # Forward UDP 8245 (the room) and TCP 8245 (its relay) on your router. With a
 # dynamic IP, add `"--relay-url", "box.example.com:8245"` (a DDNS name).
 services:
-  tailchat:
+  den:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -16,7 +16,7 @@ services:
       - "8245:8245/tcp"
     volumes:
       - data:/data                    # config, endpoint key, saved room, mods
-    command: ["serve", "--no-console", "--name", "tailchat"]
+    command: ["serve", "--no-console", "--name", "den"]
     restart: unless-stopped
 
 volumes:

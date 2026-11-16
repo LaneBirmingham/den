@@ -1,20 +1,20 @@
 # Running a persistent room
 
-`tailchat serve` is the headless mode: no GUI, no audio libraries, the room
+`den serve` is the headless mode: no GUI, no audio libraries, the room
 saved on disk, server-side mods, an admin console on stdin and a control API
-for scripts (`tailchat api --server …`). Build it with:
+for scripts (`den api --server …`). Build it with:
 
 ```sh
-cargo build --release -p tailchat --no-default-features
+cargo build --release -p denchat --no-default-features
 ```
 
 | Option | File | Notes |
 | --- | --- | --- |
-| systemd | [`tailchat.service`](tailchat.service) | `--no-console` because stdin isn't a terminal; the invite link is in the journal |
+| systemd | [`den.service`](den.service) | `--no-console` because stdin isn't a terminal; the invite link is in the journal |
 | Docker | [`docker-compose.yml`](docker-compose.yml), [`Dockerfile`](Dockerfile) | publishes UDP 8245; the invite link is in the container log |
-| By hand | — | `tailchat serve` in `tmux`/`screen` gives you the admin console |
+| By hand | — | `den serve` in `tmux`/`screen` gives you the admin console |
 
-Settings: `tailchat serve --write-config` writes `server.toml` (name, motd,
+Settings: `den serve --write-config` writes `server.toml` (name, motd,
 channels, history limit, `allow` list of member keys, max members, rate
 limit, `bind`, `port`, `[net] relays`). Command-line flags override it.
 
@@ -46,7 +46,7 @@ keys themselves.
 Its endpoint key is `data/serve.key`: keep it, and the room's address stays
 the same across restarts.
 
-**Rooms without a server.** `tailchat relay` runs just a relay (TCP 3340 by
+**Rooms without a server.** `den relay` runs just a relay (TCP 3340 by
 default) on any machine with a forwarded port. Whoever hosts a room from the
 app adds the URL it prints, token included
 (`[net] relays = ["http://box.example.com:3340/?token=…"]`), to `config.toml`;
@@ -65,13 +65,13 @@ and enforced by whoever hosts it, so flags you pass once stay in force:
 | `--open` | clear the allow list first; add `--allow` after it to set a new one |
 | (none) | keep what's saved |
 
-Locked yourself out? `tailchat serve --room <id> --open`. Refused joins are
+Locked yourself out? `den serve --room <id> --open`. Refused joins are
 logged with the peer's key.
 
 Which room it hosts:
 
 * default: the saved room named like `server.toml`'s `name`, created on the
-  first run (in `$TAILCHAT_HOME/data/rooms/<id>/`);
+  first run (in `$DEN_HOME/data/rooms/<id>/`);
 * `--room <id|name>`: a saved room, e.g. a folder copied from a member's
   `data/rooms/`; its name, channels and join rules win over `server.toml`;
 * `--adopt '<invite link>'`: the room that link points at, hosted by
@@ -90,9 +90,9 @@ from it too.
 Admin from the same machine:
 
 ```sh
-tailchat api --server state.get
-tailchat api --server message.send text="restarting in 5 minutes"
-tailchat api --server member.kick id=3 reason="be nice"
+den api --server state.get
+den api --server message.send text="restarting in 5 minutes"
+den api --server member.kick id=3 reason="be nice"
 ```
 
-Server-side mods (`runs_on = ["server"]`) go in `$TAILCHAT_HOME/config/mods/`.
+Server-side mods (`runs_on = ["server"]`) go in `$DEN_HOME/config/mods/`.

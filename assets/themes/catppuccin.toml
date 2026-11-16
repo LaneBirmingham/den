@@ -1,4 +1,4 @@
-# tailchat theme. Copy this file into <config>/themes/ (run `tailchat config init`)
+# Den theme. Copy this file into <config>/themes/ (run `den config init`)
 # and edit it: the app hot-reloads on save. Every key is optional.
 # Catppuccin Mocha: soothing pastels on a deep base
 name = "catppuccin"

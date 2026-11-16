@@ -1,0 +1,30 @@
+[package]
+name = "denchat-core"
+description = "UI-agnostic engine for Den: room server, client session, peer-to-peer networking (iroh), control API and mods"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+voice = ["dep:denchat-audio"]
+
+[dependencies]
+denchat-proto.workspace = true
+denchat-audio = { workspace = true, optional = true }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+directories.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+chrono.workspace = true
+iroh.workspace = true
+iroh-relay.workspace = true
+data-encoding.workspace = true
+portmapper.workspace = true
+bytes.workspace = true
