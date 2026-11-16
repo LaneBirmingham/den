@@ -194,7 +194,35 @@ fn init_logging(verbose: u8, quiet_default: bool) {
         _ => "debug",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("DEN_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(stderr_colors()).try_init();
+}
+
+/// Colour log lines only on a terminal that shows colour: not in a file or
+/// pipe (escape codes end up in the text), nor in a Windows console that
+/// won't turn on escape sequences. `NO_COLOR` turns colour off.
+fn stderr_colors() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetConsoleMode,
+        };
+        // SAFETY: plain console calls on this process's own stderr handle.
+        unsafe {
+            let h = GetStdHandle(STD_ERROR_HANDLE);
+            let mut mode = 0;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                // A terminal that isn't a console (mintty, MSYS): it speaks ANSI.
+                return true;
+            }
+            mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 pub fn load_config(paths: &Paths, nick: Option<String>) -> anyhow::Result<AppConfig> {
@@ -214,7 +242,15 @@ fn start_session(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<Strin
 fn run_app(rt: &tokio::runtime::Runtime, paths: &Paths, nick: Option<String>, start: Start, terminal: bool) -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
     if !terminal {
-        let session = start_session(rt, paths, nick, "den-gui")?;
+        let session = match start_session(rt, paths, nick, "den-gui") {
+            Ok(s) => s,
+            Err(e) if e.downcast_ref::<denchat_core::net::AlreadyRunning>().is_some() => {
+                return rt.block_on(pass_to_running(paths, start)).map_err(|why| e.context(format!("{why:#}")));
+            }
+            Err(e) => return Err(e),
+        };
+        #[cfg(windows)]
+        detach_own_console();
         apply_start(&session, start);
         close_on_signal(rt, &session);
         let res = {
@@ -253,6 +289,47 @@ fn close_on_signal(rt: &tokio::runtime::Runtime, session: &Session) {
         session.close().await;
         std::process::exit(0);
     });
+}
+
+/// `den` is a console program (so `den api`, `den config` … print in a
+/// shell), which makes Windows open a console window when the app is started
+/// from Explorer or a shortcut. If that console is ours alone (no shell is
+/// attached to it), let it go: the window disappears and the app runs like
+/// any other. Started from a shell, the console stays, with its logs.
+#[cfg(all(windows, feature = "gui"))]
+fn detach_own_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut pids = [0u32; 2];
+    // SAFETY: the buffer is valid for `pids.len()` entries; both calls only act on this process.
+    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
+    if attached == 1 {
+        tracing::debug!("started outside a shell; leaving the console");
+        unsafe { FreeConsole() };
+    }
+}
+
+/// The app is already running on this profile (double-clicked again, or
+/// `den join <link>` from a browser or shell): give it what this launch was
+/// for and bring its window forward, rather than starting a second copy.
+#[cfg(feature = "gui")]
+async fn pass_to_running(paths: &Paths, start: Start) -> anyhow::Result<()> {
+    let (mut api, info) = denchat_core::api::ApiClient::discover(paths, Some("client")).await?;
+    let (method, params) = match start {
+        Start::Lobby => ("api.ping", serde_json::json!({})),
+        Start::Host(o) => ("session.host", serde_json::json!({"name": o.name, "open": o.open})),
+        Start::Open(room) => ("rooms.open", serde_json::json!({"room": room})),
+        Start::Join(addr) => ("session.join", serde_json::json!({"addr": addr})),
+    };
+    api.call(method, params).await?;
+    // Windows only lets the foreground process hand the foreground on.
+    #[cfg(windows)]
+    if info.pid != 0 {
+        // SAFETY: plain Win32 call with a process id.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(info.pid) };
+    }
+    api.call("ui.raise", serde_json::json!({})).await?;
+    eprintln!("Den is already running (pid {}); passed this to it.", info.pid);
+    Ok(())
 }
 
 fn apply_start(session: &Session, start: Start) {

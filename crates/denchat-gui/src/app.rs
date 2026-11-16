@@ -364,6 +364,11 @@ impl eframe::App for DenApp {
             ctx.request_repaint_after(POLL);
         }
         self.keys(&ctx);
+        if self.session.ui().take_raise_request() {
+            // `den` started again on this profile: show this window instead.
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
         self.screenshots(&ctx);
 
         let session = self.session.clone();
@@ -570,10 +575,12 @@ impl Render<'_> {
         let full = ui.max_rect();
         let cards = self.layout.shell.style == ShellStyle::Cards;
         let g = self.layout.shell.gap.clamp(0.0, 40.0) as i8;
+        let shown = |name| screen.slot(name).is_some_and(|s| s.visible && !plan.slot(name).is_empty());
+        let (side_max, drop_right) = side_widths(full.width(), shown(SlotName::Left), shown(SlotName::Right));
         for name in [SlotName::Top, SlotName::Bottom, SlotName::Left, SlotName::Right] {
             let Some(slot) = screen.slot(name) else { continue };
             let ids = plan.slot(name);
-            if ids.is_empty() || !slot.visible {
+            if ids.is_empty() || !slot.visible || (name == SlotName::Right && drop_right) {
                 continue;
             }
             let id = ("slot", name.as_str());
@@ -604,7 +611,7 @@ impl Render<'_> {
                 panel = panel.default_size(220.0);
             }
             if !name.horizontal() {
-                panel = panel.size_range(120.0..=640.0);
+                panel = panel.size_range(SIDE_MIN..=side_max);
             }
             let carded = cards && slot.card.unwrap_or(true);
             panel.show(ui, |ui| {
@@ -814,6 +821,22 @@ fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()
     Ok(())
 }
 
+/// Narrowest a left/right slot gets, and the width the centre keeps.
+const SIDE_MIN: f32 = 120.0;
+const SIDE_MAX: f32 = 640.0;
+const CENTER_MIN: f32 = 320.0;
+
+/// How wide side slots may be in a window `width` points wide, and whether
+/// the right one must step aside. Display scaling makes windows narrow in
+/// points (a half-screen window at 150-200% is ~500-650), and fixed sides
+/// would squeeze the chat to nothing.
+fn side_widths(width: f32, left: bool, right: bool) -> (f32, bool) {
+    let room = (width - CENTER_MIN).max(0.0);
+    let drop_right = left && right && room < 2.0 * SIDE_MIN;
+    let sides = (left as u8 + (right && !drop_right) as u8).max(1);
+    ((room / f32::from(sides)).clamp(SIDE_MIN, SIDE_MAX), drop_right)
+}
+
 fn mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
@@ -835,4 +858,22 @@ fn open_path(p: &std::path::Path) -> std::io::Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = std::process::Command::new("xdg-open");
     cmd.arg(p).spawn().map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::side_widths;
+
+    #[test]
+    fn sides_give_way_to_the_centre() {
+        // Roomy: sides keep their layout sizes (up to the cap).
+        assert_eq!(side_widths(1100.0, true, true), (390.0, false));
+        assert_eq!(side_widths(3000.0, true, true), (640.0, false));
+        // 1100 px at 200%: both sides shrink...
+        assert_eq!(side_widths(800.0, true, true), (240.0, false));
+        // ...and when both can't fit beside the centre, the right one goes.
+        assert_eq!(side_widths(550.0, true, true), (230.0, true));
+        assert_eq!(side_widths(480.0, true, false), (160.0, false));
+        assert_eq!(side_widths(300.0, true, true), (120.0, true));
+    }
 }

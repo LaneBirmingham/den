@@ -37,6 +37,8 @@ pub struct NodeOptions {
 }
 
 struct NodeInner {
+    /// Our endpoint key; released once the endpoint is closed.
+    key_lock: Mutex<Option<net::KeyLock>>,
     server: ServerHandle,
     save: RoomSave,
     /// Where the room was being hosted when we took it back.
@@ -63,6 +65,7 @@ impl ServerNode {
     pub async fn start(cfg: ServerConfig, mut save: RoomSave, paths: Paths, opts: NodeOptions) -> anyhow::Result<ServerNode> {
         // Its own endpoint key, so an app on the same machine (same data
         // dir) is a different peer.
+        let key_lock = net::lock_key(&paths.data.join("serve.key"))?;
         let key = net::load_or_create_key(&paths.data.join("serve.key"))?;
         let relay = match cfg.relay.enabled {
             true => {
@@ -116,6 +119,7 @@ impl ServerNode {
         }
         let (events, _) = broadcast::channel(1024);
         let inner = Arc::new(NodeInner {
+            key_lock: Mutex::new(Some(key_lock)),
             server: server.clone(),
             save,
             claimed_from,
@@ -257,6 +261,7 @@ impl ServerNode {
         }
         self.stop();
         self.inner.server.net().close().await;
+        self.inner.key_lock.lock().take();
         let relay = self.inner.relay.lock().take();
         if let Some(r) = relay {
             r.shutdown().await;
@@ -276,9 +281,11 @@ impl ServerNode {
         self.stop();
         let net = self.inner.server.net().clone();
         let relay = self.inner.relay.lock().take();
+        let key_lock = self.inner.key_lock.lock().take();
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
                 net.close().await;
+                drop(key_lock);
                 if let Some(r) = relay {
                     r.shutdown().await;
                 }

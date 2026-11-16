@@ -54,4 +54,4 @@ the GUI exists (`den serve` and `den chat` have none).
   servers on loopback; use `bind: "localhost"` and `NetConfig::direct_only()`
   (see the `session` and `test_net` helpers) so tests never touch relays.
 * Visual check: `DEN_HOME=$(mktemp -d) DEN_SCREENSHOT=/tmp/x.png
-  DEN_SCREENSHOT_EXIT=1 cargo run -- host --bind localhost`.
+  DEN_SCREENSHOT_EXIT=1 cargo run -- host`. What agents can and can't test in the background, and what blocked it: [docs/AGENT-TESTING.md](docs/AGENT-TESTING.md).

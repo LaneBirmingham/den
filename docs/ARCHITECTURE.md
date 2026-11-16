@@ -40,7 +40,10 @@ forwards encrypted packets. ALPN is `den/3`.
 
 * **Keys** — an app's endpoint key is `<data>/device.key`; `serve` uses
   `<data>/serve.key`, so an app and a server sharing a data folder are
-  different peers. Relays: `[net] relays` = `["default"]` (iroh's public
+  different peers. Each key is held by one process at a time (`<key>.lock`,
+  `net::lock_key`): a second app on the same profile passes its launch
+  (join, host, open) to the running one over the control API and exits.
+  Relays: `[net] relays` = `["default"]` (iroh's public
   relays), `[]` (direct only) or URLs; `DEN_RELAYS` overrides it.
   `[net] port_mapping` (default `true`) lets iroh's port mapper ask the
   router for a forwarded UDP port; `false` disables it and the router probe

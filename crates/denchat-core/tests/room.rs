@@ -77,6 +77,21 @@ async fn session(name: &str, home: &std::path::Path) -> Session {
     Session::start(SessionOptions { paths: Paths::under(home), config, client_name: "test".into() }).await.unwrap()
 }
 
+/// One process per profile: a second session on the same data folder would
+/// share the endpoint key, and the relay keeps only the newest of the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_session_per_profile() {
+    let home = tmp("profile-lock");
+    let alice = session("alice", &home).await;
+    let config = AppConfig { net: NetConfig::direct_only(), ..AppConfig::default() };
+    let second = Session::start(SessionOptions { paths: Paths::under(&home), config: config.clone(), client_name: "test".into() }).await;
+    let err = second.err().expect("second session on one profile");
+    assert!(err.downcast_ref::<net::AlreadyRunning>().is_some(), "{err:#}");
+    // Free again once the first has closed.
+    alice.close().await;
+    Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap().shutdown();
+}
+
 async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     for _ in 0..400 {
         if cond() {
@@ -102,6 +117,9 @@ async fn chat_between_two_sessions() {
     bob.join(&addr);
     wait_for("both connected", || alice.state().conn.is_connected() && bob.state().conn.is_connected()).await;
     wait_for("alice sees bob", || alice.state().members.len() == 2).await;
+    // The first ping reports how the link travels: loopback with no relays is direct.
+    wait_for("route known", || bob.state().latency_ms.is_some()).await;
+    assert_eq!(bob.state().via, Some(net::Via::Direct));
     assert_eq!(alice.state().server.as_ref().unwrap().name, "test room");
     assert_eq!(alice.state().focus.as_deref(), Some("general"));
 

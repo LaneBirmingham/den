@@ -198,6 +198,8 @@ pub struct SessionState {
     pub new_since: HashMap<ChannelId, i64>,
     pub voice: VoiceView,
     pub latency_ms: Option<u32>,
+    /// Whether our connection to the host is direct or relayed (updated with `latency_ms`).
+    pub via: Option<net::Via>,
     /// Our network endpoint, once it's up.
     pub net: Option<NetView>,
     pub discovery: DiscoveryView,
@@ -224,6 +226,7 @@ impl SessionState {
             new_since: HashMap::new(),
             voice: VoiceView::default(),
             latency_ms: None,
+            via: None,
             net: None,
             discovery: DiscoveryView::default(),
             rooms: Vec::new(),
@@ -364,6 +367,8 @@ struct ConnSlot {
 type Listener = Arc<dyn Fn() + Send + Sync>;
 
 struct Inner {
+    /// This profile's endpoint key is ours until the session closes.
+    key_lock: Mutex<Option<net::KeyLock>>,
     rt: Handle,
     paths: Paths,
     client_name: String,
@@ -419,7 +424,9 @@ impl Session {
         state.voice.mode = opts.config.voice.mode.clone();
         let (events, _) = broadcast::channel(1024);
         let modules = opts.config.modules.clone();
+        let key_lock = net::lock_key(&opts.paths.data.join("device.key"))?;
         let inner = Arc::new(Inner {
+            key_lock: Mutex::new(Some(key_lock)),
             rt: Handle::current(),
             paths: opts.paths.clone(),
             client_name: opts.client_name,
@@ -690,6 +697,7 @@ impl Session {
             s.voice.channel = None;
             s.voice.joined_at = None;
             s.latency_ms = None;
+            s.via = None;
         });
         self.inner.emit(names::CONNECTION_CHANGED, json!({"state": "idle"}));
         self.inner.emit(names::HOSTING_CHANGED, json!({"hosting": null}));
@@ -1082,6 +1090,7 @@ impl Session {
                 if let Some(net) = me.inner.net.get() {
                     net.close().await;
                 }
+                me.inner.key_lock.lock().take();
             })
             .await;
     }
@@ -1719,6 +1728,7 @@ impl Inner {
             s.voice.channel = None;
             s.voice.joined_at = None;
             s.latency_ms = None;
+            s.via = None;
         });
     }
 
@@ -1920,7 +1930,11 @@ impl Inner {
                     && n == nonce
                 {
                     let ms = at.elapsed().as_millis().min(u32::MAX as u128) as u32;
-                    self.update(|s| s.latency_ms = Some(ms));
+                    let via = self.conn.lock().link.as_ref().and_then(net::Via::of);
+                    self.update(|s| {
+                        s.latency_ms = Some(ms);
+                        s.via = via;
+                    });
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::ProbeInfo { .. } | ServerMsg::Bye { .. } | ServerMsg::Handoff { .. } => {}
@@ -2170,6 +2184,7 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("ui.theme.set", "{name}", "Switch theme (desktop app follows within a second)"),
     doc("ui.layout.set", "{name}", "Switch layout (desktop app follows within a second)"),
     doc("ui.screenshot", "{path?}", "Save a PNG of the app window; returns the path it will be written to"),
+    doc("ui.raise", "{}", "Bring the app window to the front"),
     doc("mods.list", "{}", "Installed mods and their status"),
     doc("mods.run", "{command, args?}", "Run a mod slash command"),
     doc("mods.reload", "{}", "Rescan mods and restart their processes"),
@@ -2313,6 +2328,11 @@ impl ApiHandler for SessionApi {
                 s.ui().request_screenshot(path.clone());
                 s.inner.changed();
                 ok(json!({"path": path, "queued": true, "note": "written by the desktop app on its next frame; poll for the file"}))
+            }
+            "ui.raise" => {
+                s.ui().request_raise();
+                s.inner.changed();
+                ok(json!({"queued": true}))
             }
             "ui.action" => require_str(&p, "panel").and_then(|panel| {
                 let action = require_str(&p, "action")?;

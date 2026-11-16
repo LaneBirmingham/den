@@ -15,7 +15,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -79,6 +79,39 @@ pub fn invite_key(s: &str) -> anyhow::Result<SecretKey> {
     let bytes = BASE32_DNSSEC.decode(s.trim().to_ascii_lowercase().as_bytes()).context("bad invite key")?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("bad invite key length"))?;
     Ok(SecretKey::from_bytes(&arr))
+}
+
+/// Another process already uses this endpoint key: it's running with the
+/// same profile. Two endpoints with one id fight over the relay (it keeps
+/// only the newest) and over direct paths, so the first goes unreachable.
+#[derive(Debug, thiserror::Error)]
+#[error("Den is already running with this profile ({}); use that one, or set DEN_HOME to run another with its own profile", .dir.display())]
+pub struct AlreadyRunning {
+    pub dir: PathBuf,
+}
+
+/// Holds `<key>.lock` while it lives (the OS drops it if the process dies).
+#[derive(Debug)]
+pub struct KeyLock {
+    _file: std::fs::File,
+}
+
+/// Claim the endpoint key at `path` for this process.
+pub fn lock_key(path: &Path) -> anyhow::Result<KeyLock> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let lock = path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .with_context(|| format!("opening {}", lock.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(KeyLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AlreadyRunning { dir: dir.to_path_buf() }.into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::new(e).context(format!("locking {}", lock.display()))),
+    }
 }
 
 /// Load a secret key from `path` (hex), creating it on first use.
@@ -464,6 +497,32 @@ pub fn bind_ip(spec: &str) -> anyhow::Result<Option<IpAddr>> {
         "localhost" | "loopback" => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         other => Some(other.parse().with_context(|| format!("bind must be all, localhost or an IP, got {other:?}"))?),
     })
+}
+
+/// How a connection's packets travel right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// Straight between the two machines (LAN, hole-punched, or a public address).
+    Direct,
+    /// Forwarded by a relay: something (often a firewall) stops a direct path.
+    Relay,
+}
+
+impl Via {
+    /// The path `conn` sends on now, if it has one.
+    pub fn of(conn: &Connection) -> Option<Via> {
+        let paths = conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        Some(if selected.is_relay() { Via::Relay } else { Via::Direct })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::Direct => "direct",
+            Via::Relay => "relay",
+        }
+    }
 }
 
 impl Net {

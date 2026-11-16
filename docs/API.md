@@ -39,7 +39,7 @@ the connection streams events. The token is compared in constant time.
 
 | Method | Params | |
 | --- | --- | --- |
-| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away |
+| `state.get` | | connection, room, members, channels, voice, focus, discovery; `hosting` (what you host) and `is_host` (you host the room you're in); `conn.refused` on a failed connection the host turned away; `latency_ms` and `via` (`direct` or `relay`: how the link to the host travels) |
 | `messages.list` | `channel?, limit?` | recent messages (default: focused channel) |
 | `message.send` | `text, channel?` | send plain text |
 | `input.submit` | `text, channel?` | as if typed: slash commands work |
@@ -56,6 +56,7 @@ the connection streams events. The token is compared in constant time.
 | `ui.action` | `panel, action, value?` | emit a `ui.action` event |
 | `ui.theme.set` / `ui.layout.set` | `name` | switch look; the app follows within a second |
 | `ui.screenshot` | `path?` | PNG of the app window (GUI only). Written on the next frame the window draws; with the display off or the window hidden the OS may not draw one, and the file never appears |
+| `ui.raise` | | bring the app window to the front (GUI only; a second `den`/`den join` on the same profile uses it) |
 | `mods.list` / `mods.reload` | | |
 | `mods.run` | `command, args?` | run a mod command |
 | `session.host` | `name?, open?` | host a new room (invite-only unless `open`) |
