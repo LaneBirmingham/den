@@ -209,6 +209,12 @@ pub struct NetConfig {
     /// to never open ports on the router (connections then hole-punch, or go
     /// through a relay).
     pub port_mapping: bool,
+    /// Use direct (IP) paths. `false` makes this endpoint relay-only: it
+    /// opens no UDP sockets, advertises no addresses and every connection
+    /// goes through a relay (one side being relay-only is enough), so a
+    /// relayed link can be tested on demand. Needs a relay. The
+    /// `DEN_NO_DIRECT=1` environment variable does the same.
+    pub direct: bool,
     /// Relays added by the program (a server's own relay), kept whatever
     /// `DEN_RELAYS` says.
     #[serde(skip)]
@@ -217,7 +223,7 @@ pub struct NetConfig {
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig { relays: vec!["default".into()], port_mapping: true, extra_relays: Vec::new() }
+        NetConfig { relays: vec!["default".into()], port_mapping: true, direct: true, extra_relays: Vec::new() }
     }
 }
 
@@ -231,6 +237,14 @@ impl NetConfig {
     /// Just these relays.
     pub fn relays(urls: impl IntoIterator<Item = String>) -> NetConfig {
         NetConfig { relays: urls.into_iter().collect(), ..NetConfig::default() }
+    }
+
+    /// Direct paths are on: `direct`, unless `DEN_NO_DIRECT` is set (to
+    /// anything but `0`, `false`, `no` or `off`).
+    pub fn direct_enabled(&self) -> bool {
+        let off = std::env::var("DEN_NO_DIRECT")
+            .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"));
+        self.direct && !off
     }
 
     /// The relay list after applying `DEN_RELAYS`, plus `extra_relays`.

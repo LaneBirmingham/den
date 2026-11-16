@@ -976,3 +976,65 @@ async fn voice_between_two_sessions_on_test_devices() {
     bob.shutdown();
     srv.shutdown();
 }
+
+/// `[net] direct = false` (or `DEN_NO_DIRECT`): a relay-only endpoint opens
+/// no UDP sockets, so its links go through the relay whatever the other side
+/// does. One side switched off is enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_only_links_go_through_the_relay() {
+    let home = tmp("relay-only");
+    let relay = denchat_core::relay::LocalRelay::start(Some("127.0.0.1".parse().unwrap()), 0, "relay-only-test".into()).await.unwrap();
+    let url = relay.local_url.to_string();
+    let start = |nick: &str, direct: bool| {
+        let config = AppConfig {
+            nick: Some(nick.into()),
+            bind: "localhost".into(),
+            // Only the loopback relay: never the public ones.
+            net: NetConfig { direct, port_mapping: false, ..NetConfig::relays([url.clone()]) },
+            ..AppConfig::default()
+        };
+        Session::start(SessionOptions { paths: Paths::under(&home.join(nick)), config, client_name: "test".into() })
+    };
+    let routed = |s: &Session| s.state().conn.is_connected() && s.state().latency_ms.is_some();
+
+    // Alice hosts relay-only: her invite carries no address, and even her own
+    // app reaches the room through the relay.
+    let alice = start("alice", false).await.unwrap();
+    let invite = host(&alice, "relayed").await;
+    assert_eq!(Link::parse(&invite).unwrap().addr.ip_addrs().count(), 0, "no direct address advertised: {invite}");
+    assert!(alice.state().net.as_ref().is_some_and(|n| n.direct.is_empty() && n.reach == Reach::Strict));
+    // Bob has direct paths on, but nothing to take them to.
+    let bob = start("bob", true).await.unwrap();
+    bob.join(&invite);
+    wait_for("bob routed", || routed(&bob)).await;
+    assert_eq!(bob.state().via, Some(net::Via::Relay));
+    wait_for("alice routed", || routed(&alice)).await;
+    assert_eq!(alice.state().via, Some(net::Via::Relay));
+    alice.submit(None, "over the relay");
+    wait_for("bob gets it", || has_text(&bob, "general", "over the relay")).await;
+
+    // The other way round: Carol, relay-only, joins a host that has direct
+    // paths (and a loopback address in its link).
+    let dave = start("dave", true).await.unwrap();
+    let direct_invite = host(&dave, "direct").await;
+    assert!(Link::parse(&direct_invite).unwrap().addr.ip_addrs().count() > 0, "{direct_invite}");
+    let carol = start("carol", false).await.unwrap();
+    carol.join(&direct_invite);
+    wait_for("carol routed", || routed(&carol)).await;
+    assert_eq!(carol.state().via, Some(net::Via::Relay));
+    carol.submit(None, "relayed in");
+    wait_for("dave gets it", || has_text(&dave, "general", "relayed in")).await;
+
+    // Relay-only with no relay can't work, and says so.
+    let lonely = AppConfig { net: NetConfig { direct: false, ..NetConfig::direct_only() }, ..AppConfig::default() };
+    let s = Session::start(SessionOptions { paths: Paths::under(&home.join("lonely")), config: lonely, client_name: "test".into() })
+        .await
+        .unwrap();
+    s.host(HostOptions { name: "nope".into(), open: false });
+    wait_for("host fails", || matches!(&s.state().conn, ConnState::Failed { error, .. } if error.contains("no relay"))).await;
+    s.shutdown();
+    for s in [alice, bob, carol, dave] {
+        s.shutdown();
+    }
+    relay.shutdown().await;
+}

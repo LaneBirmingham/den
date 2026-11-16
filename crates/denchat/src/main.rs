@@ -9,6 +9,7 @@
 //! * `den discover | mods | config | devices | voice-test`
 
 mod cli;
+mod doctor;
 mod serve;
 mod term;
 
@@ -80,6 +81,11 @@ enum Cmd {
     },
     /// Which of your saved rooms someone is hosting right now.
     Discover {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check this machine's network: reach, addresses, port mapping, relays, firewall.
+    Doctor {
         #[arg(long)]
         json: bool,
     },
@@ -172,6 +178,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Serve(args)) => rt.block_on(serve::run(args, paths)),
         Some(Cmd::Relay { port, bind }) => rt.block_on(cli::relay(&paths, port, &bind)),
         Some(Cmd::Discover { json }) => rt.block_on(cli::discover(&paths, json)),
+        Some(Cmd::Doctor { json }) => rt.block_on(doctor::run(&paths, json)),
         Some(Cmd::Api(args)) => rt.block_on(cli::api(args, &paths)),
         Some(Cmd::Mods { cmd }) => rt.block_on(cli::mods(cmd, &paths)),
         Some(Cmd::Config { cmd }) => cli::config(cmd, &paths),
