@@ -176,6 +176,17 @@ impl ServerNode {
                         }
                         Event::new(names::ROOM_MOVED, json!({"to": to, "term": term}))
                     }
+                    ServerEvent::ChannelsUpdated { channels } => {
+                        // The room's save is what the next start (or host) serves.
+                        if let Ok(mut s) = rooms::load(&save_paths, &room_id) {
+                            s.channels = channels.clone();
+                            s.updated = crate::now_ms();
+                            if let Err(e) = rooms::save(&save_paths, &s) {
+                                tracing::warn!("saving room: {e:#}");
+                            }
+                        }
+                        Event::new(names::CHANNELS_UPDATED, json!({"channels": channels}))
+                    }
                 };
                 let _ = events.send(e);
             }

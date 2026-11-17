@@ -60,6 +60,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/nick <name>", "change your nick"),
     ("/me <action>", "emote"),
     ("/ch <channel>", "switch text channel"),
+    ("/newchannel [voice] <name>", "add a text (or voice) channel"),
     ("/clear", "clear this channel locally"),
     ("/voice [channel]", "join voice"),
     ("/hangup", "leave voice"),
@@ -127,20 +128,34 @@ pub struct VoiceView {
     pub mode: String,
     /// When we joined the current voice channel (unix ms, local clock), for call timers.
     pub joined_at: Option<i64>,
+    /// A mic test (settings) has the audio devices open outside a call.
+    pub testing: bool,
+    /// The mic test plays your voice back to you.
+    pub loopback: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SpeakerView {
     pub id: MemberId,
+    /// Smoothed RMS (0..1) of what we receive from them.
     pub level: f32,
+    /// How loud they are while speaking, 0..1 ([`crate::loudness::intensity`]).
+    pub intensity: f32,
     pub speaking: bool,
 }
 
-/// Serializable voice telemetry (frontends poll this ~15×/s while in voice).
+/// Serializable voice telemetry (frontends poll this ~15×/s while in voice
+/// or while a mic test runs).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VoiceStatsView {
+    /// Smoothed mic RMS (0..1) after input gain, metered even while muted.
     pub input_level: f32,
+    /// How loud you are, 0..1 ([`crate::loudness::intensity`] of `input_level`).
+    pub input_intensity: f32,
+    /// The gate is open: you're being sent (or would be, in a mic test).
     pub transmitting: bool,
+    /// These stats come from a mic test, not a call.
+    pub test: bool,
     pub tx_codec: Option<Codec>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
@@ -150,6 +165,15 @@ pub struct VoiceStatsView {
     /// works even when nobody speaks: `open` mode sends silence too).
     pub tx_packets: u64,
     pub rx_packets: u64,
+}
+
+/// Audio devices by name, for device pickers.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DevicesView {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub default_input: Option<String>,
+    pub default_output: Option<String>,
 }
 
 /// One of your saved rooms that someone is hosting right now.
@@ -401,6 +425,8 @@ struct Inner {
     api: Mutex<Option<ApiServer>>,
     api_env: RwLock<Vec<(String, String)>>,
     voice_wanted: Mutex<Option<ChannelId>>,
+    /// A text channel we asked to create: focus it when it appears.
+    creating: Mutex<Option<(String, Instant)>>,
     ping: Mutex<Option<(u64, Instant)>>,
     /// Our copy of the room we're in.
     copy: Mutex<Option<rooms::Copy>>,
@@ -410,6 +436,13 @@ struct Inner {
     closed: tokio::sync::OnceCell<()>,
     #[cfg(feature = "voice")]
     voice: Mutex<Option<crate::voice::VoiceLink>>,
+    /// Mic test (settings screen): devices open without a call.
+    #[cfg(feature = "voice")]
+    mic_test: Mutex<Option<denchat_audio::MicTest>>,
+    /// Bumped on every mic test start/stop, so a slow start that was
+    /// cancelled meanwhile closes its devices instead of installing them.
+    #[cfg(feature = "voice")]
+    test_epoch: AtomicU64,
 }
 
 /// Cloneable handle; all clones share one session.
@@ -458,12 +491,17 @@ impl Session {
             api: Mutex::new(None),
             api_env: RwLock::new(Vec::new()),
             voice_wanted: Mutex::new(None),
+            creating: Mutex::new(None),
             ping: Mutex::new(None),
             copy: Mutex::new(None),
             prev_me: Mutex::new(None),
             closed: tokio::sync::OnceCell::new(),
             #[cfg(feature = "voice")]
             voice: Mutex::new(None),
+            #[cfg(feature = "voice")]
+            mic_test: Mutex::new(None),
+            #[cfg(feature = "voice")]
+            test_epoch: AtomicU64::new(0),
         });
         let session = Session { inner };
         if modules.api {
@@ -763,6 +801,24 @@ impl Session {
         })
     }
 
+    /// Add a text or voice channel to the room (anyone in it may). The host
+    /// tells everyone; a new text channel you made gets the focus.
+    pub fn create_channel(&self, name: &str, kind: ChannelKind) {
+        if !self.state().conn.is_connected() {
+            self.notice(NoticeLevel::Warn, "not in a room".into());
+            return;
+        }
+        let name = name.trim().to_owned();
+        if denchat_proto::channel_slug(&name).is_empty() {
+            self.notice(NoticeLevel::Warn, "channel names need a letter or a digit".into());
+            return;
+        }
+        if kind == ChannelKind::Text {
+            *self.inner.creating.lock() = Some((denchat_proto::channel_slug(&name), Instant::now()));
+        }
+        self.inner.send(ClientMsg::CreateChannel { name, kind });
+    }
+
     /// Send plain text (no slash-command handling).
     pub fn send_message(&self, channel: Option<&str>, text: &str) {
         if let Err(e) = self.try_send_message(channel, text) {
@@ -853,6 +909,12 @@ impl Session {
             }
             "voice" => self.voice_join((!arg.is_empty()).then(|| arg.to_owned())),
             "hangup" => self.voice_leave(),
+            "newchannel" => match arg.split_once(' ').map(|(k, n)| (k, n.trim())) {
+                Some(("voice", name)) => self.create_channel(name, ChannelKind::Voice),
+                Some(("text", name)) => self.create_channel(name, ChannelKind::Text),
+                _ if arg.is_empty() => self.notice(NoticeLevel::Warn, "usage: /newchannel [voice] <name>".into()),
+                _ => self.create_channel(arg, ChannelKind::Text),
+            },
             "mute" => self.set_muted(true),
             "unmute" => self.set_muted(false),
             "deafen" => self.set_deafened(true),
@@ -1027,40 +1089,60 @@ impl Session {
             return;
         }
         #[cfg(feature = "voice")]
-        if let Some(l) = self.inner.voice.lock().as_ref() {
-            l.engine().set_ptt(pressed);
-        }
+        self.inner.each_engine(|e| e.set_ptt(pressed));
         self.inner.update(|s| s.voice.ptt = pressed);
     }
 
-    /// `voice_activity`, `push_to_talk` or `open`.
+    /// `voice_activity`, `push_to_talk` or `open`. Anything else is refused.
     pub fn set_voice_mode(&self, mode: &str) {
+        let mode = match mode {
+            "voice_activity" | "vad" => "voice_activity",
+            "push_to_talk" | "ptt" => "push_to_talk",
+            "open" | "always" => "open",
+            other => {
+                self.notice(NoticeLevel::Warn, format!("unknown voice mode \"{other}\" (voice_activity, push_to_talk or open)"));
+                return;
+            }
+        };
         self.update_config(|c| c.voice.mode = mode.to_owned());
         #[cfg(feature = "voice")]
-        if let Some(l) = self.inner.voice.lock().as_ref() {
-            l.engine().set_mode(crate::voice::tx_mode(mode));
-        }
+        self.inner.each_engine(|e| e.set_mode(crate::voice::tx_mode(mode)));
         self.inner.update(|s| s.voice.mode = mode.to_owned());
     }
 
+    /// Voice-activity gate: mic RMS (0..1) above which you're sent.
     pub fn set_vad_threshold(&self, t: f32) {
+        let t = t.clamp(0.0, 1.0);
         self.update_config(|c| c.voice.vad_threshold = t);
         #[cfg(feature = "voice")]
-        if let Some(l) = self.inner.voice.lock().as_ref() {
-            l.engine().set_vad_threshold(t);
-        }
+        self.inner.each_engine(|e| e.set_vad_threshold(t));
     }
 
+    /// Playback gain (1.0 = as received, up to 4.0).
     pub fn set_output_volume(&self, v: f32) {
+        let v = v.clamp(0.0, 4.0);
         self.update_config(|c| c.voice.output_volume = v);
         #[cfg(feature = "voice")]
-        if let Some(l) = self.inner.voice.lock().as_ref() {
-            l.engine().set_output_volume(v);
-        }
+        self.inner.each_engine(|e| e.set_output_volume(v));
+    }
+
+    /// Mic gain (1.0 = as captured, up to 16.0).
+    pub fn set_input_gain(&self, g: f32) {
+        let g = g.clamp(0.0, 16.0);
+        self.update_config(|c| c.voice.input_gain = g);
+        #[cfg(feature = "voice")]
+        self.inner.each_engine(|e| e.set_input_gain(g));
+    }
+
+    /// The push-to-talk key (`F8`, `Space`, `Mouse4`, …); `None` falls back
+    /// to the layout's `[keys] ptt`. Frontends read it from the config.
+    pub fn set_ptt_key(&self, key: Option<String>) {
+        let key = key.map(|k| k.trim().to_owned()).filter(|k| !k.is_empty());
+        self.update_config(|c| c.voice.ptt_key = key);
     }
 
     /// Choose audio devices by name (`None` = system default). Restarts the
-    /// audio engine if we're in voice so the change applies immediately.
+    /// audio engine (or the mic test) so the change applies immediately.
     pub fn set_voice_devices(&self, input: Option<String>, output: Option<String>) {
         self.update_config(|c| {
             c.voice.input_device = input;
@@ -1070,6 +1152,40 @@ impl Session {
             self.inner.stop_engine();
             self.inner.ensure_engine();
         }
+        if self.state().voice.testing {
+            self.voice_test(false);
+            self.voice_test(true);
+        }
+    }
+
+    /// Audio devices on this machine (empty without voice support). Can take
+    /// a moment: device enumeration talks to the OS audio stack.
+    pub fn voice_devices(&self) -> anyhow::Result<DevicesView> {
+        #[cfg(feature = "voice")]
+        {
+            let d = denchat_audio::list_devices()?;
+            Ok(DevicesView { inputs: d.inputs, outputs: d.outputs, default_input: d.default_input, default_output: d.default_output })
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            Ok(DevicesView::default())
+        }
+    }
+
+    /// Open the audio devices without a call, so a settings screen can show
+    /// the mic level (and whether the gate would open). Does nothing while in
+    /// voice: the call's own stats serve. Joining voice stops the test.
+    pub fn voice_test(&self, on: bool) {
+        self.inner.voice_test(on);
+    }
+
+    /// While a mic test runs: play your mic back to you (as others would hear it).
+    pub fn set_voice_loopback(&self, on: bool) {
+        #[cfg(feature = "voice")]
+        if let Some(t) = self.inner.mic_test.lock().as_ref() {
+            t.set_loopback(on);
+        }
+        self.inner.update(|s| s.voice.loopback = on);
     }
 
     // ----- mods ----------------------------------------------------------
@@ -1135,6 +1251,7 @@ impl Session {
     pub fn shutdown(&self) {
         tracing::debug!("session shutting down");
         self.leave();
+        self.voice_test(false);
         self.inner.mods.read().stop();
         self.inner.api.lock().take();
     }
@@ -1994,7 +2111,36 @@ impl Inner {
                 self.renegotiate();
                 self.emit(names::MEMBER_UPDATED, data);
             }
-            ServerMsg::ChannelsUpdated { channels } => self.update(|s| s.channels = channels),
+            ServerMsg::ChannelsUpdated { channels } => {
+                let created: Vec<Channel> = self.update(|s| {
+                    let new = channels.iter().filter(|c| s.channel(&c.id).is_none()).cloned().collect();
+                    s.channels = channels.clone();
+                    new
+                });
+                // Every member keeps the channel list, so whoever hosts next serves it.
+                if let Some(id) = self.state.read().room_id().map(str::to_owned)
+                    && let Ok(mut save) = rooms::load(&self.paths, &id)
+                {
+                    save.channels = channels.clone();
+                    save.updated = crate::now_ms();
+                    if let Err(e) = rooms::save(&self.paths, &save) {
+                        tracing::warn!("saving room: {e:#}");
+                    }
+                }
+                // Ours (same slug, maybe with a `-2` the host added): go there.
+                let wanted = self.creating.lock().take_if(|(_, at)| at.elapsed() < Duration::from_secs(10)).map(|(slug, _)| slug);
+                if let Some(slug) = wanted {
+                    let mine =
+                        created.iter().find(|c| c.kind == ChannelKind::Text && (c.id == slug || c.id.starts_with(&format!("{slug}-"))));
+                    match mine {
+                        Some(c) => {
+                            Session { inner: self.clone() }.focus_channel(&c.id);
+                        }
+                        None => *self.creating.lock() = Some((slug, Instant::now())),
+                    }
+                }
+                self.emit(names::CHANNELS_UPDATED, json!({"channels": channels, "created": created}));
+            }
             ServerMsg::App { from, ns, channel, data } => {
                 self.emit(names::APP_MESSAGE, json!({"from": from, "ns": ns, "channel": channel, "data": data}));
             }
@@ -2103,33 +2249,113 @@ impl Inner {
         };
         let me = self.clone();
         let rt = self.rt.clone();
-        self.rt.spawn_blocking(move || match crate::voice::VoiceLink::start(link, setup.token, settings, &rt) {
-            Ok(link) => {
-                link.engine().set_muted(muted);
-                link.engine().set_deafened(deafened);
-                let err = link.engine().stats().last_error;
-                *me.voice.lock() = Some(link);
-                me.update(|s| {
-                    s.voice.engine = true;
-                    s.voice.error = err;
-                });
-                me.renegotiate();
-            }
-            Err(e) => {
-                let error = format!("{e:#}");
-                me.update(|s| {
-                    s.voice.engine = false;
-                    s.voice.error = Some(error.clone());
-                });
-                me.notice(NoticeLevel::Error, format!("voice unavailable: {error}"));
-                *me.voice_wanted.lock() = None;
-                me.send(ClientMsg::VoiceLeave);
+        let test = self.end_test();
+        self.rt.spawn_blocking(move || {
+            // Release the devices a mic test held before the call opens them.
+            drop(test);
+            match crate::voice::VoiceLink::start(link, setup.token, settings, &rt) {
+                Ok(link) => {
+                    link.engine().set_muted(muted);
+                    link.engine().set_deafened(deafened);
+                    let err = link.engine().stats().last_error;
+                    *me.voice.lock() = Some(link);
+                    me.update(|s| {
+                        s.voice.engine = true;
+                        s.voice.error = err;
+                    });
+                    me.renegotiate();
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    me.update(|s| {
+                        s.voice.engine = false;
+                        s.voice.error = Some(error.clone());
+                    });
+                    me.notice(NoticeLevel::Error, format!("voice unavailable: {error}"));
+                    *me.voice_wanted.lock() = None;
+                    me.send(ClientMsg::VoiceLeave);
+                }
             }
         });
     }
 
     #[cfg(not(feature = "voice"))]
     fn ensure_engine(self: &Arc<Self>) {}
+
+    /// Run `f` on every open engine: the call's and the mic test's.
+    #[cfg(feature = "voice")]
+    fn each_engine(&self, f: impl Fn(&denchat_audio::VoiceEngine)) {
+        if let Some(l) = self.voice.lock().as_ref() {
+            f(l.engine());
+        }
+        if let Some(t) = self.mic_test.lock().as_ref() {
+            f(t.engine());
+        }
+    }
+
+    /// Take the mic test out (the caller drops it off async workers: dropping
+    /// joins audio threads) and cancel one that is still starting.
+    #[cfg(feature = "voice")]
+    fn end_test(&self) -> Option<denchat_audio::MicTest> {
+        self.test_epoch.fetch_add(1, Ordering::SeqCst);
+        let test = self.mic_test.lock().take();
+        if self.state.read().voice.testing {
+            self.update(|s| s.voice.testing = false);
+        }
+        test
+    }
+
+    fn voice_test(self: &Arc<Self>, on: bool) {
+        #[cfg(feature = "voice")]
+        {
+            if !on {
+                if let Some(t) = self.end_test() {
+                    std::thread::spawn(move || drop(t));
+                }
+                return;
+            }
+            let in_call = self.voice.lock().is_some() || self.voice_wanted.lock().is_some();
+            if in_call || self.mic_test.lock().is_some() || !self.config.read().modules.voice {
+                return;
+            }
+            let epoch = self.test_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            let settings = crate::voice::settings(&self.config.read().voice);
+            let (ptt, loopback) = {
+                let s = self.state.read();
+                (s.voice.ptt, s.voice.loopback)
+            };
+            self.update(|s| s.voice.testing = true);
+            let me = self.clone();
+            self.rt.spawn_blocking(move || match denchat_audio::MicTest::start(settings) {
+                Ok(test) => {
+                    test.engine().set_ptt(ptt);
+                    test.set_loopback(loopback);
+                    let err = test.engine().stats().last_error;
+                    let mut slot = me.mic_test.lock();
+                    if me.test_epoch.load(Ordering::SeqCst) != epoch {
+                        // Stopped (or a call started) while the devices opened.
+                        drop(slot);
+                        drop(test);
+                        return;
+                    }
+                    *slot = Some(test);
+                    drop(slot);
+                    me.update(|s| s.voice.error = err);
+                }
+                Err(e) => {
+                    if me.test_epoch.load(Ordering::SeqCst) == epoch {
+                        let error = format!("{e:#}");
+                        me.update(|s| {
+                            s.voice.testing = false;
+                            s.voice.error = Some(error);
+                        });
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "voice"))]
+        let _ = on;
+    }
 
     fn stop_engine(&self) {
         #[cfg(feature = "voice")]
@@ -2163,15 +2389,26 @@ impl Inner {
     fn voice_stats(&self) -> Option<VoiceStatsView> {
         #[cfg(feature = "voice")]
         {
-            let guard = self.voice.lock();
-            let st = guard.as_ref()?.engine().stats();
+            use crate::loudness::intensity;
+            let (st, test) = match self.voice.lock().as_ref() {
+                Some(l) => (l.engine().stats(), false),
+                None => (self.mic_test.lock().as_ref()?.engine().stats(), true),
+            };
             Some(VoiceStatsView {
                 input_level: st.input_level,
+                input_intensity: intensity(st.input_level),
                 transmitting: st.transmitting,
+                test,
                 tx_codec: st.tx_codec,
                 input_device: st.input_device,
                 output_device: st.output_device,
-                speakers: st.speakers.into_iter().map(|sp| SpeakerView { id: sp.id, level: sp.level, speaking: sp.speaking }).collect(),
+                // A mic test's only "speaker" is your own echo.
+                speakers: st
+                    .speakers
+                    .into_iter()
+                    .filter(|sp| !test && sp.id != denchat_audio::LOOPBACK_SPEAKER)
+                    .map(|sp| SpeakerView { id: sp.id, level: sp.level, intensity: intensity(sp.level), speaking: sp.speaking })
+                    .collect(),
                 error: st.last_error,
                 tx_packets: st.tx_packets,
                 rx_packets: st.rx_packets,
@@ -2245,12 +2482,20 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("message.send", "{text, channel?}", "Send plain text"),
     doc("input.submit", "{text, channel?}", "Send as if typed (slash commands work)"),
     doc("channel.focus", "{channel}", "Switch the focused text channel"),
+    doc("channel.create", "{name, kind?}", "Add a channel to the room (kind: text (default) or voice)"),
     doc("nick.set", "{nick}", "Change nick"),
     doc("voice.join", "{channel?}", "Join a voice channel"),
     doc("voice.leave", "{}", "Leave voice"),
     doc("voice.mute", "{muted}", "Mute/unmute mic"),
     doc("voice.deafen", "{deafened}", "Deafen/undeafen"),
     doc("voice.stats", "{}", "Mic level, speakers, devices"),
+    doc("voice.devices", "{}", "Audio input/output devices and the system defaults"),
+    doc(
+        "voice.settings",
+        "{input_device?, output_device?, mode?, vad_threshold?, input_gain?, output_volume?, ptt_key?}",
+        "Change voice settings (null or \"\" device/key = default); returns them all",
+    ),
+    doc("voice.test", "{on?, loopback?}", "Mic test outside a call (level in voice.stats); loopback plays you back"),
     doc("app.send", "{ns, data, channel?, to?}", "Relay a mod-defined payload to the room"),
     doc("ui.panel.set", "{panel, widgets, title?}", "Set a panel's widgets (any layout can place it)"),
     doc("ui.panel.clear", "{panel}", "Clear a panel"),
@@ -2280,6 +2525,7 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("ui.scale", "{scale}", "UI zoom, like display scaling (1.0 = 100%)"),
     doc("ui.clipboard", "{}", "Text the app last copied (copies go to $DEN_CLIPBOARD, not the system clipboard, when set)"),
     doc("app.quit", "{}", "Close the app like its close button (hands the room on first)"),
+    doc("ui.settings", "{open?}", "Open (default) or close the settings page in the desktop app"),
     doc("mods.list", "{}", "Installed mods and their status"),
     doc("mods.run", "{command, args?}", "Run a mod slash command"),
     doc("mods.reload", "{}", "Rescan mods and restart their processes"),
@@ -2396,6 +2642,18 @@ impl ApiHandler for SessionApi {
                 s.submit(ch.as_deref(), &t);
                 json!({"submitted": true})
             }),
+            "channel.create" => require_str(&p, "name").and_then(|n| {
+                let kind = match p["kind"].as_str().unwrap_or("text") {
+                    "text" => ChannelKind::Text,
+                    "voice" => ChannelKind::Voice,
+                    other => return Err(format!("unknown kind {other} (text or voice)")),
+                };
+                if denchat_proto::channel_slug(&n).is_empty() {
+                    return Err("channel names need a letter or a digit".into());
+                }
+                s.create_channel(&n, kind);
+                Ok(json!({"requested": true, "id": denchat_proto::channel_slug(&n)}))
+            }),
             "channel.focus" => require_str(&p, "channel").and_then(|c| {
                 if s.focus_channel(&c) { Ok(json!({"focus": s.state().focus})) } else { Err(format!("no text channel #{c}")) }
             }),
@@ -2420,6 +2678,15 @@ impl ApiHandler for SessionApi {
                 ok(&s.state().voice)
             }
             "voice.stats" => ok(s.voice_stats()),
+            "voice.devices" => s.voice_devices().map_err(|e| format!("{e:#}")).and_then(ok),
+            "voice.settings" => voice_settings(&s, &p),
+            "voice.test" => {
+                if let Some(l) = p["loopback"].as_bool() {
+                    s.set_voice_loopback(l);
+                }
+                s.voice_test(p["on"].as_bool().unwrap_or(true));
+                ok(&s.state().voice)
+            }
             "app.send" => require_str(&p, "ns").map(|ns| {
                 let to = p["to"].as_u64().map(|v| v as MemberId);
                 s.send_app(&ns, ch, to, p.get("data").cloned().unwrap_or(Value::Null));
@@ -2464,6 +2731,12 @@ impl ApiHandler for SessionApi {
                 s.ui().request_raise();
                 s.inner.changed();
                 ok(json!({"queued": true}))
+            }
+            "ui.settings" => {
+                let open = p["open"].as_bool().unwrap_or(true);
+                s.ui().request_settings(open);
+                s.inner.changed();
+                Ok(json!({"open": open}))
             }
             "ui.action" => require_str(&p, "panel").and_then(|panel| {
                 let action = require_str(&p, "action")?;
@@ -2525,6 +2798,43 @@ impl ApiHandler for SessionApi {
         };
         ready(res)
     }
+}
+
+/// `voice.settings`: apply the fields present, return the voice config.
+fn voice_settings(s: &Session, p: &Value) -> api::ApiResult {
+    let name = |k: &str| p[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let num = |k: &str| -> Result<Option<f32>, String> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v.as_f64().map(|f| Some(f as f32)).ok_or_else(|| format!("{k} must be a number")),
+        }
+    };
+    let (threshold, gain, volume) = (num("vad_threshold")?, num("input_gain")?, num("output_volume")?);
+    if p.get("input_device").is_some() || p.get("output_device").is_some() {
+        let cur = s.config().voice;
+        let input = if p.get("input_device").is_some() { name("input_device") } else { cur.input_device };
+        let output = if p.get("output_device").is_some() { name("output_device") } else { cur.output_device };
+        s.set_voice_devices(input, output);
+    }
+    if let Some(m) = p["mode"].as_str() {
+        if !matches!(m, "voice_activity" | "vad" | "push_to_talk" | "ptt" | "open" | "always") {
+            return Err(format!("unknown mode {m} (voice_activity, push_to_talk or open)"));
+        }
+        s.set_voice_mode(m);
+    }
+    if let Some(t) = threshold {
+        s.set_vad_threshold(t);
+    }
+    if let Some(g) = gain {
+        s.set_input_gain(g);
+    }
+    if let Some(v) = volume {
+        s.set_output_volume(v);
+    }
+    if p.get("ptt_key").is_some() {
+        s.set_ptt_key(name("ptt_key"));
+    }
+    ok(s.config().voice)
 }
 
 /// What a `welcome` says about the room, for saving.

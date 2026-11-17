@@ -136,6 +136,11 @@ A room is a save that every member holds, not a process:
   member's own uploads (what the host `want`ed) are merged into its own view
   as well as the host's.
 
+Channels work the same way: any member can add one (`create_channel`); the
+host appends it, broadcasts `channels_updated`, and every member (and a
+`serve` node) writes the new list into its save, so whoever hosts next
+serves it.
+
 Everyone has the same rights, so there are no roles to sync; join rules
 travel in `welcome` (`access`), and with the invite key and profiles, are
 enforced by whoever hosts.

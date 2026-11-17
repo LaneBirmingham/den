@@ -115,8 +115,9 @@ Settings go in `[panel."<id>"]`. Every panel also accepts `fill = true|false`.
 | --- | --- | --- |
 | `core.lobby` | host / join / discovered rooms | — |
 | `core.header` | room name, online count; click for invite, View menu, leave | `style = "pill"` (a card for a sidebar) \| `"bar"` (a strip for the top slot, default) |
-| `core.channels` | text channels with unread / mention badges, voice channels with who's in them, the voice card for your channel | `style = "list" \| "conversations"` (previews), `voice` (true), `orientation = "horizontal"` (a tab strip for top/bottom slots) |
-| `core.voice` | you: mic, deafen, hang up, settings (mode, meter, gate, volume, devices) | `show_devices`, `show_meter` |
+| `core.channels` | text channels with unread / mention badges, voice channels with who's in them, the voice card for your channel; `+` on each section adds a channel | `style = "list" \| "conversations"` (previews), `voice` (true), `create` (true: the `+` buttons), `orientation = "horizontal"` (a tab strip for top/bottom slots) |
+| `core.voice` | you (your avatar's ring follows how loud you are), mic, deafen, hang up; the gear opens the settings page | — |
+| `core.settings` | the settings page: microphone and headset, input volume, mic test with a sensitivity marker and "hear myself", input mode (voice activity / push to talk with a rebindable key / always on), output volume, theme and layout. The app shows it over everything (gear, room menu, `[keys] settings`, `den api ui.settings`); hide it with *View → Panels* to switch it off | — |
 | `core.members` | people with status lines, room key (hover), voice state | `group_voice` (true: fold your voice channel into one row) |
 | `core.messages` | message list with day and "new" dividers | `style = "cozy" \| "bubbles" \| "compact" \| "irc"`, `row = ["time","author","text"]` (compact), `time_format`, `group`, `show_system`, `header` |
 | `core.stage` | voice channels as speaker tiles with join/leave | `tile_size` (84), `show_empty` (true) |
@@ -130,11 +131,24 @@ Mod panels are `<mod id>/<panel id>`, e.g. `example.dice/history`.
 
 ```toml
 [keys]
-ptt = "F8"               # hold to talk in push-to-talk mode
+ptt = "F8"               # hold to talk in push-to-talk mode (Mouse4 / Mouse5 work too)
 mute = "Ctrl+Shift+M"    # Ctrl = Cmd on macOS
 deafen = "Ctrl+Shift+D"
 reload = "Ctrl+Shift+R"  # reload theme + layout
+settings = "Ctrl+Comma"  # open / close the settings page
 ```
+
+A push-to-talk key picked in Settings is saved as `[voice] ptt_key` in
+`config.toml` and wins over the layout's.
+
+### Talking indicators
+
+Everyone talking gets a ring around their avatar (voice card, people list,
+stage, your own card). It is always clearly visible while someone talks and
+grows thicker, with a glow, the louder they are. Loudness is measured in dB
+on what you actually receive, i.e. after the speaker's own input volume, so
+each person's ring follows how loud their settings make them
+(`denchat_core::loudness`). Colour: the theme's `speaking` token.
 
 ## Scripting the look
 

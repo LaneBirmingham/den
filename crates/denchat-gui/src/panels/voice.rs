@@ -2,22 +2,17 @@ use denchat_core::session::ConnState;
 use egui::accesskit::Role;
 use egui::{CornerRadius, Rect, RichText, Sense, Ui, pos2, vec2};
 
-use super::{Panel, PanelCx};
+use super::{Panel, PanelCx, ShellCmd};
 use crate::icons;
 use crate::kit::{self, Face, Tone, W};
 
-/// You: avatar, where you are, and your voice controls (mic, sound, hang up,
-/// settings for mode / gate / volume / devices).
-///
-/// Settings (`[panel."core.voice"]`): `show_devices`, `show_meter`.
+/// You: avatar (with your talking level), where you are, and your voice
+/// controls (mic, sound, hang up). The gear, or your name while in a call,
+/// opens the settings page (devices, mode, sensitivity, volume).
 #[derive(Default)]
 pub struct Voice {
-    #[cfg(feature = "voice")]
-    devices: Option<denchat_core::audio::DeviceList>,
     ptt_held: bool,
 }
-
-const MODES: &[(&str, &str)] = &[("voice_activity", "Voice activity"), ("push_to_talk", "Push to talk"), ("open", "Always on")];
 
 impl Panel for Voice {
     fn title(&self) -> String {
@@ -32,6 +27,7 @@ impl Panel for Voice {
             ui.label(RichText::new(err).color(p.danger).size(p.small_size));
         }
         let fill = if cx.in_card { p.sunk } else { p.panel };
+        let levels = super::talk_levels(ui, cx);
         let mut gear = None;
         kit::card(&p, fill, !cx.in_card).show(ui, |ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
@@ -90,7 +86,8 @@ impl Panel for Voice {
             let show_me = right - rect.left() >= 40.0;
             if show_me {
                 let face = Face::new(&cx.state.nick, 36.0, fill).presence(if connected { p.ok } else { p.muted });
-                face.speaking(cx.voice.is_some_and(|s| s.transmitting)).paint(painter, pos2(rect.left() + 18.0, y), &p, time);
+                let level = cx.state.me.and_then(|me| levels.get(&me).copied());
+                face.talking(level).paint(painter, pos2(rect.left() + 18.0, y), &p, time);
             }
             let x = rect.left() + 46.0;
             let w = (right - x).max(10.0);
@@ -148,104 +145,8 @@ impl Panel for Voice {
                 }
             }
         });
-        if let Some(gear) = gear {
-            egui::Popup::from_toggle_button_response(&gear)
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .width(260.0)
-                .show(|ui| self.settings(ui, cx));
+        if gear.is_some_and(|g| g.clicked()) {
+            cx.actions.shell(ShellCmd::OpenSettings);
         }
     }
-}
-
-impl Voice {
-    fn settings(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
-        let p = *cx.palette;
-        ui.set_min_width(250.0);
-        ui.label(RichText::new("Voice").font(kit::font(15.0, W::Semibold)));
-        if !denchat_core::voice_supported() {
-            ui.label(cx.small("This build has no voice support."));
-            return;
-        }
-        let mode = cx.state.voice.mode.clone();
-        ui.add_space(4.0);
-        ui.label(cx.small("Transmit"));
-        for (k, l) in MODES {
-            if ui.radio(mode == *k, *l).clicked() {
-                let k = k.to_string();
-                cx.actions.session(move |s| s.set_voice_mode(&k));
-            }
-        }
-        if cx.setting_bool("show_meter", true)
-            && let Some(stats) = cx.voice
-        {
-            ui.add_space(6.0);
-            ui.label(cx.small("Input level"));
-            let level = (stats.input_level * 6.0).clamp(0.0, 1.0);
-            let color = if stats.transmitting { p.speaking } else { p.muted };
-            ui.add(egui::ProgressBar::new(level).desired_height(6.0).fill(color));
-            if mode == "voice_activity" {
-                let mut t = cx.session.config().voice.vad_threshold;
-                let resp = ui.add(egui::Slider::new(&mut t, 0.001..=0.15).logarithmic(true).text("gate").show_value(false));
-                if resp.changed() {
-                    cx.actions.session(move |s| s.set_vad_threshold(t));
-                }
-            }
-            if let Some(err) = &stats.error {
-                ui.label(RichText::new(err).color(p.warn).size(p.small_size));
-            }
-        }
-        ui.add_space(6.0);
-        let mut vol = cx.session.config().voice.output_volume;
-        if ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("volume").show_value(false)).changed() {
-            cx.actions.session(move |s| s.set_output_volume(vol));
-        }
-        if cx.setting_bool("show_devices", true) {
-            self.devices_ui(ui, cx);
-        }
-        if let Some(k) = cx.shell.ptt_key.clone() {
-            ui.add_space(4.0);
-            ui.label(cx.small(format!("Push-to-talk key: {k}")));
-        }
-    }
-
-    #[cfg(feature = "voice")]
-    fn devices_ui(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
-        ui.add_space(6.0);
-        let list = self.devices.get_or_insert_with(|| denchat_core::audio::list_devices().unwrap_or_default());
-        let cfg = cx.session.config().voice;
-        let pick =
-            |ui: &mut Ui, id: &str, current: &Option<String>, options: &[String], default: &Option<String>| -> Option<Option<String>> {
-                let shown = current
-                    .clone()
-                    .unwrap_or_else(|| format!("Default{}", default.as_ref().map(|d| format!(" ({d})")).unwrap_or_default()));
-                let mut out = None;
-                egui::ComboBox::from_id_salt(id).selected_text(shown).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(current.is_none(), "Default").clicked() {
-                        out = Some(None);
-                    }
-                    for o in options {
-                        if ui.selectable_label(current.as_deref() == Some(o), o).clicked() {
-                            out = Some(Some(o.clone()));
-                        }
-                    }
-                });
-                out
-            };
-        ui.label(cx.small("Microphone"));
-        if let Some(input) = pick(ui, "dev-in", &cfg.input_device, &list.inputs, &list.default_input) {
-            let output = cfg.output_device.clone();
-            cx.actions.session(move |s| s.set_voice_devices(input, output));
-        }
-        ui.label(cx.small("Speakers"));
-        if let Some(output) = pick(ui, "dev-out", &cfg.output_device, &list.outputs, &list.default_output) {
-            let input = cfg.input_device.clone();
-            cx.actions.session(move |s| s.set_voice_devices(input, output));
-        }
-        if ui.small_button("Refresh devices").clicked() {
-            self.devices = None;
-        }
-    }
-
-    #[cfg(not(feature = "voice"))]
-    fn devices_ui(&mut self, _ui: &mut Ui, _cx: &mut PanelCx<'_>) {}
 }

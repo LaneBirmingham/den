@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use denchat_core::proto::{Channel, Member, MessageKind};
+use denchat_core::proto::{Channel, ChannelKind, Member, MessageKind};
 use egui::accesskit::Role;
-use egui::{CornerRadius, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
+use egui::{CornerRadius, Key, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, pos2, vec2};
 
 use super::{Panel, PanelCx};
 use crate::icons;
@@ -10,13 +10,26 @@ use crate::kit::{self, Face, W};
 use crate::theme::Palette;
 
 /// Text channels (click to switch) and voice channels (click to join).
+/// The `+` on each section header adds a channel (anyone in the room can).
 ///
 /// Settings (`[panel."core.channels"]`):
 /// * `style` — `list` (default) or `conversations` (two-line rows with the
 ///   last message, for messenger-style layouts)
 /// * `orientation` — `vertical` (default) or `horizontal` (a tab bar, for top/bottom slots)
 /// * `voice` — list voice channels too (default true)
-pub struct Channels;
+/// * `create` — show the `+` buttons to add channels (default true)
+#[derive(Default)]
+pub struct Channels {
+    create: Option<NewChannel>,
+}
+
+/// The "Create channel" dialog.
+struct NewChannel {
+    kind: ChannelKind,
+    name: String,
+    /// Focus the name field on the first frame.
+    fresh: bool,
+}
 
 impl Panel for Channels {
     fn title(&self) -> String {
@@ -34,9 +47,14 @@ impl Panel for Channels {
         let p = *cx.palette;
         let conversations = cx.setting_str("style") == Some("conversations");
         let show_voice = cx.setting_bool("voice", true);
+        let can_create = cx.setting_bool("create", true) && cx.state.conn.is_connected();
+        let mut add = None;
         ScrollArea::vertical().id_salt("channels").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            kit::section(ui, if conversations { "Chats" } else { "Channels" }, &p);
+            let label = if conversations { "Chats" } else { "Text channels" };
+            if section_with_add(ui, label, can_create, "Create a text channel", &p) {
+                add = Some(ChannelKind::Text);
+            }
             let channels: Vec<Channel> = cx.state.text_channels().cloned().collect();
             for c in &channels {
                 if conversations {
@@ -46,9 +64,11 @@ impl Panel for Channels {
                 }
             }
             let voice: Vec<Channel> = cx.state.voice_channels().cloned().collect();
-            if show_voice && !voice.is_empty() && denchat_core::voice_supported() {
-                kit::section(ui, "Voice", &p);
-                let speaking = speaking_set(cx);
+            if show_voice && denchat_core::voice_supported() && (!voice.is_empty() || can_create) {
+                if section_with_add(ui, "Voice channels", can_create, "Create a voice channel", &p) {
+                    add = Some(ChannelKind::Voice);
+                }
+                let speaking = super::talk_levels(ui, cx);
                 for c in &voice {
                     if cx.state.voice.channel.as_deref() == Some(c.id.as_str()) {
                         voice_card(ui, cx, c, &speaking);
@@ -59,16 +79,127 @@ impl Panel for Channels {
             }
             ui.add_space(6.0);
         });
+        if let Some(kind) = add {
+            self.create = Some(NewChannel { kind, name: String::new(), fresh: true });
+        }
+        if self.create.is_some() && !cx.state.conn.is_connected() {
+            self.create = None;
+        }
+        if let Some(dialog) = &mut self.create
+            && !dialog.show(ui, cx)
+        {
+            self.create = None;
+        }
     }
 }
 
-/// Members currently talking (including us while we transmit).
-pub(crate) fn speaking_set(cx: &PanelCx<'_>) -> HashSet<u32> {
-    let mut s: HashSet<u32> = cx.voice.map(|v| v.speakers.iter().filter(|s| s.speaking).map(|s| s.id).collect()).unwrap_or_default();
-    if let (Some(me), true) = (cx.state.me, cx.voice.is_some_and(|v| v.transmitting)) {
-        s.insert(me);
+/// A section label with a `+` on the right (like a Discord category).
+/// Returns whether the `+` was clicked.
+fn section_with_add(ui: &mut Ui, text: &str, add: bool, tip: &str, p: &Palette) -> bool {
+    let resp = kit::section(ui, text, p);
+    if !add {
+        return false;
     }
-    s
+    let r = egui::Rect::from_center_size(pos2(resp.rect.right() - 12.0, resp.rect.center().y), vec2(22.0, 22.0));
+    kit::icon_button_at(ui, r, text, icons::PLUS, tip, kit::Tone::Plain, p).clicked()
+}
+
+impl NewChannel {
+    /// Draw the dialog; false once it's done (created or cancelled).
+    fn show(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) -> bool {
+        let p = *cx.palette;
+        let ctx = ui.ctx().clone();
+        let frame = egui::Frame::new()
+            .fill(p.panel)
+            .corner_radius(CornerRadius::same(p.card_radius.min(16)))
+            .inner_margin(egui::Margin::same(18))
+            .stroke(Stroke::new(1.0, p.line))
+            .shadow(p.shadow);
+        let mut keep = true;
+        let modal = egui::Modal::new(egui::Id::unique("den-create-channel"))
+            .frame(frame)
+            .backdrop_color(crate::theme::alpha(egui::Color32::BLACK, 0.45))
+            .show(&ctx, |ui| {
+                ui.set_width(400.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(RichText::new("Create channel").font(kit::font(19.0, W::Semibold)).color(p.text));
+                if let Some(room) = &cx.state.server {
+                    ui.label(cx.small(format!("in {}", room.name)));
+                }
+                ui.add_space(8.0);
+                ui.label(RichText::new("Channel type").font(kit::font(12.5, W::Semibold)).color(p.muted));
+                for (kind, glyph, title, about) in [
+                    (ChannelKind::Text, icons::HASH, "Text", "Send messages, links and emoji"),
+                    (ChannelKind::Voice, icons::SPEAKER_HIGH, "Voice", "Hang out together with voice"),
+                ] {
+                    let on = self.kind == kind;
+                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
+                    kit::name_selected(&resp, Role::RadioButton, on, format!("{title} channel"));
+                    let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    let fill = if on { p.row_active } else { crate::theme::mix(p.surface, p.surface_hover, hot) };
+                    ui.painter().rect_filled(rect, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), fill);
+                    kit::icon(ui.painter(), pos2(rect.left() + 22.0, rect.center().y), glyph, 20.0, if on { p.text } else { p.muted });
+                    let g = kit::line(ui, title, kit::font(14.5, W::Semibold), p.text, rect.width() - 90.0);
+                    kit::put(ui.painter(), &g, rect.left() + 46.0, rect.center().y - 8.0, p.text);
+                    let g = kit::line(ui, about, kit::font(12.0, W::Regular), p.muted, rect.width() - 90.0);
+                    kit::put(ui.painter(), &g, rect.left() + 46.0, rect.center().y + 9.0, p.muted);
+                    let c = pos2(rect.right() - 20.0, rect.center().y);
+                    ui.painter().circle_stroke(c, 8.0, Stroke::new(1.5, if on { p.accent } else { p.line_strong }));
+                    if on {
+                        ui.painter().circle_filled(c, 4.5, p.accent);
+                    }
+                    if resp.clicked() {
+                        self.kind = kind;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(RichText::new("Channel name").font(kit::font(12.5, W::Semibold)).color(p.muted));
+                let glyph = if self.kind == ChannelKind::Text { icons::HASH } else { icons::SPEAKER_HIGH };
+                let field = ui
+                    .horizontal(|ui| {
+                        ui.label(RichText::new(glyph).size(17.0).color(p.muted));
+                        let hint = if self.kind == ChannelKind::Text { "new-channel" } else { "New voice channel" };
+                        ui.add(
+                            TextEdit::singleline(&mut self.name)
+                                .hint_text(hint)
+                                .char_limit(denchat_core::proto::MAX_CHANNEL_NAME)
+                                .desired_width(ui.available_width()),
+                        )
+                    })
+                    .inner;
+                if self.fresh {
+                    field.request_focus();
+                    self.fresh = false;
+                }
+                let slug = denchat_core::proto::channel_slug(&self.name);
+                let note = match self.kind {
+                    _ if self.name.trim().is_empty() => String::new(),
+                    _ if slug.is_empty() => "Use at least one letter or digit".to_owned(),
+                    ChannelKind::Text if slug != self.name.trim() => format!("Will be #{slug}"),
+                    _ => String::new(),
+                };
+                ui.label(cx.small(note));
+                ui.add_space(8.0);
+                let submit = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let create = kit::primary_button(ui, "Create channel", !slug.is_empty(), &p).clicked();
+                        if (create || submit) && !slug.is_empty() {
+                            let (name, kind) = (self.name.trim().to_owned(), self.kind);
+                            cx.actions.session(move |s| s.create_channel(&name, kind));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+            });
+        if modal.should_close() {
+            keep = false;
+        }
+        keep
+    }
 }
 
 fn counts(cx: &PanelCx<'_>, id: &str) -> (u32, u32) {
@@ -169,9 +300,9 @@ fn people<'a>(cx: &'a PanelCx<'_>, channel: &'a str) -> Vec<&'a Member> {
 }
 
 /// A voice channel you're not in: name, who's there, and Join.
-fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet<u32>) {
+fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<u32, f32>) {
     let p = *cx.palette;
-    let folks: Vec<(String, bool)> = people(cx, &c.id).iter().map(|m| (m.nick.clone(), speaking.contains(&m.id))).collect();
+    let folks: Vec<(String, Option<f32>)> = people(cx, &c.id).iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied())).collect();
     let (rect, resp) = kit::row(ui, 34.0, false, false, &p);
     let painter = ui.painter();
     kit::icon(painter, pos2(rect.left() + 18.0, rect.center().y), icons::SPEAKER_HIGH, 17.0, if folks.is_empty() { p.muted } else { p.ok });
@@ -207,7 +338,7 @@ fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet<
 }
 
 /// The voice channel you're in: everyone as a row, who's talking, and the call timer.
-fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet<u32>) {
+fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<u32, f32>) {
     let p = *cx.palette;
     let fill = if cx.in_card { p.sunk } else { p.panel };
     kit::card(&p, fill, !cx.in_card).stroke(Stroke::new(1.0, p.ok_soft)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
@@ -245,14 +376,15 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet
         }
         let time = ui.input(|i| i.time);
         for m in people(cx, &c.id) {
-            let talking = speaking.contains(&m.id);
+            let level = speaking.get(&m.id).copied();
+            let talking = level.is_some();
             let me = cx.state.me == Some(m.id);
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
             let painter = ui.painter();
-            Face::new(&m.nick, 22.0, fill).speaking(talking).paint(painter, pos2(r.left() + 13.0, r.center().y), &p, time);
+            Face::new(&m.nick, 22.0, fill).talking(level).paint(painter, pos2(r.left() + 13.0, r.center().y), &p, time);
             let mut right = r.right() - 4.0;
-            if talking {
-                kit::eq(painter, pos2(right - 12.0, r.center().y + 6.0), p.speaking, time);
+            if let Some(l) = level {
+                kit::eq(painter, pos2(right - 12.0, r.center().y + 6.0), p.speaking, time, l);
                 right -= 20.0;
             } else if m.deafened {
                 kit::icon(painter, pos2(right - 8.0, r.center().y), icons::EAR_SLASH, 15.0, p.danger);

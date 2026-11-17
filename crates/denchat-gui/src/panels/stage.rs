@@ -18,9 +18,7 @@ impl Panel for Stage {
         let p = *cx.palette;
         let tile = cx.settings.get("tile_size").and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64))).unwrap_or(84.0) as f32;
         let show_empty = cx.setting_bool("show_empty", true);
-        let speaking: std::collections::HashSet<u32> =
-            cx.voice.map(|v| v.speakers.iter().filter(|s| s.speaking).map(|s| s.id).collect()).unwrap_or_default();
-        let me_tx = cx.voice.is_some_and(|v| v.transmitting);
+        let speaking = super::talk_levels(ui, cx);
         let channels: Vec<_> = cx.state.voice_channels().cloned().collect();
         if channels.is_empty() {
             ui.label(cx.small("no voice channels in this room"));
@@ -55,12 +53,12 @@ impl Panel for Stage {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
                     for m in &people {
-                        let talking = speaking.contains(&m.id) || (cx.state.me == Some(m.id) && me_tx);
+                        let level = speaking.get(&m.id).copied();
                         let (rect, resp) = ui.allocate_exact_size(vec2(tile, tile + 26.0), Sense::hover());
                         let painter = ui.painter_at(rect.expand(6.0));
                         painter.rect_filled(rect, egui::CornerRadius::same(p.card_radius.min(16)), p.surface);
                         let center = rect.center_top() + vec2(0.0, tile * 0.48);
-                        Face::new(&m.nick, tile * 0.6, p.surface).speaking(talking).paint(&painter, center, &p, ui.input(|i| i.time));
+                        Face::new(&m.nick, tile * 0.6, p.surface).talking(level).paint(&painter, center, &p, ui.input(|i| i.time));
                         let name_pos = rect.center_bottom() - vec2(0.0, 15.0);
                         painter.text(name_pos, Align2::CENTER_CENTER, &m.nick, kit::font(p.small_size + 1.0, W::Medium), p.text);
                         let flag = if m.deafened {

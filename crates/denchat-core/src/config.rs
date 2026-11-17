@@ -55,8 +55,12 @@ pub struct VoiceConfig {
     pub vad_threshold: f32,
     /// Opus bitrate in bits per second.
     pub bitrate: u32,
+    /// Linear mic gain (1.0 = as captured).
     pub input_gain: f32,
+    /// Linear playback gain (1.0 = as received).
     pub output_volume: f32,
+    /// Push-to-talk key (`F8`, `Space`, `Mouse4`, …). Unset: the layout's `[keys] ptt`.
+    pub ptt_key: Option<String>,
 }
 
 impl Default for VoiceConfig {
@@ -69,6 +73,7 @@ impl Default for VoiceConfig {
             bitrate: 32_000,
             input_gain: 1.0,
             output_volume: 1.0,
+            ptt_key: None,
         }
     }
 }

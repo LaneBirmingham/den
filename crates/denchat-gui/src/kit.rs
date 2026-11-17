@@ -97,12 +97,13 @@ pub struct Face<'a> {
     pub behind: Color32,
     /// Presence dot colour, bottom right.
     pub presence: Option<Color32>,
-    pub speaking: bool,
+    /// Talking, and how loud (0..1, see `denchat_core::loudness::intensity`).
+    pub talking: Option<f32>,
 }
 
 impl<'a> Face<'a> {
     pub fn new(nick: &'a str, size: f32, behind: Color32) -> Face<'a> {
-        Face { nick, size, behind, presence: None, speaking: false }
+        Face { nick, size, behind, presence: None, talking: None }
     }
 
     pub fn presence(mut self, c: Color32) -> Self {
@@ -110,17 +111,27 @@ impl<'a> Face<'a> {
         self
     }
 
+    /// Talking at the quietest level (a plain ring).
     pub fn speaking(mut self, on: bool) -> Self {
-        self.speaking = on;
+        self.talking = on.then_some(0.0);
         self
     }
 
-    pub fn paint(&self, painter: &Painter, center: Pos2, p: &Palette, time: f64) {
+    /// Talking at `level` (0..1): the ring thickens and a glow grows with it.
+    pub fn talking(mut self, level: Option<f32>) -> Self {
+        self.talking = level.map(|l| l.clamp(0.0, 1.0));
+        self
+    }
+
+    /// How far past the avatar's edge the talking ring and glow can reach.
+    pub fn reach(size: f32) -> f32 {
+        4.0 + size * 0.3
+    }
+
+    pub fn paint(&self, painter: &Painter, center: Pos2, p: &Palette, _time: f64) {
         let r = self.size / 2.0;
-        if self.speaking {
-            // A soft pulse so talking reads at a glance without a hard flash.
-            let pulse = 0.65 + 0.35 * ((time * 5.0).sin() as f32 * 0.5 + 0.5);
-            painter.circle_stroke(center, r + 3.0, Stroke::new(2.0, alpha(p.speaking, pulse)));
+        if let Some(level) = self.talking {
+            talk_ring(painter, center, r, level, p);
         }
         painter.circle_filled(center, r, avatar_fill(self.nick, p));
         painter.text(center, Align2::CENTER_CENTER, initial(self.nick), font((self.size * 0.42).max(8.0), W::Semibold), avatar_ink(p));
@@ -134,11 +145,33 @@ impl<'a> Face<'a> {
 
     /// Allocate and draw; hover shows `tip` if given.
     pub fn show(&self, ui: &mut Ui, p: &Palette) -> Response {
-        let pad = if self.speaking { 4.0 } else { 0.0 };
+        let pad = if self.talking.is_some() { Face::reach(self.size) } else { 0.0 };
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(self.size + pad * 2.0), Sense::hover());
         self.paint(ui.painter(), rect.center(), p, ui.input(|i| i.time));
         resp
     }
+}
+
+/// The talking indicator around an avatar of radius `r`: a ring that is
+/// always clearly visible while someone talks (so you can tell at a glance
+/// who is), and a soft glow plus a thicker ring that grow with `level`.
+fn talk_ring(painter: &Painter, center: Pos2, r: f32, level: f32, p: &Palette) {
+    let l = level.clamp(0.0, 1.0);
+    // Ease out so quiet speech already moves the ring noticeably.
+    let e = 1.0 - (1.0 - l) * (1.0 - l);
+    let size = r * 2.0;
+    let width = (size * 0.06).clamp(2.0, 3.0) * (1.0 + 0.7 * e);
+    let gap = (size * 0.05).clamp(1.5, 3.0);
+    let ring = r + gap + width / 2.0;
+    let glow = (Face::reach(size) - gap - width) * e;
+    if glow > 0.3 {
+        // A halo outside the ring; two layers fake a soft falloff. Strokes,
+        // not fills, so the gap inside the ring shows whatever is behind.
+        let edge = ring + width / 2.0;
+        painter.circle_stroke(center, edge + glow / 2.0, Stroke::new(glow, alpha(p.speaking, 0.07 + 0.12 * e)));
+        painter.circle_stroke(center, edge + glow / 4.0, Stroke::new(glow / 2.0, alpha(p.speaking, 0.08 + 0.14 * e)));
+    }
+    painter.circle_stroke(center, ring, Stroke::new(width, alpha(p.speaking, 0.85 + 0.15 * e)));
 }
 
 /// Width of [`paint_stack`] for `n` faces.
@@ -147,8 +180,15 @@ pub fn stack_width(n: usize, size: f32, max: usize) -> f32 {
     if total == 0 { 0.0 } else { size + size * 0.72 * (total - 1) as f32 }
 }
 
-/// Overlapping avatars, `+N` after `max`. `faces` are `(nick, speaking)`.
-pub fn paint_stack(ui: &Ui, left_center: Pos2, faces: &[(String, bool)], (size, max): (f32, usize), behind: Color32, p: &Palette) -> f32 {
+/// Overlapping avatars, `+N` after `max`. `faces` are `(nick, talking level)`.
+pub fn paint_stack(
+    ui: &Ui,
+    left_center: Pos2,
+    faces: &[(String, Option<f32>)],
+    (size, max): (f32, usize),
+    behind: Color32,
+    p: &Palette,
+) -> f32 {
     let painter = ui.painter();
     let time = ui.input(|i| i.time);
     let step = size * 0.72;
@@ -168,7 +208,7 @@ pub fn paint_stack(ui: &Ui, left_center: Pos2, faces: &[(String, bool)], (size, 
     for i in (0..shown).rev() {
         let c = centers[i];
         painter.circle_filled(c, size / 2.0 + 2.0, behind);
-        Face { nick: &faces[i].0, size, behind, presence: None, speaking: faces[i].1 }.paint(painter, c, p, time);
+        Face { nick: &faces[i].0, size, behind, presence: None, talking: faces[i].1 }.paint(painter, c, p, time);
     }
     width
 }
@@ -341,11 +381,13 @@ pub fn signal(painter: &Painter, left_bottom: Pos2, n: u8, color: Color32, off: 
     }
 }
 
-/// Animated level bars for someone talking.
-pub fn eq(painter: &Painter, left_bottom: Pos2, color: Color32, time: f64) {
+/// Animated level bars for someone talking, taller the louder they are
+/// (`level` 0..1); never flat, so talking always shows.
+pub fn eq(painter: &Painter, left_bottom: Pos2, color: Color32, time: f64, level: f32) {
+    let l = level.clamp(0.0, 1.0);
     for i in 0..3 {
-        let phase = time * 7.0 + i as f64 * 1.9;
-        let h = 4.0 + 8.0 * (phase.sin() as f32 * 0.5 + 0.5);
+        let phase = time * (6.0 + 4.0 * l as f64) + i as f64 * 1.9;
+        let h = 3.0 + (2.5 + 8.5 * l) * (0.55 + 0.45 * phase.sin() as f32);
         let x = left_bottom.x + i as f32 * 4.5;
         painter.rect_filled(Rect::from_min_max(pos2(x, left_bottom.y - h), pos2(x + 3.0, left_bottom.y)), CornerRadius::same(1), color);
     }

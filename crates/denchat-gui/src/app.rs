@@ -15,7 +15,7 @@ use egui::{Align, Align2, CornerRadius, Frame, Id, Layout as ELayout, Margin, Or
 
 use crate::agent::{self, AgentPlugin, Kind};
 use crate::catalog::{Catalog, Entry};
-use crate::layout::{Layout, Screen, ShellStyle, Slot, SlotMode, SlotName, parse_key};
+use crate::layout::{Layout, PttInput, Screen, ShellStyle, Slot, SlotMode, SlotName, parse_key};
 use crate::panels::{Actions, Missing, ModPanel, Panel, PanelCx, Registry, ShellCmd, ShellView};
 use crate::theme::{Palette, Theme};
 
@@ -23,6 +23,8 @@ use crate::theme::{Palette, Theme};
 pub(crate) const DEFAULT_THEME: &str = "catppuccin";
 const HIDDEN_KEY: &str = "den.hidden_panels";
 const POLL: Duration = Duration::from_millis(800);
+/// The panel the settings page shows.
+const SETTINGS_PANEL: &str = "core.settings";
 
 struct Instance {
     missing: bool,
@@ -34,6 +36,7 @@ enum KeyAction {
     Mute,
     Deafen,
     Reload,
+    Settings,
 }
 
 pub struct DenApp {
@@ -54,8 +57,8 @@ pub struct DenApp {
     last_poll: Instant,
     last_scan: Instant,
     shortcuts: Vec<(KeyAction, egui::Modifiers, egui::Key)>,
-    ptt: Option<egui::Key>,
     ptt_down: bool,
+    settings_open: bool,
     title: String,
     /// `DEN_SCREENSHOT=<png>`: capture once the UI has settled.
     auto_shot: Option<(Instant, PathBuf)>,
@@ -109,8 +112,8 @@ impl DenApp {
             last_poll: Instant::now(),
             last_scan: Instant::now(),
             shortcuts: Vec::new(),
-            ptt: None,
             ptt_down: false,
+            settings_open: false,
             title: String::new(),
             auto_shot: std::env::var_os("DEN_SCREENSHOT").map(|p| {
                 let delay = std::env::var("DEN_SCREENSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
@@ -184,11 +187,31 @@ impl DenApp {
 
     fn bind_keys(&mut self) {
         let k = &self.layout.keys;
-        self.shortcuts = [(KeyAction::Mute, &k.mute), (KeyAction::Deafen, &k.deafen), (KeyAction::Reload, &k.reload)]
-            .into_iter()
-            .filter_map(|(a, spec)| spec.as_deref().and_then(parse_key).map(|(m, key)| (a, m, key)))
-            .collect();
-        self.ptt = k.ptt.as_deref().and_then(parse_key).map(|(_, key)| key);
+        self.shortcuts = [
+            (KeyAction::Mute, &k.mute),
+            (KeyAction::Deafen, &k.deafen),
+            (KeyAction::Reload, &k.reload),
+            (KeyAction::Settings, &k.settings),
+        ]
+        .into_iter()
+        .filter_map(|(a, spec)| spec.as_deref().and_then(parse_key).map(|(m, key)| (a, m, key)))
+        .collect();
+    }
+
+    /// The push-to-talk key in effect: settings first, then the layout.
+    fn ptt_spec(&self) -> Option<String> {
+        self.session.config().voice.ptt_key.or_else(|| self.layout.keys.ptt.clone())
+    }
+
+    fn set_settings_open(&mut self, open: bool) {
+        if self.settings_open == open {
+            return;
+        }
+        self.settings_open = open;
+        if !open {
+            // The page starts a mic test while it shows; release the devices.
+            self.session.voice_test(false);
+        }
     }
 
     /// Track the files behind the current theme and layout. A file we were
@@ -280,14 +303,15 @@ impl DenApp {
                     self.session.set_deafened(!d);
                 }
                 KeyAction::Reload => self.reload_all(ctx),
+                KeyAction::Settings => self.set_settings_open(!self.settings_open),
             }
         }
-        if let Some(k) = self.ptt {
-            let down = ctx.input(|i| i.key_down(k));
+        if let Some(input) = self.ptt_spec().as_deref().and_then(PttInput::parse) {
+            let down = ctx.input(|i| input.down(i));
             if down != self.ptt_down {
                 self.ptt_down = down;
                 let s = self.session.state();
-                let active = s.voice.channel.is_some() && s.voice.mode == "push_to_talk";
+                let active = (s.voice.channel.is_some() || s.voice.testing) && s.voice.mode == "push_to_talk";
                 drop(s);
                 if active || !down {
                     self.session.set_ptt(down);
@@ -314,6 +338,8 @@ impl DenApp {
                 }
             }
             ShellCmd::ReloadAssets => self.reload_all(ctx),
+            ShellCmd::OpenSettings => self.set_settings_open(true),
+            ShellCmd::CloseSettings => self.set_settings_open(false),
             ShellCmd::OpenConfigDir => {
                 let paths = self.session.paths();
                 for d in [paths.themes_dir(), paths.layouts_dir(), paths.mods_dir()] {
@@ -419,6 +445,9 @@ impl DenApp {
         if self.session.config().ui.hot_reload {
             ctx.request_repaint_after(POLL);
         }
+        if let Some(open) = self.session.ui().take_settings_request() {
+            self.set_settings_open(open);
+        }
         self.keys(&ctx);
         if self.session.ui().take_raise_request() {
             // `den` started again on this profile: show this window instead.
@@ -429,10 +458,12 @@ impl DenApp {
 
         let session = self.session.clone();
         let voice = session.voice_stats();
-        if voice.is_some() {
-            // Level meters and speaking dots.
-            ctx.request_repaint_after(Duration::from_millis(66));
+        if let Some(v) = &voice {
+            // Level meters and talking rings: smooth while anyone talks.
+            let lively = v.transmitting || v.speakers.iter().any(|s| s.speaking) || (self.settings_open && v.input_level > 0.001);
+            ctx.request_repaint_after(Duration::from_millis(if lively { 33 } else { 66 }));
         }
+        let ptt_key = self.ptt_spec();
         let mut actions = Actions::default();
         {
             let state = session.state();
@@ -450,7 +481,9 @@ impl DenApp {
                 placed: Vec::new(),
                 hidden: self.hidden.clone(),
                 layout_error: self.layout_error.clone(),
-                ptt_key: self.layout.keys.ptt.clone(),
+                ptt_key,
+                layout_ptt_key: self.layout.keys.ptt.clone(),
+                settings_open: self.settings_open,
             };
             let mut r = Render {
                 session: &session,
@@ -467,6 +500,9 @@ impl DenApp {
             };
             r.shell.placed = plan.all.iter().map(|id| (id.clone(), r.title(id))).collect();
             r.screen(ui, screen, &plan, &mut self.windows_open, &mut self.floating);
+            if self.settings_open && r.registry.contains(SETTINGS_PANEL) && !r.shell.hidden.contains(SETTINGS_PANEL) {
+                r.settings_page(ui);
+            }
         }
 
         for f in actions.session.drain(..) {
@@ -623,6 +659,32 @@ impl Render<'_> {
                 n.set_bounds(egui::accesskit::Rect { x0: r.min.x.into(), y0: r.min.y.into(), x1: r.max.x.into(), y1: r.max.y.into() });
             });
         });
+    }
+
+    /// The settings page: a modal over the whole window.
+    fn settings_page(&mut self, ui: &mut Ui) {
+        let p = *self.palette;
+        let ctx = ui.ctx().clone();
+        let screen = ctx.content_rect();
+        let size = egui::vec2((screen.width() - 48.0).clamp(320.0, 760.0), (screen.height() - 64.0).clamp(280.0, 640.0));
+        let frame = Frame::new()
+            .fill(p.panel)
+            .corner_radius(CornerRadius::same(p.card_radius.min(18)))
+            .inner_margin(Margin::symmetric(18, 14))
+            .stroke(Stroke::new(1.0, p.line))
+            .shadow(p.shadow);
+        let modal = egui::Modal::new(Id::unique("den-settings"))
+            .frame(frame)
+            .backdrop_color(crate::theme::alpha(egui::Color32::BLACK, 0.45))
+            .show(&ctx, |ui| {
+                ui.set_width(size.x);
+                ui.set_height(size.y);
+                self.in_card = true;
+                self.panel(ui, SETTINGS_PANEL);
+            });
+        if modal.should_close() {
+            self.actions.shell(ShellCmd::CloseSettings);
+        }
     }
 
     fn screen(

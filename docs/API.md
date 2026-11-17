@@ -45,10 +45,14 @@ the connection streams events. The token is compared in constant time.
 | `message.send` | `text, channel?` | send plain text |
 | `input.submit` | `text, channel?` | as if typed: slash commands work |
 | `channel.focus` | `channel` | switch the focused text channel |
+| `channel.create` | `name, kind?` | add a channel (`kind`: `text`, the default, or `voice`); anyone in the room may. Returns the `id` it asks for; the host adds `-2`… if it's taken. Everyone gets a `channels.updated` event |
 | `nick.set` | `nick` | |
 | `voice.join` / `voice.leave` | `channel?` | |
 | `voice.mute` / `voice.deafen` | `muted` / `deafened` | |
-| `voice.stats` | | mic level, speakers, devices, codec, `tx_packets` / `rx_packets` (counted since voice started; `open` mode sends even when silent) |
+| `voice.stats` | | mic level (`input_level` RMS, `input_intensity` 0..1), speakers (`level`, `intensity`, `speaking`), devices, codec, `test` (from a mic test, not a call), `tx_packets` / `rx_packets` (counted since voice started; `open` mode sends even when silent) |
+| `voice.devices` | | `inputs`, `outputs`, `default_input`, `default_output` |
+| `voice.settings` | `input_device?, output_device?, mode?, vad_threshold?, input_gain?, output_volume?, ptt_key?` | change any of them (`null` or `""` device/key = default; `mode` is `voice_activity`, `push_to_talk` or `open`); returns the voice config. Applies live, restarting audio for a device change |
+| `voice.test` | `on?, loopback?` | mic test outside a call (default `on: true`): `voice.stats` then reports the mic and whether the gate would open; `loopback` plays you back. Joining voice ends it |
 | `app.send` | `ns, data, channel?, to?` | relay a mod-defined payload |
 | `ui.panel.set` | `panel, widgets, title?` | create/update a panel ([widgets](MODS.md#widgets)) |
 | `ui.panel.clear` | `panel` | |
@@ -56,6 +60,7 @@ the connection streams events. The token is compared in constant time.
 | `ui.notify` | `text, level?` | toast (`info`, `warn`, `error`) |
 | `ui.action` | `panel, action, value?` | emit a `ui.action` event |
 | `ui.theme.set` / `ui.layout.set` | `name` | switch look; the app follows within a second |
+| `ui.settings` | `open?` | open (default) or close the desktop app's settings page (GUI only) |
 | `ui.raise` | | bring the app window to the front (GUI only; a second `den`/`den join` on the same profile uses it) |
 | `ui.clipboard` | | `{copied: {text, ts}}`: what the app last copied (Copy invite link, Copy text). With `$DEN_CLIPBOARD=<file>`, or headless, copies go there instead of the system clipboard |
 | `state.get` → `frontend` | | `"window"`, `"headless"`, or null (terminal client, `den serve`): whether the methods below work |
