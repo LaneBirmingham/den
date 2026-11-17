@@ -85,16 +85,25 @@ impl Panel for Voice {
             }
             let painter = ui.painter();
             let connected = cx.state.conn.is_connected();
-            let face = Face::new(&cx.state.nick, 36.0, fill).presence(if connected { p.ok } else { p.muted });
-            face.speaking(cx.voice.is_some_and(|s| s.transmitting)).paint(painter, pos2(rect.left() + 18.0, y), &p, time);
+            // On a narrow sidebar the buttons take the row: leave out the
+            // avatar and name rather than draw them under the buttons.
+            let show_me = right - rect.left() >= 40.0;
+            if show_me {
+                let face = Face::new(&cx.state.nick, 36.0, fill).presence(if connected { p.ok } else { p.muted });
+                face.speaking(cx.voice.is_some_and(|s| s.transmitting)).paint(painter, pos2(rect.left() + 18.0, y), &p, time);
+            }
             let x = rect.left() + 46.0;
             let w = (right - x).max(10.0);
-            let g = kit::line(ui, &cx.state.nick, kit::font(14.0, W::Semibold), p.text, w);
-            kit::put(painter, &g, x, y - 8.0, p.text);
+            if show_me {
+                let g = kit::line(ui, &cx.state.nick, kit::font(14.0, W::Semibold), p.text, w);
+                kit::put(painter, &g, x, y - 8.0, p.text);
+            }
             let (status, color, tip) = match (&v.channel, &cx.state.conn) {
                 (Some(ch), ConnState::Connected { addr }) => {
                     let (n, c) = kit::signal_level(cx.state.latency_ms, &p);
-                    kit::signal(painter, pos2(x, y + 13.0), n, c, p.surface_hover);
+                    if show_me {
+                        kit::signal(painter, pos2(x, y + 13.0), n, c, p.surface_hover);
+                    }
                     let ms = cx.state.latency_ms.map(|m| format!(" · {m} ms")).unwrap_or_default();
                     let via = cx.state.via.map(|v| format!(" · {}", v.as_str())).unwrap_or_default();
                     (ch.clone(), p.muted, format!("Voice connected to {addr}{ms}{via}"))
@@ -107,8 +116,10 @@ impl Panel for Voice {
             };
             let indent = if v.channel.is_some() && connected { 16.0 } else { 0.0 };
             let me = format!("{} · {status}", cx.state.nick);
-            let g = kit::line(ui, status, kit::font(12.0, W::Regular), color, w - indent);
-            kit::put(ui.painter(), &g, x + indent, y + 9.0, color);
+            if show_me {
+                let g = kit::line(ui, status, kit::font(12.0, W::Regular), color, w - indent);
+                kit::put(ui.painter(), &g, x + indent, y + 9.0, color);
+            }
             if v.channel.is_some() && supported {
                 if let Some(g) = gear.take() {
                     kit::name(&g, Role::Button, format!("Voice settings ({me})"));

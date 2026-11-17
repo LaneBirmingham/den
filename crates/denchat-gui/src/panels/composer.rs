@@ -1,4 +1,5 @@
-use denchat_core::session::BUILTIN_COMMANDS;
+use denchat_core::proto::NoticeLevel;
+use denchat_core::session::{BUILTIN_COMMANDS, message_problem};
 use egui::{CornerRadius, Frame, Key, Margin, RichText, Sense, Stroke, TextEdit, Ui, vec2};
 
 use super::{Panel, PanelCx};
@@ -73,6 +74,9 @@ impl Panel for Composer {
         let send_button = cx.setting_bool("send_button", true);
         let id = ui.make_persistent_id(("composer", cx.id));
         let focused = ui.ctx().memory(|m| m.has_focus(id));
+        // Tab completes a command while there are suggestions; otherwise it
+        // moves focus on, like anywhere else (the box never types a tab).
+        let tab = focused && !suggestions.is_empty() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
         let radius = if pill { CornerRadius::same(22) } else { CornerRadius::same(p.card_radius.min(14)) };
         let mut send_clicked = false;
         let field = Frame::new()
@@ -97,7 +101,7 @@ impl Panel for Composer {
                                     .min_size(vec2(w, 32.0))
                                     .align(egui::Align2::LEFT_CENTER)
                                     .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
-                                    .lock_focus(true),
+                                    .lock_focus(false),
                             )
                         })
                         .inner;
@@ -129,10 +133,12 @@ impl Panel for Composer {
             self.send(channel.clone(), cx);
         }
         if resp.has_focus() {
-            let (enter, tab, arrow_up, arrow_down) = ui.input_mut(|i| {
+            let (enter, arrow_up, arrow_down) = ui.input_mut(|i| {
                 (
-                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                    i.consume_key(egui::Modifiers::NONE, Key::Tab),
+                    // Plain Enter only: `consume_key` ignores Shift, and Shift+Enter is a new line.
+                    i.events.iter().any(|e| {
+                        matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.matches_exact(egui::Modifiers::NONE))
+                    }) && i.consume_key(egui::Modifiers::NONE, Key::Enter),
                     i.key_pressed(Key::ArrowUp),
                     i.key_pressed(Key::ArrowDown),
                 )
@@ -172,6 +178,14 @@ impl Panel for Composer {
 
 impl Composer {
     fn send(&mut self, channel: Option<String>, cx: &mut PanelCx<'_>) {
+        // Keep a message the host would refuse in the box, so it isn't lost.
+        if !self.text.trim_start().starts_with('/')
+            && let Some(problem) = message_problem(&self.text).filter(|_| !self.text.trim().is_empty())
+        {
+            cx.actions.session(move |s| s.notice(NoticeLevel::Warn, problem));
+            self.focus_next = true;
+            return;
+        }
         let text = std::mem::take(&mut self.text);
         let trimmed = text.trim_end_matches('\n').to_owned();
         if !trimmed.trim().is_empty() {

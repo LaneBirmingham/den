@@ -537,6 +537,35 @@ async fn planned_handoff_moves_everyone() {
     bob.shutdown();
 }
 
+/// An invite copied while alice hosted still works after she hands the room
+/// to bob: her app sends the join on to bob, and the invite goes with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_invite_follows_a_handoff() {
+    let home = tmp("old-invite");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let invite = host(&alice, "den").await;
+    bob.join(&invite);
+    wait_for("bob in", || alice.state().members.len() == 2).await;
+    alice.handoff(Some(member_id(&alice, "bob")));
+    wait_for("moved", || on_term(&alice, 2) && on_term(&bob, 2) && alice.state().hosting.is_none()).await;
+
+    let erin = session("erin", &home.join("e")).await;
+    erin.join(&invite);
+    wait_for("erin follows to bob", || on_term(&erin, 2) && bob.state().members.len() == 3).await;
+    // The redirect doesn't stand in for the invite.
+    let mallory = session("mallory", &home.join("m")).await;
+    mallory.join(Link::parse(&invite).unwrap().without_invite().to_string());
+    wait_for("mallory refused", || matches!(mallory.state().conn, ConnState::Failed { refused: true, .. })).await;
+    // Once alice leaves, her app stops answering for the room.
+    alice.leave();
+    wait_for("alice gone", || bob.state().members.len() == 2).await;
+    let frank = session("frank", &home.join("f")).await;
+    frank.join(&invite);
+    wait_for("frank can't get in", || matches!(frank.state().conn, ConnState::Failed { .. })).await;
+    bob.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leaving_host_hands_the_room_on() {
     let home = tmp("leave");

@@ -224,6 +224,8 @@ fn main() -> anyhow::Result<()> {
                 | Cmd::Status { .. }
                 | Cmd::Wait(_)
                 | Cmd::Sandbox { .. }
+                | Cmd::Doctor { .. }
+                | Cmd::Discover { .. }
         )
     );
     init_logging(cli.verbose, quiet_default);
@@ -268,7 +270,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Ui { cmd }) => rt.block_on(agent::ui(cmd, &paths)),
         Some(Cmd::Status { json }) => rt.block_on(agent::status(&paths, json)),
         Some(Cmd::Wait(args)) => rt.block_on(agent::wait(args, &paths)),
-        Some(Cmd::Sandbox { cmd }) => rt.block_on(agent::sandbox(cmd, &user_paths)),
+        Some(Cmd::Sandbox { cmd }) => rt.block_on(agent::sandbox(cmd, &user_paths, cli.nick.clone())),
         Some(Cmd::Mods { cmd }) => rt.block_on(cli::mods(cmd, &paths)),
         Some(Cmd::Config { cmd }) => cli::config(cmd, &paths),
         Some(Cmd::Devices) => cli::devices(),

@@ -14,6 +14,10 @@ use crate::kit::{self, W};
 #[derive(Default)]
 pub struct Header;
 
+/// This panel's id. It holds View → Panels, so it can't be hidden from there:
+/// nothing would be left to show it again.
+pub const ID: &str = "core.header";
+
 impl Panel for Header {
     fn title(&self) -> String {
         "Header".into()
@@ -221,7 +225,9 @@ fn view_items(ui: &mut Ui, cx: &mut PanelCx<'_>) {
         ui.menu_button(format!("{}  Panels", icons::SQUARES_FOUR), |ui| {
             for (id, title) in &cx.shell.placed {
                 let mut on = !cx.shell.hidden.contains(id);
-                if ui.checkbox(&mut on, title).on_hover_text(id).changed() {
+                let (enabled, hint) =
+                    if id == ID { (!on, "holds this menu; take it out of the layout file instead") } else { (true, id.as_str()) };
+                if ui.add_enabled(enabled, egui::Checkbox::new(&mut on, title)).on_hover_text(hint).on_disabled_hover_text(hint).changed() {
                     cx.actions.shell(ShellCmd::TogglePanel(id.clone()));
                 }
             }

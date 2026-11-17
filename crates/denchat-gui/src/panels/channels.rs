@@ -77,7 +77,9 @@ fn counts(cx: &PanelCx<'_>, id: &str) -> (u32, u32) {
 
 fn focus(cx: &mut PanelCx<'_>, id: &str) {
     let id = id.to_owned();
-    cx.actions.session(move |s| s.focus_channel(&id));
+    cx.actions.session(move |s| {
+        s.focus_channel(&id);
+    });
 }
 
 /// `# general` with an unread count or a red mention badge.
@@ -215,15 +217,28 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashSet
         kit::name(&resp, Role::Heading, format!("{} (you're here)", c.name));
         let painter = ui.painter();
         kit::icon(painter, pos2(rect.left() + 9.0, rect.center().y), icons::SPEAKER_HIGH, 16.0, p.ok);
-        let here = match cx.state.voice.joined_at {
-            Some(t) => format!("You're here · {}", elapsed(denchat_core::now_ms() - t)),
+        let timer = cx.state.voice.joined_at.map(|t| elapsed(denchat_core::now_ms() - t));
+        let mut options = vec![match &timer {
+            Some(t) => format!("You're here · {t}"),
             None => "You're here".into(),
-        };
-        let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(here, kit::font(11.5, W::Semibold), p.ok));
-        let pill = egui::Rect::from_min_size(pos2(rect.right() - g.size().x - 16.0, rect.center().y - 10.0), vec2(g.size().x + 16.0, 20.0));
-        painter.rect_filled(pill, CornerRadius::same(10), p.ok_soft);
-        painter.galley(pill.center() - g.size() / 2.0, g, p.ok);
-        let g = kit::line(ui, &c.name, kit::font(14.5, W::Semibold), p.text, pill.left() - rect.left() - 34.0);
+        }];
+        options.extend(timer);
+        // The longest pill that still leaves room for the channel's name; on a
+        // narrow sidebar, just the timer, or nothing.
+        const NAME_ROOM: f32 = 56.0;
+        let mut name_right = rect.right();
+        for text in options {
+            let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text, kit::font(11.5, W::Semibold), p.ok));
+            let left = rect.right() - g.size().x - 16.0;
+            if left - rect.left() - 34.0 >= NAME_ROOM {
+                let pill = egui::Rect::from_min_size(pos2(left, rect.center().y - 10.0), vec2(g.size().x + 16.0, 20.0));
+                painter.rect_filled(pill, CornerRadius::same(10), p.ok_soft);
+                painter.galley(pill.center() - g.size() / 2.0, g, p.ok);
+                name_right = pill.left();
+                break;
+            }
+        }
+        let g = kit::line(ui, &c.name, kit::font(14.5, W::Semibold), p.text, name_right - rect.left() - 34.0);
         kit::put(ui.painter(), &g, rect.left() + 26.0, rect.center().y, p.text);
         if !cx.state.voice.engine {
             ui.label(cx.small("Connecting audio…"));
@@ -297,7 +312,9 @@ fn horizontal(ui: &mut Ui, cx: &mut PanelCx<'_>) {
             }
             if ui.selectable_label(selected, label).clicked() {
                 let id = c.id.clone();
-                cx.actions.session(move |s| s.focus_channel(&id));
+                cx.actions.session(move |s| {
+                    s.focus_channel(&id);
+                });
             }
             if mentions > 0 && !selected {
                 ui.label(RichText::new(format!("@{mentions}")).size(p.small_size).color(p.danger));

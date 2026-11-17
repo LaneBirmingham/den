@@ -86,11 +86,16 @@ impl HistoryPrint {
 }
 
 fn print_message(m: &ChatMessage, chan: &str) {
-    match m.kind {
-        MessageKind::User => println!("[{}] {chan}<{}> {}", clock(m.ts), m.author, m.text),
-        MessageKind::Server => println!("[{}] {chan}** {}: {}", clock(m.ts), m.author, m.text),
-        MessageKind::System => println!("[{}] {chan}-- {}", clock(m.ts), m.text),
-    }
+    let t = clock(m.ts);
+    let (head, text) = match (m.kind, m.emote()) {
+        (MessageKind::User, Some(action)) => (format!("[{t}] {chan}* {} ", m.author), action),
+        (MessageKind::User, None) => (format!("[{t}] {chan}<{}> ", m.author), m.text.as_str()),
+        (MessageKind::Server, _) => (format!("[{t}] {chan}** {}: ", m.author), m.text.as_str()),
+        (MessageKind::System, _) => (format!("[{t}] {chan}-- "), m.text.as_str()),
+    };
+    // Later lines of a multi-line message line up under the first.
+    let pad = format!("\n{}", " ".repeat(head.chars().count()));
+    println!("{head}{}", text.lines().collect::<Vec<_>>().join(&pad));
 }
 
 fn print_event(session: &Session, ev: &Event) {

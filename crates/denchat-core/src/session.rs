@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use denchat_proto::voice::Codec;
 use denchat_proto::{
-    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, Member, MemberId, MessageKind, NoticeLevel,
-    PROTOCOL_VERSION, Reach, ServerInfo, ServerMsg, VoiceSetup,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
+    MessageKind, NoticeLevel, PROTOCOL_VERSION, Reach, ServerInfo, ServerMsg, VoiceSetup,
 };
 use iroh::endpoint::Connection;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -40,6 +40,19 @@ use crate::server::{self, HandoffState, ServerHandle, ServerMode, ServerOptions}
 use crate::ui::{UiStore, Widget};
 
 const MAX_LOCAL_MESSAGES: usize = 2000;
+
+/// Why the host would drop or refuse `text` as a message, if it would: blank,
+/// or over [`MAX_MESSAGE_LEN`] once trailing whitespace is gone.
+pub fn message_problem(text: &str) -> Option<String> {
+    let text = text.trim_end();
+    if text.trim().is_empty() {
+        return Some("message is empty".into());
+    }
+    if text.len() > MAX_MESSAGE_LEN {
+        return Some(format!("messages are limited to {MAX_MESSAGE_LEN} bytes (this one is {})", text.len()));
+    }
+    None
+}
 
 /// Built-in slash commands: `(usage, description)`. Frontends use this for help and completion.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
@@ -733,27 +746,39 @@ impl Session {
 
     // ----- chat ----------------------------------------------------------
 
-    pub fn focus_channel(&self, channel: &str) {
+    /// Switch to text channel `channel`; false if there's no such channel.
+    pub fn focus_channel(&self, channel: &str) -> bool {
         let channel = denchat_proto::clean_channel_id(channel);
         self.inner.update(|s| {
-            if s.channel(&channel).is_some_and(|c| c.kind == ChannelKind::Text) {
-                if let Some(old) = s.focus.take().filter(|f| *f != channel) {
-                    s.new_since.remove(&old);
-                }
-                s.unread.remove(&channel);
-                s.mentions.remove(&channel);
-                s.focus = Some(channel);
+            if !s.channel(&channel).is_some_and(|c| c.kind == ChannelKind::Text) {
+                return false;
             }
-        });
+            if let Some(old) = s.focus.take().filter(|f| *f != channel) {
+                s.new_since.remove(&old);
+            }
+            s.unread.remove(&channel);
+            s.mentions.remove(&channel);
+            s.focus = Some(channel);
+            true
+        })
     }
 
     /// Send plain text (no slash-command handling).
     pub fn send_message(&self, channel: Option<&str>, text: &str) {
-        let Some(channel) = self.inner.target_channel(channel) else {
-            self.notice(NoticeLevel::Warn, "not in a room".into());
-            return;
-        };
+        if let Err(e) = self.try_send_message(channel, text) {
+            self.notice(NoticeLevel::Warn, e);
+        }
+    }
+
+    /// [`Session::send_message`], but says why the text can't go (empty, too
+    /// long, no room) instead of posting a notice.
+    pub fn try_send_message(&self, channel: Option<&str>, text: &str) -> Result<(), String> {
+        if let Some(problem) = message_problem(text) {
+            return Err(problem);
+        }
+        let channel = self.inner.target_channel(channel).ok_or("not in a room")?;
         self.inner.send(ClientMsg::Send { channel, text: text.to_owned() });
+        Ok(())
     }
 
     /// Handle composer input: `/commands` (built-in, then mods) or plain text.
@@ -813,7 +838,11 @@ impl Session {
                 let nick = self.state().me().map(|m| m.nick.clone()).unwrap_or_default();
                 self.send_message(channel, &format!("_{nick} {arg}_"));
             }
-            "ch" | "channel" if !arg.is_empty() => self.focus_channel(arg),
+            "ch" | "channel" if !arg.is_empty() => {
+                if !self.focus_channel(arg) {
+                    self.notice(NoticeLevel::Warn, format!("no text channel #{}", denchat_proto::clean_channel_id(arg)));
+                }
+            }
             "clear" => {
                 let ch = self.inner.target_channel(channel);
                 self.inner.update(|s| {
@@ -1073,6 +1102,11 @@ impl Session {
             .get_or_init(|| async move {
                 let hosted = me.inner.hosted.lock().clone();
                 let my_id = me.state().me;
+                // We're going: don't follow the room to its next host (and
+                // start voice up again there) while the handoff runs.
+                me.inner.epoch.fetch_add(1, Ordering::SeqCst);
+                me.inner.stop_connection();
+                *me.inner.voice_wanted.lock() = None;
                 match hosted.map(|h| (h.hand_off(None, my_id), h)) {
                     Some((Ok(m), h)) => {
                         tracing::info!("closing: handing the room to {}", m.nick);
@@ -1183,6 +1217,14 @@ async fn conn_task(inner: Arc<Inner>, epoch: u64, mut addrs: Vec<String>) {
                 } else {
                     tracing::info!("the room moved to {to:?} (term {term})");
                     addrs = inner.moved(to.clone(), term);
+                    // Redirected before we ever got in (an invite from an
+                    // earlier host): we have no saved copy to take the room
+                    // and invite from, so bring them along from the link.
+                    if let Ok(from) = Link::parse(&addr)
+                        && from.room.is_some()
+                    {
+                        addrs = addrs.into_iter().map(|a| carry_room(&a, &from)).collect();
+                    }
                     last_move = Some((to, term));
                 }
                 attempt = 0;
@@ -1224,6 +1266,21 @@ async fn conn_task(inner: Arc<Inner>, epoch: u64, mut addrs: Vec<String>) {
         inner.update(|s| s.conn = ConnState::Connecting { addr: addr.clone(), attempt });
         inner.emit(names::CONNECTION_CHANGED, json!({"state": "connecting", "addr": addr, "attempt": attempt}));
         tokio::time::sleep(delay).await;
+    }
+}
+
+/// `to` with `from`'s room and invite where it has none of its own (and
+/// names the same room, or none).
+fn carry_room(to: &str, from: &Link) -> String {
+    match Link::parse(to) {
+        Ok(l) if l.room.is_none() || l.room == from.room => {
+            let invite = l.invite.clone().or_else(|| from.invite.clone());
+            let room = l.room.clone().or_else(|| from.room.clone());
+            let mut l = l.invite(invite);
+            l.room = room;
+            l.to_string()
+        }
+        _ => to.to_owned(),
     }
 }
 
@@ -1710,6 +1767,14 @@ impl Inner {
         slot.voice = None;
         drop(slot);
         self.stop_engine();
+        self.stop_forwarding();
+    }
+
+    /// Stop sending joins for our room on to its host (we left, or lost it).
+    fn stop_forwarding(&self) {
+        if let (Some(net), Some(id)) = (self.net.get(), self.state.read().room_id()) {
+            net.forward(id, None);
+        }
     }
 
     /// After a connection ends: forget live state but keep messages on screen.
@@ -1724,6 +1789,7 @@ impl Inner {
             slot.voice = None;
         }
         self.stop_engine();
+        self.stop_forwarding();
         self.update(|s| {
             s.members.clear();
             s.me = None;
@@ -1754,6 +1820,14 @@ impl Inner {
             slot.outbox = Some(tx);
             slot.link = Some(link);
             slot.voice = Some(voice);
+        }
+        // Joins that reach us for this room (an invite from when we hosted
+        // it) go on to where it's hosted now, unless that's us.
+        if let Some(net) = self.net.get()
+            && rooms::valid_id(&server.room_id)
+            && Link::parse(addr).is_ok_and(|l| l.id() != net.id())
+        {
+            net.forward(&server.room_id, Some((addr.to_owned(), server.term)));
         }
         let motd = server.motd.clone();
         let room = server.name.clone();
@@ -2317,17 +2391,13 @@ impl ApiHandler for SessionApi {
                 let all = st.messages(&channel);
                 ok(&all[all.len().saturating_sub(limit)..])
             }
-            "message.send" => require_str(&p, "text").map(|t| {
-                s.send_message(ch.as_deref(), &t);
-                json!({"sent": true})
-            }),
+            "message.send" => require_str(&p, "text").and_then(|t| s.try_send_message(ch.as_deref(), &t)).map(|()| json!({"sent": true})),
             "input.submit" => require_str(&p, "text").map(|t| {
                 s.submit(ch.as_deref(), &t);
                 json!({"submitted": true})
             }),
-            "channel.focus" => require_str(&p, "channel").map(|c| {
-                s.focus_channel(&c);
-                json!({"focus": s.state().focus})
+            "channel.focus" => require_str(&p, "channel").and_then(|c| {
+                if s.focus_channel(&c) { Ok(json!({"focus": s.state().focus})) } else { Err(format!("no text channel #{c}")) }
             }),
             "nick.set" => require_str(&p, "nick").map(|n| {
                 s.set_nick(&n);

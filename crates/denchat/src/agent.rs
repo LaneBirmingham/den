@@ -617,7 +617,7 @@ async fn live_instance(home: &Path) -> Option<(ApiClient, InstanceInfo)> {
     None
 }
 
-pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> {
+pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths, nick: Option<String>) -> anyhow::Result<()> {
     match cmd {
         SandboxCmd::Path { name } => println!("{}", sandbox_home(&name)?.display()),
         SandboxCmd::List => {
@@ -705,7 +705,8 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths) -> anyhow::Result<()> 
             }
             // Its own config: never the user's devices, never the user's clipboard.
             let mut cfg: AppConfig = config::load_or_default(&paths.config_file())?;
-            cfg.nick = Some(name.clone());
+            // `den sandbox start a --nick alice`; otherwise the sandbox's name.
+            cfg.nick = Some(nick.unwrap_or_else(|| name.clone()));
             // A copied config may have these off; a sandbox is for driving.
             cfg.modules.api = true;
             cfg.modules.agent_control = true;

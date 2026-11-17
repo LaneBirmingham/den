@@ -342,6 +342,10 @@ struct NetInner {
     ready: AtomicBool,
     routes: Mutex<Vec<Route>>,
     next_route: AtomicU64,
+    /// Rooms this app is in but doesn't host: where they're hosted now, and
+    /// at which term. A join that reaches us with an old invite (the room
+    /// was hosted here before a handoff) is sent on there.
+    forwards: Mutex<Vec<(String, String, u64)>>,
     /// A second endpoint for joining rooms this one hosts (an endpoint can't dial itself).
     loopback: tokio::sync::OnceCell<Endpoint>,
     /// The router offers port mapping (UPnP, NAT-PMP or PCP), so the
@@ -672,6 +676,7 @@ impl Net {
             ready: AtomicBool::new(false),
             routes: Mutex::new(Vec::new()),
             next_route: AtomicU64::new(1),
+            forwards: Mutex::new(Vec::new()),
             loopback: tokio::sync::OnceCell::new(),
             router_maps: AtomicBool::new(false),
         });
@@ -878,6 +883,16 @@ impl Net {
         Registration { net: Arc::downgrade(&self.inner), id }
     }
 
+    /// Send joins for `room` that reach us on to `host` (a link without the
+    /// invite) at `term`, while we're in the room there; `None` stops that.
+    pub fn forward(&self, room: &str, to: Option<(String, u64)>) {
+        let mut f = self.inner.forwards.lock();
+        f.retain(|(r, ..)| r != room);
+        if let Some((host, term)) = to {
+            f.push((room.to_owned(), host, term));
+        }
+    }
+
     /// Dial `addr` (our own endpoint included).
     pub async fn connect(&self, addr: EndpointAddr, timeout: Duration) -> anyhow::Result<Connection> {
         let who = addr.id.fmt_short().to_string();
@@ -1018,7 +1033,19 @@ async fn route(inner: Weak<NetInner>, incoming: iroh::endpoint::Incoming) -> any
             }
         }
         None => {
-            let _ = write_frame(&mut send, &no_room(room.as_deref())).await;
+            // A join for a room we're in but don't host (it was handed on, or
+            // someone has an invite from when we hosted): send it there.
+            let forward = match (&first, &room, inner.upgrade()) {
+                (ClientMsg::Hello { .. }, Some(id), Some(n)) => {
+                    n.forwards.lock().iter().find(|(r, ..)| r == id).map(|(_, to, term)| (to.clone(), *term))
+                }
+                _ => None,
+            };
+            let reply = match forward {
+                Some((to, term)) => ServerMsg::Handoff { to: vec![to], term },
+                None => no_room(room.as_deref()),
+            };
+            let _ = write_frame(&mut send, &reply).await;
             finish(&conn, send).await;
         }
     }

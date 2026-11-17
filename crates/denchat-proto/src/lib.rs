@@ -253,6 +253,19 @@ pub struct ChatMessage {
     pub kind: MessageKind,
 }
 
+impl ChatMessage {
+    /// The action of a `/me` message, which arrives as `_nick waves_`:
+    /// `Some("waves")`.
+    pub fn emote(&self) -> Option<&str> {
+        self.text
+            .strip_prefix('_')
+            .and_then(|t| t.strip_suffix('_'))
+            .and_then(|t| t.strip_prefix(self.author.as_str()))
+            .and_then(|t| t.strip_prefix(' '))
+            .filter(|_| self.kind == MessageKind::User)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ServerInfo {
     pub name: String,

@@ -78,8 +78,14 @@ impl DenApp {
         let repaint = ctx.clone();
         session.on_change(move || repaint.request_repaint());
         agent::attach(ctx, session.ui(), kind);
-        let hidden: HashSet<String> =
-            storage.and_then(|s| eframe::get_value::<Vec<String>>(s, HIDDEN_KEY)).unwrap_or_default().into_iter().collect();
+        // The header holds View → Panels; an older build let it be hidden,
+        // which left no way to bring anything back.
+        let hidden: HashSet<String> = storage
+            .and_then(|s| eframe::get_value::<Vec<String>>(s, HIDDEN_KEY))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| id != crate::panels::header::ID)
+            .collect();
         let catalog = Catalog::scan(session.paths(), &session.mods());
         let ui_cfg = session.config().ui;
         let zoom = scale(ui_cfg.scale);
@@ -303,7 +309,7 @@ impl DenApp {
                 self.session.update_config(|c| c.ui.layout = n);
             }
             ShellCmd::TogglePanel(id) => {
-                if !self.hidden.remove(&id) {
+                if !self.hidden.remove(&id) && id != crate::panels::header::ID {
                     self.hidden.insert(id);
                 }
             }
@@ -370,6 +376,30 @@ impl DenApp {
 }
 
 impl eframe::App for DenApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Agent calls need frames even while eframe is holding them back (see
+        // `AgentPlugin::wants_offscreen_pass`): run one here and draw it on the CPU.
+        if !ctx.with_plugin::<AgentPlugin, _>(|p| p.wants_offscreen_pass()).unwrap_or(false) {
+            return;
+        }
+        let mut raw = ctx.input(|i| i.raw.clone());
+        raw.events.clear();
+        raw.hovered_files.clear();
+        raw.dropped_files.clear();
+        raw.time = None;
+        ctx.with_plugin::<AgentPlugin, _>(|p| p.offscreen = true);
+        let out = ctx.run_ui(raw, |ui| self.frame(ui));
+        ctx.with_plugin::<AgentPlugin, _>(|p| p.offscreen = false);
+        // Hand what the pass asked for (window commands, copies) to eframe.
+        ctx.output_mut(|o| o.append(out.platform_output));
+        for (id, vo) in out.viewport_output {
+            for cmd in vo.commands {
+                ctx.send_viewport_cmd_to(id, cmd);
+            }
+            ctx.request_repaint_after_for(vo.repaint_delay, id);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
     }

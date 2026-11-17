@@ -43,15 +43,7 @@ impl<'a> View<'a> {
         let time = chrono::DateTime::from_timestamp_millis(m.ts)
             .map(|t| t.with_timezone(&chrono::Local).format(fmt).to_string())
             .unwrap_or_default();
-        // `/me waves` arrives as `_nick waves_`.
-        let emote_body = m
-            .text
-            .strip_prefix('_')
-            .and_then(|t| t.strip_suffix('_'))
-            .and_then(|t| t.strip_prefix(m.author.as_str()))
-            .and_then(|t| t.strip_prefix(' '))
-            .filter(|_| m.kind == MessageKind::User);
-        let (emote, text) = match emote_body {
+        let (emote, text) = match m.emote() {
             Some(rest) => (true, rest),
             None => (false, m.text.as_str()),
         };

@@ -44,7 +44,9 @@ async fn drive_the_app_headless() {
     };
 
     // In the room, the built-in panels name their widgets.
-    let found = call(&session, "ui.wait", json!({"target": "Room menu", "timeout_ms": 15_000})).await;
+    // `button:`: the lobby's hint ("… room menu → Copy invite link") also
+    // contains the words, and shows until the room is up.
+    let found = call(&session, "ui.wait", json!({"target": "button:Room menu", "timeout_ms": 15_000})).await;
     assert!(found["found"].as_str().unwrap().contains("test room"), "{found}");
     let t = tree(&session).await;
     for want in ["core.channels", "button \"#general\"", "textbox \"Message #general\"", "item \"alice (you) · Online\""] {

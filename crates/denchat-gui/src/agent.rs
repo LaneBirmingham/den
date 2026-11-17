@@ -464,6 +464,14 @@ pub struct AgentPlugin {
     /// Accessibility was on before any agent call (a screen reader).
     screen_reader: bool,
     title: String,
+    /// When the last egui pass ran, real or off-screen.
+    last_pass: Instant,
+    /// Between `input_hook` and `output_hook`: no new pass can start.
+    in_pass: bool,
+    /// The pass running now is [`AgentPlugin::wants_offscreen_pass`]'s: draw on the CPU.
+    pub offscreen: bool,
+    /// Texture changes from off-screen passes, for the GPU's next real frame.
+    held_textures: egui::TexturesDelta,
 }
 
 /// Window mode keeps the accessibility tree switched on this long after the last call.
@@ -492,7 +500,25 @@ impl AgentPlugin {
             pointer: None,
             screen_reader: false,
             title: "Den".into(),
+            last_pass: Instant::now(),
+            in_pass: false,
+            offscreen: false,
+            held_textures: Default::default(),
         }
+    }
+
+    /// Agent calls are waiting, but the window has had no frame for a while.
+    /// On Wayland a window the compositor isn't showing (another workspace, a
+    /// sleeping monitor) gets no frame callbacks, so eframe stops running the ui
+    /// and calls only `App::logic`, without saying the window is hidden.
+    pub fn wants_offscreen_pass(&mut self) -> bool {
+        if self.in_pass {
+            return false;
+        }
+        for call in self.ui.take_frontend_calls() {
+            self.submit(call);
+        }
+        self.kind == Kind::Window && !self.jobs.is_empty() && self.last_pass.elapsed() > Duration::from_millis(200)
     }
 
     /// Queue a call from inside the app (e.g. `DEN_SCREENSHOT`).
@@ -822,7 +848,7 @@ impl AgentPlugin {
             (Kind::Headless, "gpu") => return Err("a headless app has no GPU renderer; use renderer=cpu (the default)".into()),
             (Kind::Headless, _) | (_, "cpu") => false,
             (Kind::Window, "gpu") => true,
-            (Kind::Window, _) => visible,
+            (Kind::Window, _) => visible && !self.offscreen,
         };
         let gpu = gpu.then(|| {
             let id = self.next_shot;
@@ -944,6 +970,7 @@ impl egui::Plugin for AgentPlugin {
     }
 
     fn input_hook(&mut self, ctx: &Context, input: &mut RawInput) {
+        self.in_pass = true;
         for call in self.ui.take_frontend_calls() {
             self.submit(call);
         }
@@ -999,6 +1026,11 @@ impl egui::Plugin for AgentPlugin {
                 injected = true;
                 if let Some(batch) = steps.pop_front() {
                     input.events.extend(batch);
+                    // Input we inject is meant for the app as if it had keyboard focus,
+                    // which a window driven from behind doesn't: without this,
+                    // `Response::has_focus` is false (it needs the window focused too),
+                    // so a key handled after the widget, like the composer's Enter, is lost.
+                    input.focused = true;
                 }
                 if steps.is_empty() {
                     let done = std::mem::take(&mut job.done);
@@ -1021,6 +1053,16 @@ impl egui::Plugin for AgentPlugin {
 
     fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput) {
         self.textures.apply(&output.textures_delta);
+        self.last_pass = Instant::now();
+        self.in_pass = false;
+        if self.offscreen {
+            // Nothing paints this pass: keep its texture changes for the next frame that does.
+            self.held_textures.append(std::mem::take(&mut output.textures_delta));
+        } else if !self.held_textures.is_empty() {
+            let newer = std::mem::take(&mut output.textures_delta);
+            output.textures_delta = std::mem::take(&mut self.held_textures);
+            output.textures_delta.append(newer);
+        }
         // Clipboard: remember copies; with $DEN_CLIPBOARD (or no window to own
         // a clipboard) send them there instead of the user's clipboard.
         let intercept = self.clipboard_file.is_some() || self.kind == Kind::Headless;

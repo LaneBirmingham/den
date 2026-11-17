@@ -12,7 +12,7 @@
 
 mod channels;
 mod composer;
-mod header;
+pub(crate) mod header;
 mod lobby;
 mod members;
 mod messages;
@@ -147,7 +147,7 @@ impl Registry {
     pub fn with_builtins() -> Registry {
         let mut r = Registry::empty();
         r.register("core.lobby", "Host or join a room", || Box::new(lobby::Lobby::default()));
-        r.register("core.header", "Room header and View menu", || Box::new(header::Header));
+        r.register(header::ID, "Room header and View menu", || Box::new(header::Header));
         r.register("core.channels", "Text and voice channels", || Box::new(channels::Channels));
         r.register("core.voice", "Voice controls", || Box::new(voice::Voice::default()));
         r.register("core.members", "People in the room", || Box::new(members::Members));
