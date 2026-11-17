@@ -110,10 +110,13 @@ pub struct WindowSpec {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Keys {
+    /// Hold to talk. Settings (`[voice] ptt_key` in config.toml) override it.
     pub ptt: Option<String>,
     pub mute: Option<String>,
     pub deafen: Option<String>,
     pub reload: Option<String>,
+    /// Open / close the settings page.
+    pub settings: Option<String>,
 }
 
 impl Default for Keys {
@@ -123,6 +126,33 @@ impl Default for Keys {
             mute: Some("Ctrl+Shift+M".into()),
             deafen: Some("Ctrl+Shift+D".into()),
             reload: Some("Ctrl+Shift+R".into()),
+            settings: Some("Ctrl+Comma".into()),
+        }
+    }
+}
+
+/// What can be held to talk: a key, or a side mouse button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PttInput {
+    Key(egui::Key),
+    Pointer(egui::PointerButton),
+}
+
+impl PttInput {
+    /// `F8`, `Space`, `Mouse4`/`Mouse5` (modifiers are ignored: you hold
+    /// the key while doing other things).
+    pub fn parse(spec: &str) -> Option<PttInput> {
+        match spec.trim().to_ascii_lowercase().as_str() {
+            "mouse4" | "mousex1" | "mouseback" => Some(PttInput::Pointer(egui::PointerButton::Extra1)),
+            "mouse5" | "mousex2" | "mouseforward" => Some(PttInput::Pointer(egui::PointerButton::Extra2)),
+            _ => parse_key(spec).map(|(_, k)| PttInput::Key(k)),
+        }
+    }
+
+    pub fn down(&self, i: &egui::InputState) -> bool {
+        match *self {
+            PttInput::Key(k) => i.key_down(k),
+            PttInput::Pointer(b) => i.pointer.button_down(b),
         }
     }
 }
@@ -255,5 +285,11 @@ mod tests {
         assert_eq!(k, egui::Key::M);
         assert_eq!(parse_key("F8").unwrap().1, egui::Key::F8);
         assert!(parse_key("Ctrl+Nope").is_none());
+        assert_eq!(parse_key("Ctrl+Comma").unwrap().1, egui::Key::Comma);
+        // What the settings page stores round-trips.
+        for k in [egui::Key::F8, egui::Key::Space, egui::Key::V, egui::Key::Backtick] {
+            assert_eq!(PttInput::parse(k.name()), Some(PttInput::Key(k)), "{}", k.name());
+        }
+        assert_eq!(PttInput::parse("Mouse4"), Some(PttInput::Pointer(egui::PointerButton::Extra1)));
     }
 }

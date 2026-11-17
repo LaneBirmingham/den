@@ -39,6 +39,8 @@ pub mod names {
     pub const COMMAND_RUN: &str = "command.run";
     /// History arrived from the host (on join, or merged from a sync): `{channel, count}`.
     pub const HISTORY_LOADED: &str = "history.loaded";
+    /// Someone added a channel: `{channels, created}` (`created`: the new ones).
+    pub const CHANNELS_UPDATED: &str = "channels.updated";
 
     /// Every name, for docs and `api.methods`.
     pub const ALL: &[&str] = &[
@@ -57,6 +59,7 @@ pub mod names {
         ROOM_MOVED,
         COMMAND_RUN,
         HISTORY_LOADED,
+        CHANNELS_UPDATED,
     ];
 }
 

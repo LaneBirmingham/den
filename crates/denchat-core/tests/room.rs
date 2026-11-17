@@ -1013,6 +1013,12 @@ async fn voice_between_two_sessions_on_test_devices() {
     assert!(a.tx_packets >= 50 && a.input_level > 0.15, "{a:?}");
     let b = bob.voice_stats().unwrap();
     assert!(b.input_level < 1e-3, "silence in: {b:?}");
+    // Talking indicators: a loud tone is near the top of the speech range,
+    // on both ends; silence doesn't light up.
+    assert!(a.transmitting && a.input_intensity > 0.6, "alice's own ring: {a:?}");
+    let heard = b.speakers.iter().find(|s| s.speaking).expect("bob hears a speaker");
+    assert!(heard.intensity > 0.6, "alice's ring as bob sees it: {heard:?}");
+    assert_eq!(b.input_intensity, 0.0);
 
     // The recording is readable while voice runs, and holds the tone.
     wait_for("tone recorded", || {
@@ -1090,4 +1096,80 @@ async fn relay_only_links_go_through_the_relay() {
         s.shutdown();
     }
     relay.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn members_create_channels_that_outlive_the_host() {
+    use denchat_core::proto::ChannelKind;
+    let home = tmp("channels");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2 && bob.state().conn.is_connected()).await;
+    let kind_of = |s: &Session, id: &str| s.state().channel(id).map(|c| (c.name.clone(), c.kind));
+
+    // Anyone can add one; the creator lands in the new text channel.
+    bob.create_channel("Dev Talk", ChannelKind::Text);
+    wait_for("alice sees #dev-talk", || kind_of(&alice, "dev-talk").is_some()).await;
+    assert_eq!(kind_of(&bob, "dev-talk"), Some(("dev-talk".into(), ChannelKind::Text)));
+    wait_for("bob focuses it", || bob.state().focus.as_deref() == Some("dev-talk")).await;
+    assert_eq!(alice.state().focus.as_deref(), Some("general"), "others stay where they are");
+    alice.send_message(Some("dev-talk"), "first!");
+    wait_for("message in the new channel", || has_text(&bob, "dev-talk", "first!")).await;
+
+    // Voice channels keep the typed name; taken ids get a suffix.
+    alice.submit(None, "/newchannel voice Gaming Room");
+    wait_for("voice channel", || kind_of(&bob, "gaming-room") == Some(("Gaming Room".into(), ChannelKind::Voice))).await;
+    alice.create_channel("dev talk", ChannelKind::Text);
+    wait_for("deduplicated", || kind_of(&bob, "dev-talk-2").is_some()).await;
+
+    // Every member saved them, so the next host serves them.
+    let bob_id = member_id(&alice, "bob");
+    alice.handoff(Some(bob_id));
+    wait_for("moved to bob", || on_term(&alice, 2) && on_term(&bob, 2)).await;
+    let ids: Vec<String> = alice.state().channels.iter().map(|c| c.id.clone()).collect();
+    for want in ["general", "lounge", "dev-talk", "gaming-room", "dev-talk-2"] {
+        assert!(ids.iter().any(|i| i == want), "{want} missing after handoff: {ids:?}");
+    }
+    wait_for("history kept", || has_text(&alice, "dev-talk", "first!")).await;
+    bob.shutdown();
+}
+
+/// The settings page's mic test: devices open outside a call, stats show the
+/// mic and the gate, and joining voice takes the devices over.
+#[cfg(feature = "voice")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mic_test_outside_a_call() {
+    use denchat_core::config::VoiceConfig;
+    let home = tmp("mic-test");
+    let voice =
+        VoiceConfig { input_device: Some("test:sine:440".into()), output_device: Some("test:null".into()), ..VoiceConfig::default() };
+    let config =
+        AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), voice, ..AppConfig::default() };
+    let alice = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+
+    alice.voice_test(true);
+    wait_for("mic metered", || alice.voice_stats().is_some_and(|v| v.test && v.input_intensity > 0.6 && v.transmitting)).await;
+    assert!(alice.state().voice.testing);
+    // A gate above the tone closes it; settings apply to the running test.
+    alice.set_vad_threshold(0.9);
+    wait_for("gate closed", || alice.voice_stats().is_some_and(|v| !v.transmitting)).await;
+    alice.set_voice_loopback(true);
+    assert!(alice.state().voice.loopback);
+
+    alice.voice_test(false);
+    wait_for("test stopped", || alice.voice_stats().is_none() && !alice.state().voice.testing).await;
+
+    // Joining voice ends a running test.
+    let srv = start_server(None).await;
+    alice.join(link(&srv).await);
+    wait_for("connected", || alice.state().conn.is_connected()).await;
+    alice.voice_test(true);
+    wait_for("testing", || alice.voice_stats().is_some_and(|v| v.test)).await;
+    alice.voice_join(None);
+    wait_for("call took over", || alice.state().voice.engine && !alice.state().voice.testing).await;
+    assert!(alice.voice_stats().is_some_and(|v| !v.test));
+    alice.shutdown();
+    srv.shutdown();
 }

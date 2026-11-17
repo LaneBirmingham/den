@@ -154,8 +154,57 @@ pub struct SpeakerStat {
     pub buffered_ms: u32,
 }
 
-/// Speaker id used for the local echo in [`loopback_test`].
+/// Speaker id used for the local echo in [`loopback_test`] and [`MicTest`].
 pub const LOOPBACK_SPEAKER: u32 = u32::MAX;
+
+/// A voice engine with no network, for settings screens: meters the mic
+/// (through the real gate, so [`VoiceStats::transmitting`] shows whether you'd
+/// be heard) and, with loopback on, plays what would be sent back to you.
+pub struct MicTest {
+    engine: Arc<VoiceEngine>,
+    sink: Arc<EchoSink>,
+}
+
+struct EchoSink {
+    engine: std::sync::OnceLock<std::sync::Weak<VoiceEngine>>,
+    echo: std::sync::atomic::AtomicBool,
+}
+
+impl PacketSink for EchoSink {
+    fn send_voice(&self, seq: u16, codec: Codec, payload: &[u8]) {
+        if self.echo.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(engine) = self.engine.get().and_then(std::sync::Weak::upgrade)
+        {
+            engine.receive(LOOPBACK_SPEAKER, seq, codec, payload);
+        }
+    }
+}
+
+impl MicTest {
+    /// Open the devices in `settings`. Blocks while they open (up to ~10 s).
+    pub fn start(settings: VoiceSettings) -> Result<MicTest> {
+        let sink = Arc::new(EchoSink { engine: Default::default(), echo: Default::default() });
+        let engine = Arc::new(VoiceEngine::start(settings, sink.clone())?);
+        let _ = sink.engine.set(Arc::downgrade(&engine));
+        Ok(MicTest { engine, sink })
+    }
+
+    pub fn engine(&self) -> &VoiceEngine {
+        &self.engine
+    }
+
+    /// Hear yourself (use headphones: there is no echo cancellation).
+    pub fn set_loopback(&self, on: bool) {
+        let was = self.sink.echo.swap(on, std::sync::atomic::Ordering::Relaxed);
+        if was && !on {
+            self.engine.remove_speaker(LOOPBACK_SPEAKER);
+        }
+    }
+
+    pub fn loopback(&self) -> bool {
+        self.sink.echo.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Mic -> encode -> decode -> speakers locally for `duration` (echo test), returns stats at the end.
 ///

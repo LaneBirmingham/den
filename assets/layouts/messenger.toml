@@ -25,5 +25,3 @@ header = true
 placeholder = "Message #{channel}"
 style = "pill"
 
-[panel."core.voice"]
-show_devices = false

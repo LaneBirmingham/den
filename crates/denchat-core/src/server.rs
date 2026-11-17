@@ -27,8 +27,9 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use denchat_proto::voice::{self, Packet};
 use denchat_proto::{
-    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
-    MessageKind, PROTOCOL_VERSION, Profile, Proof, Reach, ServerInfo, ServerMsg, VoiceSetup, clean_nick, encode_frame,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_CHANNEL_NAME, MAX_CHANNELS,
+    MAX_MESSAGE_LEN, Member, MemberId, MessageKind, PROTOCOL_VERSION, Profile, Proof, Reach, ServerInfo, ServerMsg, VoiceSetup,
+    channel_slug, clean_nick, encode_frame,
 };
 use iroh::endpoint::Connection;
 use parking_lot::Mutex;
@@ -127,6 +128,10 @@ pub enum ServerEvent {
     Moved {
         to: Vec<String>,
         term: u64,
+    },
+    /// A member added a channel; `channels` is the new list.
+    ChannelsUpdated {
+        channels: Vec<Channel>,
     },
 }
 
@@ -736,6 +741,55 @@ impl Shared {
                 _ => self.reply(&mut room, id, &reject("no_channel", format!("no voice channel #{channel}"))),
             },
             ClientMsg::VoiceLeave => self.update_member(&mut room, id, |m| m.voice = None),
+            ClientMsg::CreateChannel { name, kind } => {
+                let display: String = name.trim().trim_start_matches('#').trim().chars().take(MAX_CHANNEL_NAME).collect();
+                let slug = channel_slug(&display);
+                if slug.is_empty() {
+                    self.reply(&mut room, id, &reject("bad_channel", "channel names need a letter or a digit"));
+                    return;
+                }
+                if room.channels.len() >= MAX_CHANNELS {
+                    self.reply(&mut room, id, &reject("too_many_channels", format!("a room can have {MAX_CHANNELS} channels")));
+                    return;
+                }
+                // Like a message, it counts against the sender's rate limit.
+                let limit = self.cfg.rate_limit.max(1) as usize;
+                if let Some(conn) = room.members.get_mut(&id) {
+                    let now = Instant::now();
+                    while conn.sent.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10)) {
+                        conn.sent.pop_front();
+                    }
+                    if conn.sent.len() >= limit {
+                        let msg =
+                            ServerMsg::Notice { level: denchat_proto::NoticeLevel::Warn, text: "slow down — channel not created".into() };
+                        send_to(conn, &frame(&msg));
+                        return;
+                    }
+                    conn.sent.push_back(now);
+                }
+                // Ids are unique across kinds: `lounge`, `lounge-2`, …
+                let id_free = |c: &str| !room.channels.iter().any(|x| x.id == c);
+                let Some(cid) = std::iter::once(slug.clone())
+                    .chain((2..100).map(|i| {
+                        let suffix = format!("-{i}");
+                        format!("{}{suffix}", &slug[..slug.len().min(32 - suffix.len())])
+                    }))
+                    .find(|c| id_free(c))
+                else {
+                    self.reply(&mut room, id, &reject("bad_channel", "that channel name is taken"));
+                    return;
+                };
+                // Text channels show their id (`#dev-talk`); voice channels keep what was typed.
+                let name = match kind {
+                    ChannelKind::Text => cid.clone(),
+                    ChannelKind::Voice => display,
+                };
+                room.channels.push(Channel { id: cid, name, kind, topic: None });
+                let channels = room.channels.clone();
+                room.broadcast(&frame(&ServerMsg::ChannelsUpdated { channels: channels.clone() }), None);
+                drop(room);
+                let _ = self.events.send(ServerEvent::ChannelsUpdated { channels });
+            }
             ClientMsg::VoiceState { muted, deafened } => self.update_member(&mut room, id, |m| {
                 m.muted = muted;
                 m.deafened = deafened;

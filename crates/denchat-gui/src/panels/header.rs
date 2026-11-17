@@ -205,8 +205,12 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
     });
 }
 
-/// Theme / layout / panel toggles and reloads.
+/// Settings, theme / layout / panel toggles and reloads.
 fn view_items(ui: &mut Ui, cx: &mut PanelCx<'_>) {
+    if ui.button(format!("{}  Settings", icons::GEAR_SIX)).on_hover_text("Microphone, headset, push to talk, look").clicked() {
+        cx.actions.shell(ShellCmd::OpenSettings);
+        ui.close();
+    }
     ui.menu_button(format!("{}  Theme", icons::PALETTE), |ui| {
         for (name, origin) in &cx.shell.themes {
             if ui.radio(cx.shell.theme == *name, name).on_hover_text(origin).clicked() {

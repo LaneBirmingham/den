@@ -17,12 +17,13 @@ mod lobby;
 mod members;
 mod messages;
 mod modpanel;
+mod settings;
 mod stage;
 mod status;
 mod toasts;
 mod voice;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use denchat_core::session::{Session, SessionState, VoiceStatsView};
 use egui::{RichText, Ui};
@@ -51,6 +52,9 @@ pub enum ShellCmd {
     TogglePanel(String),
     ReloadAssets,
     OpenConfigDir,
+    /// Show the settings page (`core.settings`) over everything.
+    OpenSettings,
+    CloseSettings,
 }
 
 /// A deferred call against the session.
@@ -84,8 +88,12 @@ pub struct ShellView {
     pub placed: Vec<(String, String)>,
     pub hidden: HashSet<String>,
     pub layout_error: Option<String>,
-    /// The push-to-talk key from the layout, for hints.
+    /// The push-to-talk key in effect (settings override the layout), for hints.
     pub ptt_key: Option<String>,
+    /// The layout's push-to-talk key (what "reset" in settings goes back to).
+    pub layout_ptt_key: Option<String>,
+    /// The settings page is showing.
+    pub settings_open: bool,
 }
 
 /// Everything a panel may look at this frame.
@@ -148,7 +156,7 @@ impl Registry {
         let mut r = Registry::empty();
         r.register("core.lobby", "Host or join a room", || Box::new(lobby::Lobby::default()));
         r.register(header::ID, "Room header and View menu", || Box::new(header::Header));
-        r.register("core.channels", "Text and voice channels", || Box::new(channels::Channels));
+        r.register("core.channels", "Text and voice channels", || Box::new(channels::Channels::default()));
         r.register("core.voice", "Voice controls", || Box::new(voice::Voice::default()));
         r.register("core.members", "People in the room", || Box::new(members::Members));
         r.register("core.messages", "Messages in the current channel", || Box::new(messages::Messages));
@@ -156,6 +164,7 @@ impl Registry {
         r.register("core.stage", "Voice participants as tiles", || Box::new(stage::Stage));
         r.register("core.status", "Status bar", || Box::new(status::Status));
         r.register("core.toasts", "Pop-up notices", || Box::new(toasts::Toasts));
+        r.register("core.settings", "Settings page: audio devices, voice, appearance", || Box::new(settings::Settings::default()));
         r
     }
 
@@ -192,6 +201,29 @@ impl Panel for Missing {
     fn show(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
         ui.label(cx.small(format!("panel \"{}\" isn't available — is its mod installed?", self.0)));
     }
+}
+
+/// Who is talking right now and how loud (0..1, smoothed for drawing):
+/// remote speakers, plus you while you're being sent. Members not talking
+/// are absent.
+pub(crate) fn talk_levels(ui: &Ui, cx: &PanelCx<'_>) -> HashMap<u32, f32> {
+    let mut out = HashMap::new();
+    let Some(v) = cx.voice else { return out };
+    for s in v.speakers.iter().filter(|s| s.speaking) {
+        out.insert(s.id, s.intensity);
+    }
+    if let (Some(me), false, true) = (cx.state.me, v.test, v.transmitting) {
+        out.insert(me, v.input_intensity);
+    }
+    for (id, level) in out.iter_mut() {
+        *level = smooth(ui, ("talk-level", *id), *level);
+    }
+    out
+}
+
+/// Ease a level toward `target` over a few frames, so meters glide.
+pub(crate) fn smooth(ui: &Ui, key: impl std::hash::Hash + std::fmt::Debug, target: f32) -> f32 {
+    ui.ctx().animate_value_with_time(egui::Id::unique(key), target, 0.1)
 }
 
 /// A small filled circle (status / speaking indicator). Drawn, not a glyph,

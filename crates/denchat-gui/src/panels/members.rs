@@ -21,7 +21,7 @@ impl Panel for Members {
 
     fn show(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
         let p = *cx.palette;
-        let speaking = super::channels::speaking_set(cx);
+        let speaking = super::talk_levels(ui, cx);
         let behind = if cx.in_card { p.panel } else { p.canvas };
         ui.spacing_mut().item_spacing.y = 2.0;
 
@@ -42,7 +42,7 @@ impl Panel for Members {
             kit::section(ui, &format!("With you in {ch}"), &p);
             let me = cx.state.me;
             let others: Vec<&str> = with_me.iter().filter(|m| Some(m.id) != me).map(|m| m.nick.as_str()).collect();
-            let faces: Vec<(String, bool)> = with_me.iter().map(|m| (m.nick.clone(), speaking.contains(&m.id))).collect();
+            let faces: Vec<(String, Option<f32>)> = with_me.iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied())).collect();
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
             let w = kit::paint_stack(ui, pos2(r.left() + 4.0, r.center().y), &faces, (26.0, 4), behind, &p);
             let x = r.left() + 4.0 + w + 10.0;
@@ -63,17 +63,18 @@ impl Panel for Members {
             kit::section(ui, "Online", &p);
         }
         for m in rest {
-            member_row(ui, cx, m, speaking.contains(&m.id), behind);
+            member_row(ui, cx, m, speaking.get(&m.id).copied(), behind);
         }
     }
 }
 
-fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, talking: bool, behind: Color32) {
+fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, level: Option<f32>, behind: Color32) {
+    let talking = level.is_some();
     let p = *cx.palette;
     let is_me = cx.state.me == Some(m.id);
     let (rect, resp) = kit::row(ui, 44.0, false, false, &p);
     let painter = ui.painter();
-    Face::new(&m.nick, 32.0, behind).presence(p.ok).speaking(talking).paint(
+    Face::new(&m.nick, 32.0, behind).presence(p.ok).talking(level).paint(
         painter,
         pos2(rect.left() + 20.0, rect.center().y),
         &p,

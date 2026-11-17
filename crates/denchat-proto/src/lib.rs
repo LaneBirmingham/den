@@ -392,6 +392,13 @@ pub enum ClientMsg {
         muted: bool,
         deafened: bool,
     },
+    /// Add a channel to the room. Anyone in the room may (everyone has the
+    /// same rights). The host answers everyone with `channels_updated`, or
+    /// the sender with `error`.
+    CreateChannel {
+        name: String,
+        kind: ChannelKind,
+    },
     /// Mod-defined payload relayed to other members (or one member via `to`).
     /// The server never interprets `data`; `ns` namespaces it (e.g. `dice`).
     App {
@@ -559,6 +566,24 @@ pub fn clean_nick(raw: &str) -> String {
     nick
 }
 
+/// Most channels a room can have.
+pub const MAX_CHANNELS: usize = 64;
+/// Longest channel display name, in characters.
+pub const MAX_CHANNEL_NAME: usize = 32;
+
+/// A new channel's id from what someone typed: [`clean_channel_id`] with
+/// runs of `-` collapsed and none at the ends (`"My  Room!"` → `my-room`).
+/// Empty when nothing usable is left.
+pub fn channel_slug(raw: &str) -> ChannelId {
+    let mut out = String::new();
+    for c in clean_channel_id(raw).chars() {
+        if !(c == '-' && (out.is_empty() || out.ends_with('-'))) {
+            out.push(c);
+        }
+    }
+    out.trim_end_matches('-').to_owned()
+}
+
 /// Normalise a channel slug: lowercase ascii, digits, `-` and `_`.
 pub fn clean_channel_id(raw: &str) -> ChannelId {
     raw.trim()
@@ -573,6 +598,15 @@ pub fn clean_channel_id(raw: &str) -> ChannelId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_slugs() {
+        assert_eq!(channel_slug("My  Room!"), "my-room");
+        assert_eq!(channel_slug("#dev talk"), "dev-talk");
+        assert_eq!(channel_slug("--a__b--"), "a__b");
+        assert_eq!(channel_slug("!!!"), "");
+        assert_eq!(channel_slug(&"x".repeat(50)).len(), 32);
+    }
 
     #[test]
     fn frame_roundtrip() {

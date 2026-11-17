@@ -155,6 +155,7 @@ pub struct UiStore {
     frontend: RwLock<Option<Frontend>>,
     calls: Mutex<Vec<FrontendCall>>,
     copied: Mutex<Option<Copied>>,
+    settings: Mutex<Option<bool>>,
 }
 
 impl UiStore {
@@ -218,6 +219,17 @@ impl UiStore {
     /// Frontends call this each frame; true once per request.
     pub fn take_raise_request(&self) -> bool {
         self.raise.swap(false, Ordering::Relaxed)
+    }
+
+    /// Ask the frontend to open (or close) its settings page.
+    pub fn request_settings(&self, open: bool) {
+        *self.settings.lock() = Some(open);
+        self.bump();
+    }
+
+    /// Frontends call this each frame; returns a pending open/close once.
+    pub fn take_settings_request(&self) -> Option<bool> {
+        self.settings.lock().take()
     }
 
     pub fn revision(&self) -> u64 {

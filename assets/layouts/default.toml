@@ -8,6 +8,7 @@
 # Built-in panels (remove any of them to switch it off):
 #   core.lobby  core.header  core.channels  core.voice  core.members
 #   core.messages  core.composer  core.stage  core.status  core.toasts
+#   core.settings (the settings page; the app shows it over everything)
 # Mod panels are "<mod id>/<panel id>". Placeholders:
 #   "mods:<slot>"  every mod panel that asks for that slot
 #   "mods:*"       every mod panel not placed anywhere else
@@ -58,11 +59,9 @@ header = true                      # "# channel" and topic above the messages
 placeholder = "Message #{channel}"
 style = "field"                    # or "pill"
 
-[panel."core.voice"]
-show_devices = true
-
 [keys]
-ptt = "F8"                 # hold to talk (in push-to-talk mode)
+ptt = "F8"                 # hold to talk (in push-to-talk mode); Settings can override it
 mute = "Ctrl+Shift+M"      # Ctrl means Cmd on macOS
 deafen = "Ctrl+Shift+D"
 reload = "Ctrl+Shift+R"    # reload theme + layout
+settings = "Ctrl+Comma"    # open / close the settings page
