@@ -46,6 +46,20 @@ pub const MAX_MESSAGE_LEN: usize = 4000;
 pub const MAX_BATCH: usize = 100;
 /// `hello` feature: this client can host the room if asked.
 pub const FEATURE_HOST: &str = "host";
+/// `hello` and [`ServerInfo::features`]: speaks the picture messages
+/// (profile and room pictures). Neither side sends them to a peer that
+/// doesn't say so: older peers drop connections on unknown messages.
+pub const FEATURE_PICTURES: &str = "pictures";
+/// Largest picture file (profile or room picture) anyone sends or accepts.
+pub const MAX_PICTURE: usize = 256 * 1024;
+/// Most picture ids in one `get_pictures` / `want_pictures`.
+pub const MAX_PICTURE_IDS: usize = 256;
+
+/// A picture id: the BLAKE3 hash of the file, as 64 lowercase hex digits.
+/// Pictures are content-addressed, so the same id always means the same bytes.
+pub fn valid_picture_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// How easily others can connect to a member's app directly, worst to best.
 /// The room's host should be someone others can reach: everyone connects to
@@ -162,15 +176,19 @@ pub struct Proof {
     pub invite: Option<String>,
 }
 
-/// A member as the room remembers them: the public half of their key and the
-/// nick it belongs to. Every member's copy of the room keeps the list.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// A member as the room remembers them: the public half of their key, the
+/// nick it belongs to and their picture. Every member's copy of the room
+/// keeps the list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Profile {
     pub key: String,
     pub nick: String,
     /// Unix ms the room first saw this key.
     #[serde(default)]
     pub since: i64,
+    /// Their profile picture (see [`valid_picture_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -202,6 +220,9 @@ pub struct Member {
     /// How easily others can connect to the member's app (see [`Reach`]).
     #[serde(default)]
     pub reach: Reach,
+    /// Their profile picture (see [`valid_picture_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -282,6 +303,18 @@ pub struct ServerInfo {
     /// Bumped on every change of host. The highest term is the live room.
     #[serde(default)]
     pub term: u64,
+    /// The room's picture (see [`valid_picture_id`]). Any member may change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// What this host speaks beyond the base protocol (e.g. [`FEATURE_PICTURES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl ServerInfo {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 /// Who may join (besides holding the invite key, if the room has one).
@@ -354,6 +387,10 @@ pub enum ClientMsg {
         /// How reachable the member's app thinks it is.
         #[serde(default)]
         reach: Reach,
+        /// The member's profile picture. A host that lacks the file asks for
+        /// it with `want_pictures`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picture: Option<String>,
     },
     /// Ask for public room info and close. Used to find a room's live host.
     Probe {
@@ -439,6 +476,30 @@ pub enum ClientMsg {
         reach: Reach,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         addr: Option<String>,
+    },
+    /// A picture file (base64), sent before the `set_picture` /
+    /// `set_room_picture` that uses it, or because the host asked for it
+    /// (`want_pictures`). `id` must be the file's hash.
+    PutPicture {
+        id: String,
+        data: String,
+    },
+    /// "Send me these pictures": answered with a `picture` for each one the
+    /// host has.
+    GetPictures {
+        ids: Vec<String>,
+    },
+    /// Change (or with `None`, remove) our profile picture. The host must
+    /// have the file (`put_picture` first).
+    SetPicture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picture: Option<String>,
+    },
+    /// Change (or remove) the room's picture. Anyone in the room may; the
+    /// host answers everyone with `room_updated`.
+    SetRoomPicture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picture: Option<String>,
     },
 }
 
@@ -528,6 +589,24 @@ pub enum ServerMsg {
     Handoff {
         to: Vec<String>,
         term: u64,
+    },
+    /// A picture file (base64) the receiver asked for, or that a member just
+    /// started using. Its id is the file's hash: check it.
+    Picture {
+        id: String,
+        data: String,
+    },
+    /// Pictures the room uses that the host lacks: send any you have with
+    /// `put_picture`.
+    WantPictures {
+        ids: Vec<String>,
+    },
+    /// The room's settings changed (its picture, so far). `by`: the member
+    /// who changed them.
+    RoomUpdated {
+        server: ServerInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<MemberId>,
     },
 }
 
@@ -636,6 +715,20 @@ mod tests {
         // Older peers' server info still parses.
         let info: ServerInfo = serde_json::from_value(serde_json::json!({"name": "den", "version": "0.1.0"})).unwrap();
         assert_eq!((info.room_id.as_str(), info.term), ("", 0));
+    }
+
+    #[test]
+    fn picture_fields_are_optional() {
+        // Peers from before pictures still parse, and nothing extra is sent without one.
+        let m: Member = serde_json::from_value(serde_json::json!({"id": 1, "nick": "a"})).unwrap();
+        assert_eq!(m.picture, None);
+        assert!(serde_json::to_value(&m).unwrap().get("picture").is_none());
+        let info = ServerInfo { features: vec![FEATURE_PICTURES.into()], ..Default::default() };
+        assert!(info.has(FEATURE_PICTURES));
+        assert!(serde_json::to_value(ServerInfo::default()).unwrap().get("features").is_none());
+        assert!(valid_picture_id(&"ab".repeat(32)));
+        assert!(!valid_picture_id(&"AB".repeat(32)));
+        assert!(!valid_picture_id("../x"));
     }
 
     #[test]

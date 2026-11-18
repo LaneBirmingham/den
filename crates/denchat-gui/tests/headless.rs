@@ -87,3 +87,110 @@ async fn drive_the_app_headless() {
     session.close().await;
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The lobby holds the View menu on its screen: View → Panels must not hide
+/// it, or the window goes blank with nothing left to bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lobby_cannot_be_hidden_from_its_own_menu() {
+    let home = std::env::temp_dir().join(format!("den-gui-lobby-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let config = AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    let session = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let app = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            let _guard = rt.enter();
+            denchat_gui::run_mode(session, Registry::with_builtins(), Mode::Headless)
+        })
+    };
+
+    call(&session, "ui.wait", json!({"target": "button:View", "timeout_ms": 15_000})).await;
+    call(&session, "ui.click", json!({"target": "button:View"})).await;
+    call(&session, "ui.hover", json!({"target": "Panels"})).await;
+    call(&session, "ui.wait", json!({"target": "checkbox:Lobby", "timeout_ms": 5_000})).await;
+    // Clicking it (disabled or not) must leave the lobby, and its View button, on screen.
+    let _ = try_click(&session, "checkbox:Lobby").await;
+    call(&session, "ui.key", json!({"key": "Escape"})).await;
+    let t = tree(&session).await;
+    assert!(t.contains("core.lobby") && t.contains("button \"View\""), "lobby hidden:\n{t}");
+
+    call(&session, "app.quit", json!({})).await;
+    tokio::task::spawn_blocking(move || app.join()).await.unwrap().unwrap().unwrap();
+    session.close().await;
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A click that may be refused (a disabled widget): the error is fine.
+async fn try_click(s: &Session, target: &str) -> Result<Value, String> {
+    let rx = s.ui().call_frontend("ui.click", json!({"target": target}))?;
+    tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?
+}
+
+/// A 1x1 PNG.
+const DOT: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63,
+    0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
+
+async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..400 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The room picture from the room menu and your own from Settings → Profile.
+/// Headless there's no file dialog: the app asks for a path instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pictures_from_the_room_menu_and_settings() {
+    let home = std::env::temp_dir().join(format!("den-gui-pictures-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let image = home.join("dot.png");
+    std::fs::write(&image, DOT).unwrap();
+    let config = AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    let session = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+    session.host(HostOptions { name: "test room".into(), open: false });
+    let rt = tokio::runtime::Handle::current();
+    let app = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            let _guard = rt.enter();
+            denchat_gui::run_mode(session, Registry::with_builtins(), Mode::Headless)
+        })
+    };
+    let path = image.to_string_lossy().to_string();
+
+    call(&session, "ui.wait", json!({"target": "button:Room menu", "timeout_ms": 15_000})).await;
+    call(&session, "ui.click", json!({"target": "Room menu"})).await;
+    call(&session, "ui.click", json!({"target": "Change room picture…"})).await;
+    call(&session, "ui.wait", json!({"target": "button:Use picture", "timeout_ms": 5_000})).await;
+    call(&session, "ui.type", json!({"text": path, "target": "textbox:Image file", "enter": true})).await;
+    until("the room picture", || session.state().room_picture().is_some()).await;
+    call(&session, "ui.wait", json!({"target": "button:Use picture", "gone": true, "timeout_ms": 5_000})).await;
+    until("the change line", || session.state().messages("general").iter().any(|m| m.text == "alice changed the room picture")).await;
+
+    call(&session, "ui.click", json!({"target": "Room menu"})).await;
+    call(&session, "ui.click", json!({"target": "Settings"})).await;
+    call(&session, "ui.wait", json!({"target": "tab:Profile", "timeout_ms": 5_000})).await;
+    call(&session, "ui.click", json!({"target": "tab:Profile"})).await;
+    call(&session, "ui.wait", json!({"target": "Change picture…", "timeout_ms": 5_000})).await;
+    assert!(!tree(&session).await.contains("Remove picture"), "nothing to remove yet");
+    call(&session, "ui.click", json!({"target": "Change picture…"})).await;
+    call(&session, "ui.type", json!({"text": path, "target": "textbox:Image file", "enter": true})).await;
+    until("your picture", || session.state().picture.is_some()).await;
+    until("it reaches the room", || session.state().me().is_some_and(|m| m.picture == session.state().picture)).await;
+    call(&session, "ui.click", json!({"target": "Remove picture"})).await;
+    until("removed", || session.state().picture.is_none() && session.state().me().is_some_and(|m| m.picture.is_none())).await;
+
+    call(&session, "app.quit", json!({})).await;
+    tokio::task::spawn_blocking(move || app.join()).await.unwrap().unwrap().unwrap();
+    session.close().await;
+    let _ = std::fs::remove_dir_all(&home);
+}

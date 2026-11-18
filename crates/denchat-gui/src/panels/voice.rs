@@ -73,7 +73,7 @@ impl Panel for Voice {
             let me_rect = Rect::from_min_max(pos2(rect.left() - 4.0, rect.top() - 2.0), pos2(right + 4.0, rect.bottom() + 2.0));
             if gear.is_none() {
                 let resp = ui.interact(me_rect, ui.scope_id().with("me"), Sense::click());
-                let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                let hot = kit::hover_fade(ui, resp.id, resp.hovered());
                 if hot > 0.0 {
                     ui.painter().rect_filled(me_rect, CornerRadius::same(p.row_radius), crate::theme::alpha(p.text, 0.05 * hot));
                 }
@@ -85,7 +85,8 @@ impl Panel for Voice {
             // avatar and name rather than draw them under the buttons.
             let show_me = right - rect.left() >= 40.0;
             if show_me {
-                let face = Face::new(&cx.state.nick, 36.0, fill).presence(if connected { p.ok } else { p.muted });
+                let face =
+                    Face::new(&cx.state.nick, 36.0, fill).presence(if connected { p.ok } else { p.muted }).picture(cx.my_picture(ui));
                 let level = cx.state.me.and_then(|me| levels.get(&me).copied());
                 face.talking(level).paint(painter, pos2(rect.left() + 18.0, y), &p, time);
             }

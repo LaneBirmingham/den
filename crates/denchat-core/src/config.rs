@@ -1,6 +1,6 @@
 //! User-editable TOML configuration.
 //!
-//! `config.toml` drives the app (nick, voice, theme/layout choice, which
+//! `config.toml` drives the app (nickname, voice, theme/layout choice, which
 //! built-in modules are on). `server.toml` drives a room server. Both are
 //! optional; every field has a default.
 
@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
-    /// Display nick. Defaults to the OS user.
+    /// Display nickname. Defaults to the OS user. `nick = …` (the old key) still works.
+    #[serde(rename = "nickname", alias = "nick")]
     pub nick: Option<String>,
     /// Where the app listens: `all` (default), `localhost`, or an IP.
     pub bind: String,
@@ -110,7 +111,7 @@ pub struct Modules {
     pub api: bool,
     /// Look for live hosts of your saved rooms (in the lobby).
     pub discovery: bool,
-    /// Built-in slash commands (`/nick`, `/voice`, …).
+    /// Built-in slash commands (`/nickname`, `/voice`, …).
     pub slash_commands: bool,
     /// Let agents and scripts see and drive the app through the control API:
     /// the `ui.*` calls behind `den ui` (widget tree, click, type, keys,
@@ -347,6 +348,13 @@ mod tests {
         assert_eq!(cfg.ui.theme, "paper");
         assert_eq!(cfg.ui.layout, "default");
         assert!(cfg.modules.voice);
+    }
+
+    #[test]
+    fn nickname_key_and_old_nick_key() {
+        let cfg: AppConfig = toml::from_str("nickname = \"lane\"").unwrap();
+        assert_eq!(cfg.nick.as_deref(), Some("lane"));
+        assert!(toml::to_string(&cfg).unwrap().contains("nickname = \"lane\""));
     }
 
     #[test]

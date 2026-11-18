@@ -27,9 +27,9 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use denchat_proto::voice::{self, Packet};
 use denchat_proto::{
-    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, Identity, MAX_BATCH, MAX_CHANNEL_NAME, MAX_CHANNELS,
-    MAX_MESSAGE_LEN, Member, MemberId, MessageKind, PROTOCOL_VERSION, Profile, Proof, Reach, ServerInfo, ServerMsg, VoiceSetup,
-    channel_slug, clean_nick, encode_frame,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, FEATURE_PICTURES, Identity, MAX_BATCH, MAX_CHANNEL_NAME,
+    MAX_CHANNELS, MAX_MESSAGE_LEN, MAX_PICTURE_IDS, Member, MemberId, MessageKind, PROTOCOL_VERSION, Profile, Proof, Reach, ServerInfo,
+    ServerMsg, VoiceSetup, channel_slug, clean_nick, encode_frame, valid_picture_id,
 };
 use iroh::endpoint::Connection;
 use parking_lot::Mutex;
@@ -39,6 +39,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::config::ServerConfig;
 use crate::net::{self, Incoming, Link, Net, PublicKey, Registration, read_frame, write_frame};
+use crate::pictures;
 use crate::rooms;
 
 /// History sent to a member on join, per text channel.
@@ -79,6 +80,10 @@ pub struct ServerOptions {
     pub invite: Option<String>,
     /// Members the room already knows (from the save).
     pub profiles: Vec<Profile>,
+    /// Keep picture files here (a room save's `pictures/`); memory only without.
+    pub pictures_dir: Option<PathBuf>,
+    /// The room's picture (from the save).
+    pub picture: Option<String>,
 }
 
 /// Progress of handing the room to another host.
@@ -133,6 +138,11 @@ pub enum ServerEvent {
     ChannelsUpdated {
         channels: Vec<Channel>,
     },
+    /// The room's settings changed (its picture), by member `by`.
+    RoomUpdated {
+        server: ServerInfo,
+        by: Option<MemberId>,
+    },
 }
 
 struct Conn {
@@ -147,6 +157,8 @@ struct Conn {
     /// starts (one every 2 s at most).
     reach_seq: u64,
     reach_at: Instant,
+    /// The member's app speaks the picture messages (`FEATURE_PICTURES`).
+    pictures: bool,
 }
 
 struct Room {
@@ -161,6 +173,11 @@ struct Room {
     pending: Option<(MemberId, u64)>,
     /// Everyone the room knows, by key.
     profiles: HashMap<String, Profile>,
+    /// Picture files.
+    pictures: pictures::Store,
+    /// Pictures the room uses that we lack, and who asked for each (they get
+    /// it when a member sends it).
+    missing: HashMap<String, HashSet<MemberId>>,
 }
 
 impl Room {
@@ -226,17 +243,32 @@ impl Room {
         added
     }
 
-    /// Remember that `key` goes by `nick`.
-    fn remember(&mut self, key: Option<&str>, nick: &str) {
+    /// Remember that `key` goes by `nick` and `picture`.
+    fn remember(&mut self, key: Option<&str>, nick: &str, picture: Option<&str>) {
         let Some(key) = key else { return };
         let since = self.profiles.get(key).map(|p| p.since).unwrap_or_else(crate::now_ms);
-        self.profiles.insert(key.to_owned(), Profile { key: key.to_owned(), nick: nick.to_owned(), since });
+        let picture = picture.map(str::to_owned);
+        self.profiles.insert(key.to_owned(), Profile { key: key.to_owned(), nick: nick.to_owned(), since, picture });
         if self.profiles.len() > MAX_PROFILES {
             let online: HashSet<String> = self.members.values().filter_map(|c| c.member.identity.key.clone()).collect();
             if let Some(oldest) = self.profiles.values().filter(|p| !online.contains(&p.key)).min_by_key(|p| p.since).map(|p| p.key.clone())
             {
                 self.profiles.remove(&oldest);
             }
+        }
+    }
+
+    /// Pictures the room uses: its own (`room_picture`), members' and profiles'.
+    fn pictures_in_use(&self, room_picture: Option<&str>) -> HashSet<String> {
+        let members = self.members.values().filter_map(|c| c.member.picture.as_deref());
+        let profiles = self.profiles.values().filter_map(|p| p.picture.as_deref());
+        room_picture.into_iter().chain(members).chain(profiles).map(str::to_owned).collect()
+    }
+
+    /// Queue a frame to members whose app speaks pictures.
+    fn broadcast_pictures(&mut self, frame: &Arc<[u8]>, except: Option<MemberId>) {
+        for conn in self.members.values_mut().filter(|c| c.pictures && Some(c.member.id) != except) {
+            send_to(conn, frame);
         }
     }
 
@@ -325,13 +357,36 @@ pub async fn start(opts: ServerOptions) -> anyhow::Result<ServerHandle> {
         mode: opts.mode.as_str().into(),
         room_id: opts.room_id,
         term: opts.term,
+        picture: opts.picture.filter(|p| valid_picture_id(p)),
+        features: vec![FEATURE_PICTURES.into()],
     };
     let (events, _) = broadcast::channel(1024);
     let (shutdown, _) = watch::channel(false);
     let (handoff, _) = watch::channel(HandoffState::None);
-    let profiles = opts.profiles.into_iter().filter(|p| !p.key.is_empty()).map(|p| (p.key.clone(), p)).collect();
-    let room =
-        Room { members: HashMap::new(), tokens: HashMap::new(), channels, history, next_member: 1, last_id, pending: None, profiles };
+    let profiles = opts
+        .profiles
+        .into_iter()
+        .filter(|p| !p.key.is_empty())
+        .map(|mut p| {
+            p.picture = p.picture.filter(|x| valid_picture_id(x));
+            (p.key.clone(), p)
+        })
+        .collect();
+    let mut room = Room {
+        members: HashMap::new(),
+        tokens: HashMap::new(),
+        channels,
+        history,
+        next_member: 1,
+        last_id,
+        pending: None,
+        profiles,
+        pictures: pictures::Store::new(opts.pictures_dir),
+        missing: HashMap::new(),
+    };
+    // Files nothing uses any more (old pictures, uploads that were never used) go.
+    let in_use = room.pictures_in_use(info.picture.as_deref());
+    room.pictures.prune(&in_use);
     let room_id = info.room_id.clone();
     let shared = Arc::new(Shared {
         room: Mutex::new(room),
@@ -387,7 +442,7 @@ async fn answer(inc: Incoming, reply: &ServerMsg) {
 async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
     let peer = inc.conn.remote_id().fmt_short().to_string();
     let first = inc.first.clone();
-    let (nick, client, codecs, features, proof, addr, claimed) = match first {
+    let (nick, client, codecs, features, proof, addr, claimed, picture) = match first {
         ClientMsg::Probe { .. } => {
             let (members, channels) = {
                 let room = shared.room.lock();
@@ -402,7 +457,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
             answer(inc, &reply).await;
             return;
         }
-        ClientMsg::Hello { version, nick, client, codecs, features, proof, addr, reach, .. } => {
+        ClientMsg::Hello { version, nick, client, codecs, features, proof, addr, reach, picture, .. } => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("protocol {version} not supported (server speaks {PROTOCOL_VERSION})");
                 answer(inc, &reject("version", msg)).await;
@@ -414,7 +469,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
                 answer(inc, &ServerMsg::Handoff { to, term }).await;
                 return;
             }
-            (nick, client, codecs, features, proof, addr, reach)
+            (nick, client, codecs, features, proof, addr, reach, picture)
         }
         _ => {
             answer(inc, &reject("handshake", "expected hello")).await;
@@ -451,7 +506,9 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
             };
             let wanted = clean_nick(&nick);
             let nick = room.unique_nick(&wanted, None, identity.key.as_deref());
-            room.remember(identity.key.as_deref(), &nick);
+            let picture = picture.filter(|p| valid_picture_id(p));
+            room.remember(identity.key.as_deref(), &nick, picture.as_deref());
+            let speaks_pictures = features.iter().any(|f| f == FEATURE_PICTURES);
             let member = Member {
                 id,
                 nick,
@@ -465,6 +522,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
                 addr,
                 // Only the host's own check can make someone `open`.
                 reach: claimed.min(Reach::Public),
+                picture,
             };
             let mut conn = Conn {
                 member: member.clone(),
@@ -475,6 +533,7 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
                 sent: VecDeque::new(),
                 reach_seq: 0,
                 reach_at: Instant::now(),
+                pictures: speaks_pictures,
             };
             // Welcome and history go into the outbox before anything else can.
             let welcome = ServerMsg::Welcome {
@@ -497,6 +556,22 @@ async fn handle_conn(shared: Arc<Shared>, inc: Incoming) {
             for ch in text_channels {
                 let (messages, complete) = room.history_page(&ch, None, JOIN_HISTORY);
                 send_to(&mut conn, &frame(&ServerMsg::History { channel: ch, messages, complete }));
+            }
+            // Pictures the room uses that we lack: maybe this member has them
+            // (their own, at least).
+            if speaks_pictures {
+                let room_picture = shared.info.lock().picture.clone();
+                let mut lacking: Vec<String> = room.pictures_in_use(room_picture.as_deref()).into_iter().collect();
+                if let Some(p) = &member.picture {
+                    lacking.push(p.clone());
+                }
+                lacking.sort();
+                lacking.dedup();
+                lacking.retain(|p| !room.pictures.has(p));
+                lacking.truncate(MAX_PICTURE_IDS);
+                if !lacking.is_empty() {
+                    send_to(&mut conn, &frame(&ServerMsg::WantPictures { ids: lacking }));
+                }
             }
             room.broadcast(&frame(&ServerMsg::MemberJoined { member: member.clone() }), None);
             room.tokens.insert(token, id);
@@ -729,10 +804,92 @@ impl Shared {
             }
             ClientMsg::SetNick { nick } => {
                 let wanted = clean_nick(&nick);
-                let key = room.members.get(&id).and_then(|c| c.member.identity.key.clone());
-                let nick = room.unique_nick(&wanted, Some(id), key.as_deref());
-                room.remember(key.as_deref(), &nick);
+                let Some(me) = room.members.get(&id).map(|c| c.member.clone()) else { return };
+                let nick = room.unique_nick(&wanted, Some(id), me.identity.key.as_deref());
+                room.remember(me.identity.key.as_deref(), &nick, me.picture.as_deref());
                 self.update_member(&mut room, id, |m| m.nick = nick);
+            }
+            ClientMsg::PutPicture { id: pic, data } => {
+                let bytes = match pictures::from_wire(&pic, &data) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.reply(&mut room, id, &reject("bad_picture", format!("{e:#}")));
+                        return;
+                    }
+                };
+                // Files we asked for are free; the rest count like messages.
+                let waiting = room.missing.remove(&pic);
+                let room_picture = self.info.lock().picture.clone();
+                let wanted = waiting.is_some() || room.pictures_in_use(room_picture.as_deref()).contains(&pic);
+                if !wanted && !room.pictures.has(&pic) && !self.spend(&mut room, id, "picture not saved") {
+                    return;
+                }
+                room.pictures.put(&bytes);
+                let out = frame(&ServerMsg::Picture { id: pic, data });
+                for m in waiting.into_iter().flatten().filter(|m| *m != id) {
+                    if let Some(c) = room.members.get_mut(&m) {
+                        send_to(c, &out);
+                    }
+                }
+            }
+            ClientMsg::GetPictures { ids } => {
+                let room_picture = self.info.lock().picture.clone();
+                let in_use = room.pictures_in_use(room_picture.as_deref());
+                let mut lacking = Vec::new();
+                for pic in ids.into_iter().filter(|p| valid_picture_id(p)).take(MAX_PICTURE_IDS) {
+                    match room.pictures.get(&pic) {
+                        Some(bytes) => self.reply(&mut room, id, &ServerMsg::Picture { id: pic, data: pictures::to_wire(&bytes) }),
+                        // Look for pictures the room uses among the others; send it on when it comes.
+                        None if in_use.contains(&pic) => {
+                            let waiters = room.missing.entry(pic.clone()).or_default();
+                            if waiters.is_empty() {
+                                lacking.push(pic);
+                            }
+                            waiters.insert(id);
+                        }
+                        None => {}
+                    }
+                }
+                if !lacking.is_empty() {
+                    room.broadcast_pictures(&frame(&ServerMsg::WantPictures { ids: lacking }), Some(id));
+                }
+            }
+            ClientMsg::SetPicture { picture } => {
+                if let Some(p) = &picture
+                    && !room.pictures.has(p)
+                {
+                    self.reply(&mut room, id, &reject("missing_picture", "send the picture (put_picture) before using it"));
+                    return;
+                }
+                if !self.spend(&mut room, id, "picture not changed") {
+                    return;
+                }
+                let Some(me) = room.members.get(&id).map(|c| c.member.clone()) else { return };
+                room.remember(me.identity.key.as_deref(), &me.nick, picture.as_deref());
+                self.update_member(&mut room, id, |m| m.picture = picture);
+            }
+            ClientMsg::SetRoomPicture { picture } => {
+                if let Some(p) = &picture
+                    && !room.pictures.has(p)
+                {
+                    self.reply(&mut room, id, &reject("missing_picture", "send the picture (put_picture) before using it"));
+                    return;
+                }
+                if !self.spend(&mut room, id, "room picture not changed") {
+                    return;
+                }
+                let server = {
+                    let mut info = self.info.lock();
+                    if info.picture == picture {
+                        return;
+                    }
+                    info.picture = picture;
+                    info.clone()
+                };
+                room.broadcast_pictures(&frame(&ServerMsg::RoomUpdated { server: server.clone(), by: Some(id) }), None);
+                drop(room);
+                tracing::info!("member {id} changed the room picture");
+                let _ = self.events.send(ServerEvent::RoomUpdated { server, by: Some(id) });
             }
             ClientMsg::VoiceJoin { channel } => match room.channel(&channel) {
                 Some(c) if c.kind == ChannelKind::Voice => {
@@ -753,19 +910,8 @@ impl Shared {
                     return;
                 }
                 // Like a message, it counts against the sender's rate limit.
-                let limit = self.cfg.rate_limit.max(1) as usize;
-                if let Some(conn) = room.members.get_mut(&id) {
-                    let now = Instant::now();
-                    while conn.sent.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10)) {
-                        conn.sent.pop_front();
-                    }
-                    if conn.sent.len() >= limit {
-                        let msg =
-                            ServerMsg::Notice { level: denchat_proto::NoticeLevel::Warn, text: "slow down — channel not created".into() };
-                        send_to(conn, &frame(&msg));
-                        return;
-                    }
-                    conn.sent.push_back(now);
+                if !self.spend(&mut room, id, "channel not created") {
+                    return;
                 }
                 // Ids are unique across kinds: `lounge`, `lounge-2`, …
                 let id_free = |c: &str| !room.channels.iter().any(|x| x.id == c);
@@ -906,6 +1052,24 @@ impl Shared {
         }
     }
 
+    /// Count a change against member `id`'s rate limit (shared with messages).
+    /// False, with a notice saying `dropped`, when they're over it.
+    fn spend(&self, room: &mut Room, id: MemberId, dropped: &str) -> bool {
+        let limit = self.cfg.rate_limit.max(1) as usize;
+        let Some(conn) = room.members.get_mut(&id) else { return false };
+        let now = Instant::now();
+        while conn.sent.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(10)) {
+            conn.sent.pop_front();
+        }
+        if conn.sent.len() >= limit {
+            let msg = ServerMsg::Notice { level: denchat_proto::NoticeLevel::Warn, text: format!("slow down — {dropped}") };
+            send_to(conn, &frame(&msg));
+            return false;
+        }
+        conn.sent.push_back(now);
+        true
+    }
+
     /// Whether we can check how reachable the app at `addr` is: it has an
     /// address, and it isn't our own app (hosting from it).
     fn checks_reach(&self, addr: Option<&str>) -> bool {
@@ -992,9 +1156,14 @@ impl ServerHandle {
         vec![self.link().await.without_invite().to_string()]
     }
 
-    /// Everyone the room knows (key → nick).
+    /// Everyone the room knows (key → nick, picture).
     pub fn profiles(&self) -> Vec<Profile> {
         self.shared.room.lock().profile_list()
+    }
+
+    /// A picture file the room has.
+    pub fn picture(&self, id: &str) -> Option<Arc<[u8]>> {
+        self.shared.room.lock().pictures.get(id)
     }
 
     pub fn info(&self) -> ServerInfo {

@@ -108,7 +108,7 @@ impl Panel for Composer {
                     if send_button {
                         let ready = enabled && !self.text.trim().is_empty();
                         let (r, b) = ui.allocate_exact_size(vec2(btn, btn), if ready { Sense::click() } else { Sense::hover() });
-                        let hot = ui.ctx().animate_bool_with_time(b.id, b.hovered() && ready, 0.12);
+                        let hot = kit::hover_fade(ui, b.id, b.hovered() && ready);
                         let (bg, fg) = if ready {
                             (crate::theme::mix(p.accent, p.text, 0.12 * hot), p.accent_text)
                         } else {

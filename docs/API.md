@@ -46,7 +46,13 @@ the connection streams events. The token is compared in constant time.
 | `input.submit` | `text, channel?` | as if typed: slash commands work |
 | `channel.focus` | `channel` | switch the focused text channel |
 | `channel.create` | `name, kind?` | add a channel (`kind`: `text`, the default, or `voice`); anyone in the room may. Returns the `id` it asks for; the host adds `-2`… if it's taken. Everyone gets a `channels.updated` event |
-| `nick.set` | `nick` | |
+| `nickname.set` | `nickname` | change your nickname (`nick.set` with `nick` still works) |
+| `profile.picture.set` | `path \| data` | your profile picture, from an image file or base64 `data` (PNG, JPEG, GIF, WebP, BMP: cut to a square and made small). Returns `{picture}` (its id); it goes to the room you're in and every room you join |
+| `profile.picture.clear` | | remove your profile picture |
+| `room.picture.set` | `path \| data` | the picture of the room you're in; anyone in the room may. Everyone gets a `room.updated` event |
+| `room.picture.clear` | | remove the room's picture |
+| `picture.get` | `id, path?` | a picture file by id (`state.get` has them: `picture`, `members[].picture`, `profile_pictures`, `server.picture`): written to `path`, or returned as base64 `data`, with its `kind` |
+
 | `voice.join` / `voice.leave` | `channel?` | |
 | `voice.mute` / `voice.deafen` | `muted` / `deafened` | |
 | `voice.stats` | | mic level (`input_level` RMS, `input_intensity` 0..1), speakers (`level`, `intensity`, `speaking`), devices, codec, `test` (from a mic test, not a call), `tx_packets` / `rx_packets` (counted since voice started; `open` mode sends even when silent) |

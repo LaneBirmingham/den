@@ -67,7 +67,7 @@ layouts = ["focus.toml"]         # appear in View → Layout
 | `DEN_MOD_ID`, `DEN_MOD_ROOT` | all | the mod's id and folder |
 | `DEN_MOD_STATE_DIR`, `DEN_MOD_CONFIG_DIR` | all | per-mod writable folders |
 | `DEN_VERSION` | all | Den version |
-| `DEN_COMMAND`, `DEN_ARGS`, `DEN_CONTEXT_JSON` | commands | command name, raw args, `{channel, nick, …}` |
+| `DEN_COMMAND`, `DEN_ARGS`, `DEN_CONTEXT_JSON` | commands | command name, raw args, `{channel, nick, …}` (`nick` is your nickname) |
 | `DEN_EVENT`, `DEN_EVENT_JSON` | hooks | event name and JSON (also on **stdin**) |
 | `DEN_CHANNEL` | commands, hooks | channel the command/event relates to |
 | `DEN_PANEL_ID` | panel commands | full panel id |
@@ -104,7 +104,11 @@ Buttons run one of the mod's commands (`command` + `args`) and/or emit a
 `member.updated`, `voice.joined`, `voice.left`, `app.message`, `notice`,
 `ui.action`, `ui.changed`, `hosting.changed`, `room.moved` (`{to, term}`: the
 room changed host), `command.run`, `history.loaded` (`{channel, count}`:
-history arrived from the host or was merged from your copy on join).
+history arrived from the host or was merged from your copy on join),
+`channels.updated` (`{channels, created}`), `room.updated` (`{server, by}`:
+someone changed the room's picture), `picture.received` (`{id}`: a picture
+file arrived; `den api picture.get id=…` reads it).
+
 `connection.changed` with `state: "failed"` carries `refused: true` when the
 host turned you away (join rules, full room, version).
 Payloads are what `den api events.subscribe` prints — the easiest way to

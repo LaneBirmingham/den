@@ -9,6 +9,7 @@
 //!                                             last host, peers, profiles
 //! <data>/rooms/<room id>/member.key           this member's key for the room (secret)
 //! <data>/rooms/<room id>/history/<chan>.jsonl recent messages, one JSON object per line
+//! <data>/rooms/<room id>/pictures/<id>.<ext>  the room's picture and members' pictures
 //! ```
 //!
 //! The folder is self-contained: copy it to another machine (for example one
@@ -65,9 +66,13 @@ pub struct RoomSave {
     /// the room when its last host is gone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
-    /// Members the room knows: the public half of each one's key and their nick.
+    /// Members the room knows: the public half of each one's key, their
+    /// nick and picture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<Profile>,
+    /// The room's picture: a file in `pictures/` (see [`crate::pictures`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
 }
 
 /// How many peer addresses a save keeps.
@@ -97,6 +102,7 @@ impl RoomSave {
             channels: Vec::new(),
             peers: Vec::new(),
             profiles: Vec::new(),
+            picture: None,
         }
     }
 
@@ -110,27 +116,29 @@ impl RoomSave {
     /// Merge what a host says about the room's members.
     pub fn merge_profiles(&mut self, profiles: &[Profile]) {
         for p in profiles {
-            self.note_profile(&p.key, &p.nick, p.since);
+            self.note_profile(&p.key, &p.nick, p.since, p.picture.as_deref());
         }
     }
 
-    fn note_profile(&mut self, key: &str, nick: &str, since: i64) {
+    fn note_profile(&mut self, key: &str, nick: &str, since: i64, picture: Option<&str>) {
         if key.is_empty() {
             return;
         }
+        let picture = picture.filter(|p| denchat_proto::valid_picture_id(p)).map(str::to_owned);
         match self.profiles.iter_mut().find(|x| x.key == key) {
             Some(x) => {
                 x.nick = nick.to_owned();
                 x.since = x.since.min(since);
+                x.picture = picture;
             }
-            None => self.profiles.push(Profile { key: key.to_owned(), nick: nick.to_owned(), since }),
+            None => self.profiles.push(Profile { key: key.to_owned(), nick: nick.to_owned(), since, picture }),
         }
     }
 
     /// Remember a member we saw: their profile, and where their app is (if it can host).
     pub fn note_member(&mut self, m: &Member) {
         if let Some(k) = m.identity.key.as_deref().filter(|_| m.identity.verified) {
-            self.note_profile(k, &m.nick, crate::now_ms());
+            self.note_profile(k, &m.nick, crate::now_ms(), m.picture.as_deref());
         }
         if let Some(a) = m.addr.as_ref().filter(|_| m.can_host) {
             let id = Link::parse(a).ok().map(|l| l.id());
@@ -156,10 +164,16 @@ impl RoomSave {
         ServerConfig { name: self.name.clone(), motd: self.motd.clone(), channels, allow: self.access.allow.clone(), ..base }
     }
 
+    /// Pictures the room uses: its own and its members'.
+    pub fn pictures(&self) -> std::collections::HashSet<String> {
+        self.picture.iter().chain(self.profiles.iter().filter_map(|p| p.picture.as_ref())).cloned().collect()
+    }
+
     /// Copy what a host told us about the room.
     pub fn update_from(&mut self, server: &ServerInfo, channels: &[Channel], access: Option<&Access>) {
         self.name = server.name.clone();
         self.motd = server.motd.clone();
+        self.picture = server.picture.clone().filter(|p| denchat_proto::valid_picture_id(p));
         self.term = self.term.max(server.term);
         let safe: Vec<Channel> = channels.iter().filter(|c| safe_channel(&c.id)).cloned().collect();
         if !safe.is_empty() {
@@ -195,6 +209,11 @@ pub fn dir(paths: &Paths, id: &str) -> PathBuf {
 
 pub fn history_dir(paths: &Paths, id: &str) -> PathBuf {
     dir(paths, id).join("history")
+}
+
+/// The room's pictures (its own and its members'), named by id.
+pub fn pictures_dir(paths: &Paths, id: &str) -> PathBuf {
+    dir(paths, id).join("pictures")
 }
 
 /// This member's key for room `id`, made on first use. Only its public half
@@ -540,7 +559,14 @@ mod tests {
         let h = |id: &str, term: u64, mode: &str| LiveHost {
             addr: format!("den://{id}"),
             id: id.into(),
-            server: ServerInfo { name: "r".into(), motd: None, version: "x".into(), mode: mode.into(), room_id: "r".into(), term },
+            server: ServerInfo {
+                name: "r".into(),
+                version: "x".into(),
+                mode: mode.into(),
+                room_id: "r".into(),
+                term,
+                ..Default::default()
+            },
             members: 1,
         };
         let pick = |v: Vec<LiveHost>| best_host(v).map(|x| x.id);
@@ -557,9 +583,11 @@ mod tests {
     #[test]
     fn saves_remember_profiles_and_peers() {
         let mut s = RoomSave::empty("r");
-        s.merge_profiles(&[Profile { key: "k1".into(), nick: "ann".into(), since: 5 }]);
-        s.merge_profiles(&[Profile { key: "k1".into(), nick: "anna".into(), since: 9 }]);
-        assert_eq!(s.profiles, vec![Profile { key: "k1".into(), nick: "anna".into(), since: 5 }]);
+        let pic = "ab".repeat(32);
+        s.merge_profiles(&[Profile { key: "k1".into(), nick: "ann".into(), since: 5, picture: None }]);
+        s.merge_profiles(&[Profile { key: "k1".into(), nick: "anna".into(), since: 9, picture: Some(pic.clone()) }]);
+        assert_eq!(s.profiles, vec![Profile { key: "k1".into(), nick: "anna".into(), since: 5, picture: Some(pic.clone()) }]);
+        assert_eq!(s.pictures(), [pic].into_iter().collect());
         let peer = Link::new(SecretKey::generate().public().into()).to_string();
         let m = Member {
             id: 1,
@@ -573,7 +601,9 @@ mod tests {
             can_host: true,
             addr: Some(peer.clone()),
             reach: Default::default(),
+            picture: None,
         };
+
         s.note_member(&m);
         s.note_member(&m);
         assert_eq!(s.peers, vec![peer.clone()]);

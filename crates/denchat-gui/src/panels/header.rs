@@ -14,9 +14,18 @@ use crate::kit::{self, W};
 #[derive(Default)]
 pub struct Header;
 
-/// This panel's id. It holds View → Panels, so it can't be hidden from there:
-/// nothing would be left to show it again.
+/// This panel's id.
 pub const ID: &str = "core.header";
+
+/// Panels that hold the View menu (the room header, and the lobby, which has
+/// its own View button). View → Panels can't hide them: nothing would be left
+/// on that screen to show them again. Taking one out of a layout file still works.
+pub const HOLDS_VIEW_MENU: &[&str] = &[ID, super::lobby::ID];
+
+/// Whether View → Panels may hide `id`.
+pub fn can_hide(id: &str) -> bool {
+    !HOLDS_VIEW_MENU.contains(&id)
+}
 
 impl Panel for Header {
     fn title(&self) -> String {
@@ -64,7 +73,7 @@ fn pill(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 58.0), Sense::click());
     let painter = ui.painter();
     let radius = CornerRadius::same(p.card_radius.min(16));
-    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let hover = kit::hover_fade(ui, resp.id, resp.hovered());
     if cx.in_card {
         painter.rect_filled(rect, radius, crate::theme::alpha(p.text, 0.04 * hover));
     } else {
@@ -72,8 +81,7 @@ fn pill(ui: &mut Ui, cx: &mut PanelCx<'_>) {
         painter.rect_filled(rect, radius, crate::theme::mix(p.panel, p.surface, 0.35 * hover));
     }
     let tile = egui::Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 19.0), vec2(38.0, 38.0));
-    painter.rect_filled(tile, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), p.accent);
-    painter.text(tile.center(), Align2::CENTER_CENTER, kit::initial(&name), kit::font(17.0, W::Semibold), p.accent_text);
+    room_tile(painter, tile, &name, cx.picture(ui, cx.state.room_picture()), &p);
     let x = tile.right() + 10.0;
     let text_w = rect.right() - 34.0 - x;
     let g = kit::line(ui, name.clone(), kit::font(15.0, W::Semibold), p.text, text_w);
@@ -90,6 +98,10 @@ fn pill(ui: &mut Ui, cx: &mut PanelCx<'_>) {
 fn bar(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     let p = *cx.palette;
     ui.horizontal(|ui| {
+        if let Some(tex) = cx.picture(ui, cx.state.room_picture()) {
+            let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            crate::pictures::paint_rounded(ui.painter(), r, 6.0, tex);
+        }
         ui.label(RichText::new(room_name(cx)).font(kit::font(p.heading_size, W::Semibold)));
         let (line, dot) = presence_line(cx);
         super::dot(ui, dot, 3.5);
@@ -105,6 +117,38 @@ fn bar(ui: &mut Ui, cx: &mut PanelCx<'_>) {
             room_menu(&resp, cx);
         });
     });
+}
+
+/// A room's tile: its picture, or its initial on the accent colour.
+pub fn room_tile(painter: &egui::Painter, tile: egui::Rect, name: &str, picture: Option<egui::TextureId>, p: &crate::theme::Palette) {
+    let radius = (tile.height() * 0.3).min(p.row_radius.saturating_add(2).min(12) as f32);
+    match picture {
+        Some(tex) => crate::pictures::paint_rounded(painter, tile, radius, tex),
+        None => {
+            painter.rect_filled(tile, CornerRadius::same(radius as u8), p.accent);
+            let size = (tile.height() * 0.45).max(9.0);
+            painter.text(tile.center(), Align2::CENTER_CENTER, kit::initial(name), kit::font(size, W::Semibold), p.accent_text);
+        }
+    }
+}
+
+/// Change or remove the room's picture (anyone in the room may).
+fn picture_items(ui: &mut Ui, cx: &mut PanelCx<'_>) {
+    if !cx.state.conn.is_connected() {
+        return;
+    }
+    let supported = cx.state.pictures_supported();
+    let tip =
+        if supported { "Anyone in the room can change it; everyone sees it" } else { "The host runs an older Den without room pictures" };
+    let change = ui.add_enabled(supported, egui::Button::new(format!("{}  Change room picture…", icons::IMAGE)));
+    if change.on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+        cx.actions.shell(ShellCmd::PickPicture(crate::pictures::PictureFor::Room));
+        ui.close();
+    }
+    if supported && cx.state.room_picture().is_some() && ui.button(format!("{}  Remove room picture", icons::TRASH)).clicked() {
+        cx.actions.session(|s| s.set_room_picture_file(None));
+        ui.close();
+    }
 }
 
 /// The host is gone: run the room from your own copy (or join whoever
@@ -152,6 +196,7 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
                     }
                 });
             }
+            picture_items(ui, cx);
             ui.separator();
         } else if cx.state.host_lost() {
             ui.label(cx.small("The host is gone"));
@@ -189,9 +234,11 @@ fn room_menu(resp: &egui::Response, cx: &mut PanelCx<'_>) {
                 });
                 ui.close();
             }
+            picture_items(ui, cx);
             ui.separator();
         }
         view_items(ui, cx);
+
         ui.separator();
         let leave = match &cx.state.hosting {
             Some(_) if cx.state.can_take_over().next().is_some() => "Leave (someone else hosts)",
@@ -230,7 +277,7 @@ fn view_items(ui: &mut Ui, cx: &mut PanelCx<'_>) {
             for (id, title) in &cx.shell.placed {
                 let mut on = !cx.shell.hidden.contains(id);
                 let (enabled, hint) =
-                    if id == ID { (!on, "holds this menu; take it out of the layout file instead") } else { (true, id.as_str()) };
+                    if can_hide(id) { (true, id.as_str()) } else { (!on, "holds this menu; take it out of the layout file instead") };
                 if ui.add_enabled(enabled, egui::Checkbox::new(&mut on, title)).on_hover_text(hint).on_disabled_hover_text(hint).changed() {
                     cx.actions.shell(ShellCmd::TogglePanel(id.clone()));
                 }

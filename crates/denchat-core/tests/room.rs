@@ -55,6 +55,8 @@ async fn start_with(
         term,
         invite,
         profiles: Vec::new(),
+        pictures_dir: None,
+        picture: None,
     })
     .await
     .unwrap()
@@ -130,7 +132,7 @@ async fn chat_between_two_sessions() {
     assert_eq!(msg.kind, MessageKind::User);
 
     // Slash commands are handled locally and change server state.
-    bob.submit(None, "/nick bobby");
+    bob.submit(None, "/nickname bobby");
     wait_for("nick change seen", || alice.state().members.values().any(|m| m.nick == "bobby")).await;
     // `//` sends a literal slash.
     bob.submit(None, "//shrug");
@@ -368,6 +370,7 @@ async fn raw_join_as(
         proof: net::prove(&conn, &id, Some(&member), None).unwrap(),
         addr,
         reach,
+        picture: None,
     };
     write_frame(&mut wr, &hello).await.unwrap();
     match read_frame::<_, ServerMsg>(&mut rd).await.unwrap().unwrap() {
@@ -1172,4 +1175,84 @@ async fn mic_test_outside_a_call() {
     assert!(alice.voice_stats().is_some_and(|v| !v.test));
     alice.shutdown();
     srv.shutdown();
+}
+
+/// A 1x1 PNG.
+const DOT: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63,
+    0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
+
+fn picture_of(viewer: &Session, nick: &str) -> Option<String> {
+    viewer.state().members.values().find(|m| m.nick == nick).and_then(|m| m.picture.clone())
+}
+
+/// Profile pictures and the room picture: set by anyone, sent to everyone,
+/// kept in every member's copy, and served by whoever hosts next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pictures_travel_with_the_room() {
+    let home = tmp("pictures");
+    let alice = session("alice", &home.join("a")).await;
+    let bob = session("bob", &home.join("b")).await;
+    // Set before hosting: the new room's host doesn't have the file yet, so it asks alice for it.
+    let alice_pic = alice.set_picture(Some(DOT.to_vec())).await.unwrap().expect("an id");
+    assert_eq!(alice.state().picture.as_deref(), Some(alice_pic.as_str()));
+    let addr = host(&alice, "den").await;
+    bob.join(&addr);
+    wait_for("both in", || alice.state().members.len() == 2 && bob.state().members.len() == 2).await;
+    assert_eq!(picture_of(&bob, "alice").as_deref(), Some(alice_pic.as_str()));
+    wait_for("bob has alice's picture", || bob.picture(&alice_pic).is_some()).await;
+
+    // Anyone can change the room picture; everyone gets it and saves it.
+    assert!(bob.state().pictures_supported());
+    let room_pic = bob.set_room_picture(Some(DOT.to_vec())).await.unwrap().expect("an id");
+    wait_for("alice sees the room picture", || alice.state().room_picture() == Some(room_pic.as_str())).await;
+    wait_for("alice has the file", || alice.picture(&room_pic).is_some()).await;
+    assert!(has_text(&alice, "general", "bob changed the room picture"));
+    let room = alice.state().room_id().unwrap().to_owned();
+    wait_for("saved by both", || {
+        [&home.join("a"), &home.join("b")]
+            .iter()
+            .all(|h| rooms::load(&Paths::under(h), &room).is_ok_and(|s| s.picture.as_deref() == Some(room_pic.as_str())))
+    })
+    .await;
+
+    // A picture made from another image changes for everyone; the room
+    // remembers it under alice's key for her older messages.
+    let wide = {
+        let mut v = DOT.to_vec();
+        // Same pixel, one more (ignored) chunk after IEND: a different file.
+        v.extend_from_slice(b"\0\0\0\0teXt");
+        v
+    };
+    let bob_pic = bob.set_picture(Some(wide)).await.unwrap().expect("an id");
+    wait_for("alice sees bob's", || picture_of(&alice, "bob").as_deref() == Some(bob_pic.as_str())).await;
+    wait_for("alice has bob's file", || alice.picture(&bob_pic).is_some()).await;
+    alice.submit(None, "hi");
+    wait_for("echo", || has_text(&bob, "general", "hi")).await;
+    let msg = bob.state().messages("general").iter().find(|m| m.text == "hi").cloned().unwrap();
+    assert_eq!(bob.state().author_picture(&msg), Some(alice_pic.as_str()));
+
+    // The next host serves the files to someone new.
+    let bob_id = member_id(&alice, "bob");
+    alice.handoff(Some(bob_id));
+    wait_for("moved to bob", || on_term(&alice, 2) && on_term(&bob, 2)).await;
+    let carol = session("carol", &home.join("c")).await;
+    carol.join(bob.state().hosting.as_ref().unwrap().share[0].clone());
+    wait_for("carol in", || carol.state().conn.is_connected() && carol.state().members.len() == 3).await;
+    assert_eq!(carol.state().room_picture(), Some(room_pic.as_str()));
+    wait_for("carol has every picture", || {
+        carol.picture(&room_pic).is_some() && carol.picture(&alice_pic).is_some() && carol.picture(&bob_pic).is_some()
+    })
+    .await;
+
+    // Removing works the same way.
+    alice.set_picture(None).await.unwrap();
+    wait_for("alice's picture gone for carol", || picture_of(&carol, "alice").is_none()).await;
+    carol.set_room_picture(None).await.unwrap();
+    wait_for("room picture gone", || alice.state().room_picture().is_none() && bob.state().room_picture().is_none()).await;
+    assert!(has_text(&bob, "general", "carol removed the room picture"));
+    bob.shutdown();
 }

@@ -30,8 +30,8 @@ struct Cli {
     /// Keep config, data and state under this directory (same as DEN_HOME).
     #[arg(long, global = true, env = "DEN_HOME", hide_env_values = true)]
     home: Option<PathBuf>,
-    /// Override the nick for this run.
-    #[arg(long, global = true)]
+    /// Override the nickname for this run.
+    #[arg(long = "nickname", visible_alias = "nick", global = true)]
     nick: Option<String>,
     /// More logging (-v info, -vv debug).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]

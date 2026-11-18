@@ -4,6 +4,8 @@ use egui::accesskit::Role;
 use egui::{CornerRadius, Event, Key, PointerButton, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 
 use super::{Panel, PanelCx, ShellCmd};
+use crate::pictures::PictureFor;
+
 use crate::icons;
 use crate::kit::{self, Face, W};
 use crate::theme::{Palette, alpha, mix};
@@ -25,12 +27,15 @@ pub struct Settings {
     /// Frame we last drew on, to notice the page being (re)opened.
     last_frame: u64,
     was_in_call: bool,
+    /// The nickname being edited on the profile page.
+    nick: Option<String>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Page {
     #[default]
     Voice,
+    Profile,
     Appearance,
 }
 
@@ -65,9 +70,11 @@ impl Panel for Settings {
             ui.vertical(|ui| {
                 ui.set_width(150.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for (page, glyph, label) in
-                    [(Page::Voice, icons::MICROPHONE, "Voice & audio"), (Page::Appearance, icons::PAINT_BRUSH, "Appearance")]
-                {
+                for (page, glyph, label) in [
+                    (Page::Voice, icons::MICROPHONE, "Voice & audio"),
+                    (Page::Profile, icons::USER_CIRCLE, "Profile"),
+                    (Page::Appearance, icons::PAINT_BRUSH, "Appearance"),
+                ] {
                     let (rect, resp) = kit::row(ui, 34.0, self.page == page, false, &p);
                     kit::name_selected(&resp, Role::Tab, self.page == page, label);
                     let color = if self.page == page { p.text } else { p.muted };
@@ -91,6 +98,7 @@ impl Panel for Settings {
                         ui.set_width(ui.available_width() - 8.0);
                         match self.page {
                             Page::Voice => self.voice_page(ui, cx),
+                            Page::Profile => self.profile_page(ui, cx),
                             Page::Appearance => appearance_page(ui, cx),
                         }
                         ui.add_space(8.0);
@@ -110,6 +118,7 @@ impl Settings {
         if opened {
             self.devices = None;
             self.capturing = false;
+            self.nick = None;
         }
         let v = &cx.state.voice;
         let in_call = v.channel.is_some() || v.engine;
@@ -342,6 +351,62 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// Your picture and nickname: what everyone in your rooms sees.
+    fn profile_page(&mut self, ui: &mut Ui, cx: &mut PanelCx<'_>) {
+        let p = *cx.palette;
+        section(ui, &p, icons::USER_CIRCLE, "Profile");
+        group(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                let size = 88.0;
+                let fill = mix(p.panel, p.surface, 0.5);
+                let pic = cx.my_picture(ui);
+                let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+                Face::new(&cx.state.nick, size, fill).picture(pic).paint(ui.painter(), r.center(), &p, 0.0);
+                picture_hover(ui, &resp, r, size / 2.0);
+                kit::name(&resp, Role::Button, "Your picture");
+                if resp.on_hover_text("Change your picture").clicked() {
+                    cx.actions.shell(ShellCmd::PickPicture(PictureFor::Me));
+                }
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    let label = ui.label(RichText::new("Nickname").font(kit::font(13.0, W::Medium)).color(p.muted));
+                    let nick = self.nick.get_or_insert_with(|| cx.state.nick.clone());
+                    let edit = ui.add(egui::TextEdit::singleline(nick).desired_width(220.0)).labelled_by(label.id);
+                    if edit.lost_focus() && nick.trim() != cx.state.nick && !nick.trim().is_empty() {
+                        let n = nick.trim().to_owned();
+                        cx.actions.session(move |s| s.set_nick(&n));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("{}  Change picture…", icons::IMAGE)).clicked() {
+                            cx.actions.shell(ShellCmd::PickPicture(PictureFor::Me));
+                        }
+                        if cx.state.picture.is_some() && ui.button(format!("{}  Remove picture", icons::TRASH)).clicked() {
+                            cx.actions.session(|s| s.set_picture_file(None));
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                cx.small("Everyone in your rooms sees your picture and nickname. Any image works: it's cut to a square and made small."),
+            );
+        });
+    }
+}
+
+/// Darken a picture you can click and show a camera, while hovered.
+pub(crate) fn picture_hover(ui: &Ui, resp: &egui::Response, r: Rect, radius: f32) {
+    let hover = kit::hover_fade(ui, resp.id, resp.hovered());
+    if hover > 0.0 {
+        let corner = CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8);
+        ui.painter().rect_filled(r, corner, alpha(egui::Color32::BLACK, 0.45 * hover));
+        kit::icon(ui.painter(), r.center(), icons::CAMERA, (r.height() * 0.3).clamp(14.0, 26.0), alpha(egui::Color32::WHITE, hover));
+    }
+}
+
 fn appearance_page(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     let p = *cx.palette;
     section(ui, &p, icons::PALETTE, "Theme");
@@ -444,7 +509,7 @@ fn keycap(ui: &mut Ui, p: &Palette, text: &str, active: bool) -> egui::Response 
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), kit::font(13.0, W::Semibold), fg));
     let (rect, resp) = ui.allocate_exact_size(vec2((g.size().x + 24.0).max(64.0), 30.0), Sense::click());
     kit::name(&resp, Role::Button, format!("Push-to-talk key: {text}"));
-    let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let hot = kit::hover_fade(ui, resp.id, resp.hovered());
     let radius = CornerRadius::same(6);
     let bg = if active { p.accent } else { mix(p.surface, p.surface_hover, hot) };
     // A darker lip under the cap.

@@ -36,6 +36,8 @@ struct View<'a> {
     text: &'a str,
     mention: bool,
     own: bool,
+    /// The author's picture.
+    picture: Option<egui::TextureId>,
 }
 
 impl<'a> View<'a> {
@@ -48,7 +50,7 @@ impl<'a> View<'a> {
             None => (false, m.text.as_str()),
         };
         let own = m.kind == MessageKind::User && m.author_id.is_some() && m.author_id == me;
-        View { time, emote, text, mention, own }
+        View { time, emote, text, mention, own, picture: None }
     }
 }
 
@@ -158,7 +160,10 @@ impl Panel for Messages {
                     Item::New if style == Style::Bubbles => kit::new_divider(ui, "New messages", true, &p),
                     Item::New if style == Style::Cozy => kit::new_divider(ui, "New", false, &p),
                     Item::Msg { m, start, end } => {
-                        let v = View::of(m, &time_format, cx.state.mentions_me(m), me);
+                        let mut v = View::of(m, &time_format, cx.state.mentions_me(m), me);
+                        if *start || *end {
+                            v.picture = cx.picture(ui, cx.state.author_picture(m));
+                        }
                         match style {
                             Style::Cozy => cozy(ui, m, &v, *start, &p, &nicks, behind),
                             Style::Bubbles => bubble(ui, m, &v, *start, *end, &p, &nicks),
@@ -270,7 +275,7 @@ fn voice_pill(ui: &mut Ui, cx: &mut PanelCx<'_>, right: f32, y: f32) -> f32 {
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text, kit::font(12.5, W::Semibold), fg));
     let r = Rect::from_min_size(pos2(right - g.size().x - 24.0, y - 15.0), vec2(g.size().x + 24.0, 30.0));
     let resp = ui.interact(r, ui.scope_id().with("voice-pill"), Sense::click());
-    let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let hot = kit::hover_fade(ui, resp.id, resp.hovered());
     ui.painter().rect_filled(r, CornerRadius::same(15), crate::theme::mix(bg, fg, 0.08 * hot));
     kit::name(&resp, Role::Button, g.text().trim_start_matches(icons::PHONE).trim());
     ui.painter().galley(r.center() - g.size() / 2.0, g, fg);
@@ -375,7 +380,7 @@ fn cozy(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, p: &Palette, ni
     let (rect, resp) = ui.allocate_exact_size(vec2(w, pad_top + head + g.size().y + 3.0), Sense::click());
     kit::name(&resp, Role::ListItem, message_label(m, v, &body));
     let hovered = resp.hovered();
-    let t = ui.ctx().animate_bool_with_time(resp.id, hovered, 0.1);
+    let t = kit::hover_fade(ui, resp.id, hovered);
     let painter = ui.painter();
     let radius = CornerRadius::same(p.row_radius);
     if v.mention {
@@ -396,7 +401,7 @@ fn cozy(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, p: &Palette, ni
             painter.circle_filled(center, AVATAR / 2.0, p.accent_soft);
             kit::icon(painter, center, icons::INFO, 18.0, p.accent_ink);
         } else {
-            Face::new(&m.author, AVATAR, behind).paint(painter, center, p, 0.0);
+            Face::new(&m.author, AVATAR, behind).picture(v.picture).paint(painter, center, p, 0.0);
         }
         let (name, nc) = if server {
             (if m.author.is_empty() { "server".to_owned() } else { m.author.clone() }, p.accent_ink)
@@ -498,7 +503,8 @@ fn bubble(ui: &mut Ui, m: &ChatMessage, v: &View<'_>, start: bool, end: bool, p:
             ui.painter().galley(pos2(bubble.left() + 4.0 + nw + 8.0, row.top() + 1.5), tg, p.muted);
         }
         if end {
-            Face::new(&m.author, 28.0, p.bg).paint(ui.painter(), pos2(row.left() + 8.0 + 14.0, bubble.bottom() - 14.0), p, 0.0);
+            let at = pos2(row.left() + 8.0 + 14.0, bubble.bottom() - 14.0);
+            Face::new(&m.author, 28.0, p.bg).picture(v.picture).paint(ui.painter(), at, p, 0.0);
         }
     }
     let resp = resp.on_hover_text(&v.time);

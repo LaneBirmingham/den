@@ -1284,7 +1284,7 @@ mod tests {
         for _ in 0..2 {
             let mut o = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.horizontal(|ui| {
-                    let label = ui.label("Nick");
+                    let label = ui.label("Nickname");
                     ui.text_edit_singleline(&mut text).labelled_by(label.id);
                 });
             });
@@ -1294,7 +1294,7 @@ mod tests {
         let update = out.expect("accesskit update");
         let tree = Tree::build(&ctx, &update, &mut Refs::default());
         let tb = tree.nodes.iter().find(|n| n.role == "textbox").expect("a textbox");
-        assert_eq!(tb.text, "Nick");
+        assert_eq!(tb.text, "Nickname");
     }
 
     #[test]

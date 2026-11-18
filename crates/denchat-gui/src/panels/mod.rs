@@ -17,7 +17,7 @@ mod lobby;
 mod members;
 mod messages;
 mod modpanel;
-mod settings;
+pub(crate) mod settings;
 mod stage;
 mod status;
 mod toasts;
@@ -55,6 +55,9 @@ pub enum ShellCmd {
     /// Show the settings page (`core.settings`) over everything.
     OpenSettings,
     CloseSettings,
+    /// Ask for an image (the system's file dialog; a path prompt without a
+    /// window) and make it your picture or the room's.
+    PickPicture(crate::pictures::PictureFor),
 }
 
 /// A deferred call against the session.
@@ -110,9 +113,21 @@ pub struct PanelCx<'a> {
     /// The panel sits inside a card the shell drew (so it shouldn't raise its
     /// own cards); false on the bare canvas or in the flat style.
     pub in_card: bool,
+    pub pictures: &'a crate::pictures::Pictures,
 }
 
 impl PanelCx<'_> {
+    /// The texture for a picture id (a member's, the room's, yours), once its
+    /// file is here.
+    pub fn picture(&self, ui: &Ui, id: Option<&str>) -> Option<egui::TextureId> {
+        self.pictures.texture(ui.ctx(), self.session, self.state.revision, id)
+    }
+
+    /// Your own picture.
+    pub fn my_picture(&self, ui: &Ui) -> Option<egui::TextureId> {
+        self.picture(ui, self.state.picture.as_deref())
+    }
+
     pub fn setting_str(&self, key: &str) -> Option<&str> {
         self.settings.get(key).and_then(|v| v.as_str())
     }
@@ -154,7 +169,7 @@ impl Registry {
     /// All built-in panels.
     pub fn with_builtins() -> Registry {
         let mut r = Registry::empty();
-        r.register("core.lobby", "Host or join a room", || Box::new(lobby::Lobby::default()));
+        r.register(lobby::ID, "Host or join a room", || Box::new(lobby::Lobby::default()));
         r.register(header::ID, "Room header and View menu", || Box::new(header::Header));
         r.register("core.channels", "Text and voice channels", || Box::new(channels::Channels::default()));
         r.register("core.voice", "Voice controls", || Box::new(voice::Voice::default()));
