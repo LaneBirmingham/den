@@ -41,6 +41,10 @@ pub mod names {
     pub const HISTORY_LOADED: &str = "history.loaded";
     /// Someone added a channel: `{channels, created}` (`created`: the new ones).
     pub const CHANNELS_UPDATED: &str = "channels.updated";
+    /// The room's settings changed (its picture): `{server, by}` (`by`: the member who did it).
+    pub const ROOM_UPDATED: &str = "room.updated";
+    /// A picture file arrived and is ready to show (`state.get` pictures, `picture.get`): `{id}`.
+    pub const PICTURE_RECEIVED: &str = "picture.received";
 
     /// Every name, for docs and `api.methods`.
     pub const ALL: &[&str] = &[
@@ -60,6 +64,8 @@ pub mod names {
         COMMAND_RUN,
         HISTORY_LOADED,
         CHANNELS_UPDATED,
+        ROOM_UPDATED,
+        PICTURE_RECEIVED,
     ];
 }
 

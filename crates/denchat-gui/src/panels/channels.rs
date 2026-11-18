@@ -135,7 +135,7 @@ impl NewChannel {
                     let on = self.kind == kind;
                     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
                     kit::name_selected(&resp, Role::RadioButton, on, format!("{title} channel"));
-                    let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    let hot = kit::hover_fade(ui, resp.id, resp.hovered());
                     let fill = if on { p.row_active } else { crate::theme::mix(p.surface, p.surface_hover, hot) };
                     ui.painter().rect_filled(rect, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), fill);
                     kit::icon(ui.painter(), pos2(rect.left() + 22.0, rect.center().y), glyph, 20.0, if on { p.text } else { p.muted });
@@ -302,7 +302,8 @@ fn people<'a>(cx: &'a PanelCx<'_>, channel: &'a str) -> Vec<&'a Member> {
 /// A voice channel you're not in: name, who's there, and Join.
 fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<u32, f32>) {
     let p = *cx.palette;
-    let folks: Vec<(String, Option<f32>)> = people(cx, &c.id).iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied())).collect();
+    let folks: Vec<kit::StackFace> =
+        people(cx, &c.id).iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied(), cx.picture(ui, m.picture.as_deref()))).collect();
     let (rect, resp) = kit::row(ui, 34.0, false, false, &p);
     let painter = ui.painter();
     kit::icon(painter, pos2(rect.left() + 18.0, rect.center().y), icons::SPEAKER_HIGH, 17.0, if folks.is_empty() { p.muted } else { p.ok });
@@ -381,7 +382,8 @@ fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap
             let me = cx.state.me == Some(m.id);
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
             let painter = ui.painter();
-            Face::new(&m.nick, 22.0, fill).talking(level).paint(painter, pos2(r.left() + 13.0, r.center().y), &p, time);
+            let pic = cx.picture(ui, m.picture.as_deref());
+            Face::new(&m.nick, 22.0, fill).talking(level).picture(pic).paint(painter, pos2(r.left() + 13.0, r.center().y), &p, time);
             let mut right = r.right() - 4.0;
             if let Some(l) = level {
                 kit::eq(painter, pos2(right - 12.0, r.center().y + 6.0), p.speaking, time, l);

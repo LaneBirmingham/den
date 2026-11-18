@@ -10,9 +10,11 @@ name = "den"
 path = "src/main.rs"
 
 [features]
-default = ["gui", "voice"]
+default = ["gui", "voice", "images"]
 gui = ["dep:denchat-gui"]
 voice = ["denchat-core/voice", "denchat-gui?/voice"]
+# Resize pictures (profile, room) people choose; without it they must already be small.
+images = ["denchat-core/images"]
 
 [dependencies]
 denchat-core.workspace = true

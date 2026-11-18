@@ -58,7 +58,13 @@ impl Panel for Stage {
                         let painter = ui.painter_at(rect.expand(6.0));
                         painter.rect_filled(rect, egui::CornerRadius::same(p.card_radius.min(16)), p.surface);
                         let center = rect.center_top() + vec2(0.0, tile * 0.48);
-                        Face::new(&m.nick, tile * 0.6, p.surface).talking(level).paint(&painter, center, &p, ui.input(|i| i.time));
+                        let pic = cx.picture(ui, m.picture.as_deref());
+                        Face::new(&m.nick, tile * 0.6, p.surface).talking(level).picture(pic).paint(
+                            &painter,
+                            center,
+                            &p,
+                            ui.input(|i| i.time),
+                        );
                         let name_pos = rect.center_bottom() - vec2(0.0, 15.0);
                         painter.text(name_pos, Align2::CENTER_CENTER, &m.nick, kit::font(p.small_size + 1.0, W::Medium), p.text);
                         let flag = if m.deafened {

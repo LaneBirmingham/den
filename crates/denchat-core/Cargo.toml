@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 voice = ["dep:denchat-audio"]
+# Resize pictures people choose, and decode them for display.
+images = ["dep:image"]
 
 [dependencies]
 denchat-proto.workspace = true
@@ -28,3 +30,5 @@ iroh-relay.workspace = true
 data-encoding.workspace = true
 portmapper.workspace = true
 bytes.workspace = true
+blake3.workspace = true
+image = { workspace = true, optional = true }

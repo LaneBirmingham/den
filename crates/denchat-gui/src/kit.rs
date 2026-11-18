@@ -99,11 +99,19 @@ pub struct Face<'a> {
     pub presence: Option<Color32>,
     /// Talking, and how loud (0..1, see `denchat_core::loudness::intensity`).
     pub talking: Option<f32>,
+    /// Their picture (else a coloured circle with their initial).
+    pub picture: Option<egui::TextureId>,
 }
 
 impl<'a> Face<'a> {
     pub fn new(nick: &'a str, size: f32, behind: Color32) -> Face<'a> {
-        Face { nick, size, behind, presence: None, talking: None }
+        Face { nick, size, behind, presence: None, talking: None, picture: None }
+    }
+
+    /// Show this picture (see `PanelCx::picture`) instead of the initial.
+    pub fn picture(mut self, tex: Option<egui::TextureId>) -> Self {
+        self.picture = tex;
+        self
     }
 
     pub fn presence(mut self, c: Color32) -> Self {
@@ -133,8 +141,14 @@ impl<'a> Face<'a> {
         if let Some(level) = self.talking {
             talk_ring(painter, center, r, level, p);
         }
-        painter.circle_filled(center, r, avatar_fill(self.nick, p));
-        painter.text(center, Align2::CENTER_CENTER, initial(self.nick), font((self.size * 0.42).max(8.0), W::Semibold), avatar_ink(p));
+        match self.picture {
+            Some(tex) => crate::pictures::paint_round(painter, center, self.size, tex),
+            None => {
+                painter.circle_filled(center, r, avatar_fill(self.nick, p));
+                let ink = avatar_ink(p);
+                painter.text(center, Align2::CENTER_CENTER, initial(self.nick), font((self.size * 0.42).max(8.0), W::Semibold), ink);
+            }
+        }
         if let Some(c) = self.presence {
             let dr = (self.size * 0.15).clamp(3.0, 6.0);
             let at = center + vec2(r * 0.72, r * 0.72);
@@ -180,15 +194,11 @@ pub fn stack_width(n: usize, size: f32, max: usize) -> f32 {
     if total == 0 { 0.0 } else { size + size * 0.72 * (total - 1) as f32 }
 }
 
-/// Overlapping avatars, `+N` after `max`. `faces` are `(nick, talking level)`.
-pub fn paint_stack(
-    ui: &Ui,
-    left_center: Pos2,
-    faces: &[(String, Option<f32>)],
-    (size, max): (f32, usize),
-    behind: Color32,
-    p: &Palette,
-) -> f32 {
+/// One face in [`paint_stack`]: nick, talking level, picture.
+pub type StackFace = (String, Option<f32>, Option<egui::TextureId>);
+
+/// Overlapping avatars, `+N` after `max`.
+pub fn paint_stack(ui: &Ui, left_center: Pos2, faces: &[StackFace], (size, max): (f32, usize), behind: Color32, p: &Palette) -> f32 {
     let painter = ui.painter();
     let time = ui.input(|i| i.time);
     let step = size * 0.72;
@@ -208,7 +218,7 @@ pub fn paint_stack(
     for i in (0..shown).rev() {
         let c = centers[i];
         painter.circle_filled(c, size / 2.0 + 2.0, behind);
-        Face { nick: &faces[i].0, size, behind, presence: None, talking: faces[i].1 }.paint(painter, c, p, time);
+        Face { nick: &faces[i].0, size, behind, presence: None, talking: faces[i].1, picture: faces[i].2 }.paint(painter, c, p, time);
     }
     width
 }
@@ -279,6 +289,13 @@ pub fn icon_button_at(ui: &mut Ui, rect: Rect, salt: &str, glyph: &str, tip: &st
     if !tip.is_empty() { resp.on_hover_text(tip) } else { resp }
 }
 
+/// How lit a hover highlight is (0..1). It comes on in the same frame the
+/// pointer arrives, since any fade-in reads as lag behind the cursor, and
+/// fades briefly as the pointer leaves so sweeping down a list stays calm.
+pub fn hover_fade(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
+    ui.ctx().animate_bool_with_time(id, hovered, if hovered { 0.0 } else { 0.1 })
+}
+
 /// The tooltip is the name (it says what a click does: `Mute`, `Unmute`).
 fn name_icon_button(resp: &Response, fallback: &str, tip: &str, _tone: Tone) {
     name(resp, Role::Button, if tip.is_empty() { fallback } else { tip });
@@ -286,7 +303,7 @@ fn name_icon_button(resp: &Response, fallback: &str, tip: &str, _tone: Tone) {
 
 fn paint_icon_button(ui: &Ui, resp: &Response, glyph: &str, tone: Tone, p: &Palette) {
     let rect = resp.rect;
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = hover_fade(ui, resp.id, resp.hovered());
     let radius = CornerRadius::same(p.row_radius.min((rect.height() / 2.0) as u8));
     let (bg, fg) = match tone {
         Tone::Plain => (alpha(p.text, 0.07 * t), mix(p.muted, p.text, t)),
@@ -302,7 +319,7 @@ pub fn pill_button(ui: &mut Ui, text: &str, p: &Palette) -> Response {
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(12.5, W::Semibold), p.text));
     let size = vec2(g.size().x + 20.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = hover_fade(ui, resp.id, resp.hovered());
     ui.painter().rect_filled(rect, CornerRadius::same(12), mix(p.surface, p.surface_hover, t));
     put(ui.painter(), &g, rect.left() + 10.0, rect.center().y, p.text);
     name(&resp, Role::Button, text);
@@ -315,7 +332,7 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, p: &Palette) -> Re
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(13.5, W::Semibold), fg));
     let size = vec2((g.size().x + 32.0).max(72.0), 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() && enabled, 0.12);
+    let t = hover_fade(ui, resp.id, resp.hovered() && enabled);
     let bg = if enabled { mix(p.accent, p.text, 0.12 * t) } else { p.surface };
     ui.painter().rect_filled(rect, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), bg);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
@@ -347,7 +364,7 @@ pub fn section(ui: &mut Ui, text: &str, p: &Palette) -> Response {
 /// A row that highlights on hover and can be selected. Returns the click response.
 pub fn row(ui: &mut Ui, height: f32, selected: bool, raised: bool, p: &Palette) -> (Rect, Response) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let t = hover_fade(ui, resp.id, resp.hovered());
     let radius = CornerRadius::same(p.row_radius);
     if selected {
         if raised {

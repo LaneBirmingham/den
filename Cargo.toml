@@ -32,7 +32,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 crossbeam-channel = "0.5"
 # clipboard: system copy/paste (without it egui keeps a private, in-app clipboard). links: open URLs.
 # system_fonts: fall back to OS fonts for scripts the bundled fonts lack (CJK, Arabic, emoji, …).
-eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "persistence", "system_fonts", "wayland", "x11"] }
+# wgpu, not glow: windowed OpenGL on Windows queues frames in the driver, so hover
+# and clicks trail the cursor; wgpu (DX12 / Vulkan / Metal) presents with a one-frame queue.
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "wgpu", "links", "persistence", "system_fonts", "wayland", "x11"] }
 egui = "0.37"
 cpal = "0.18"
 opus = "0.4"
@@ -43,6 +45,15 @@ data-encoding = "2"
 # Same version iroh uses; only to ask the router whether it maps ports (`Net::reach`).
 portmapper = "0.19"
 bytes = "1"
+blake3 = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rfd = "0.18"
+
+# Optimise dependencies even in dev builds: unoptimised egui tessellation, opus
+# and crypto eat most of a 144-240 Hz frame budget. Den's own crates stay
+# quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

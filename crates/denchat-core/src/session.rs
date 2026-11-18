@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use denchat_proto::voice::Codec;
 use denchat_proto::{
-    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, MAX_BATCH, MAX_MESSAGE_LEN, Member, MemberId,
-    MessageKind, NoticeLevel, PROTOCOL_VERSION, Reach, ServerInfo, ServerMsg, VoiceSetup,
+    Access, Channel, ChannelId, ChannelKind, ChatMessage, ClientMsg, FEATURE_HOST, FEATURE_PICTURES, MAX_BATCH, MAX_MESSAGE_LEN,
+    MAX_PICTURE_IDS, Member, MemberId, MessageKind, NoticeLevel, PROTOCOL_VERSION, Reach, ServerInfo, ServerMsg, VoiceSetup,
 };
 use iroh::endpoint::Connection;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -35,6 +35,7 @@ use crate::events::{Event, names};
 use crate::mods::{ModHost, ModRuntime};
 use crate::net::{self, Link, Net, read_frame, write_frame};
 use crate::paths::Paths;
+use crate::pictures;
 use crate::rooms::{self, RoomSave};
 use crate::server::{self, HandoffState, ServerHandle, ServerMode, ServerOptions};
 use crate::ui::{UiStore, Widget};
@@ -57,7 +58,7 @@ pub fn message_problem(text: &str) -> Option<String> {
 /// Built-in slash commands: `(usage, description)`. Frontends use this for help and completion.
 pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
-    ("/nick <name>", "change your nick"),
+    ("/nickname <name>", "change your nickname"),
     ("/me <action>", "emote"),
     ("/ch <channel>", "switch text channel"),
     ("/newchannel [voice] <name>", "add a text (or voice) channel"),
@@ -71,8 +72,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/connect <invite>", "join another room"),
     ("/invite", "show this room's invite link"),
     ("/whoami", "show your key for this room"),
+    ("/picture <file>|clear", "set (or remove) your profile picture"),
+    ("/roompicture <file>|clear", "set (or remove) this room's picture"),
     ("/disconnect", "leave the room (hands it off if you host it)"),
-    ("/handoff [nick]", "hand hosting to another member"),
+    ("/handoff [nickname]", "hand hosting to another member"),
     ("/takeover", "host this room from your copy (when its host is gone)"),
     ("/mods", "list mods"),
 ];
@@ -222,6 +225,11 @@ pub struct SessionState {
     pub server: Option<ServerInfo>,
     pub me: Option<MemberId>,
     pub nick: String,
+    /// Your profile picture (an id for [`Session::picture`]), in every room.
+    pub picture: Option<String>,
+    /// Pictures of the room's members by key, including people who aren't
+    /// here now (for the authors of older messages).
+    pub profile_pictures: HashMap<String, String>,
     pub channels: Vec<Channel>,
     pub members: BTreeMap<MemberId, Member>,
     #[serde(skip)]
@@ -229,7 +237,7 @@ pub struct SessionState {
     /// Text channel the user is looking at (default target for input).
     pub focus: Option<ChannelId>,
     pub unread: HashMap<ChannelId, u32>,
-    /// Unread messages that mention our nick, per channel (a subset of `unread`).
+    /// Unread messages that mention our nickname, per channel (a subset of `unread`).
     pub mentions: HashMap<ChannelId, u32>,
     /// Per channel: timestamp of the first message that arrived while we were
     /// looking elsewhere. Frontends draw a "new messages" line above it. Kept
@@ -256,6 +264,8 @@ impl SessionState {
             server: None,
             me: None,
             nick,
+            picture: None,
+            profile_pictures: HashMap::new(),
             channels: Vec::new(),
             members: BTreeMap::new(),
             messages: HashMap::new(),
@@ -275,6 +285,48 @@ impl SessionState {
 
     pub fn me(&self) -> Option<&Member> {
         self.me.and_then(|id| self.members.get(&id))
+    }
+
+    /// The picture to show for the author of `m`: theirs while they're here,
+    /// else what the room remembers for their key.
+    pub fn author_picture(&self, m: &ChatMessage) -> Option<&str> {
+        if let Some(member) = m.author_id.and_then(|id| self.members.get(&id)) {
+            return member.picture.as_deref();
+        }
+        m.author_key.as_deref().and_then(|k| self.profile_pictures.get(k)).map(String::as_str)
+    }
+
+    /// The room's picture.
+    pub fn room_picture(&self) -> Option<&str> {
+        self.server.as_ref().and_then(|s| s.picture.as_deref())
+    }
+
+    /// The host we're connected to can store and pass on pictures.
+    pub fn pictures_supported(&self) -> bool {
+        self.conn.is_connected() && self.server.as_ref().is_some_and(|s| s.has(FEATURE_PICTURES))
+    }
+
+    /// Every picture the room refers to.
+    fn pictures_in_use(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .room_picture()
+            .map(str::to_owned)
+            .into_iter()
+            .chain(self.members.values().filter_map(|m| m.picture.clone()))
+            .chain(self.profile_pictures.values().cloned())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Remember a member's picture under their key (if the host checked it).
+    fn note_picture(&mut self, m: &Member) {
+        let Some(key) = m.identity.key.clone().filter(|_| m.identity.verified) else { return };
+        match m.picture.clone() {
+            Some(p) => self.profile_pictures.insert(key, p),
+            None => self.profile_pictures.remove(&key),
+        };
     }
 
     pub fn text_channels(&self) -> impl Iterator<Item = &Channel> {
@@ -405,6 +457,35 @@ struct ConnSlot {
 
 type Listener = Arc<dyn Fn() + Send + Sync>;
 
+/// Picture files this session can show.
+#[derive(Default)]
+struct Pictures {
+    /// Our own profile picture: id and file.
+    own: Option<(String, Arc<[u8]>)>,
+    /// The room we're in (its id) and its pictures.
+    room: Option<(String, pictures::Store)>,
+    /// Asked the host for these and waiting.
+    asked: std::collections::HashSet<String>,
+}
+
+impl Pictures {
+    fn get(&mut self, id: &str) -> Option<Arc<[u8]>> {
+        if let Some((own, bytes)) = &self.own
+            && own == id
+        {
+            return Some(bytes.clone());
+        }
+        self.room.as_mut().and_then(|(_, s)| s.get(id))
+    }
+
+    fn has(&mut self, id: &str) -> bool {
+        self.own.as_ref().is_some_and(|(own, _)| own == id) || self.room.as_mut().is_some_and(|(_, s)| s.has(id))
+    }
+}
+
+/// Biggest image file we'll read to make a picture from.
+const MAX_IMAGE_FILE: u64 = 40 << 20;
+
 struct Inner {
     /// This profile's endpoint key is ours until the session closes.
     key_lock: Mutex<Option<net::KeyLock>>,
@@ -427,6 +508,8 @@ struct Inner {
     voice_wanted: Mutex<Option<ChannelId>>,
     /// A text channel we asked to create: focus it when it appears.
     creating: Mutex<Option<(String, Instant)>>,
+    /// Our picture and the files of the room we're in.
+    pictures: Mutex<Pictures>,
     ping: Mutex<Option<(u64, Instant)>>,
     /// Our copy of the room we're in.
     copy: Mutex<Option<rooms::Copy>>,
@@ -468,6 +551,8 @@ impl Session {
     pub async fn start(opts: SessionOptions) -> anyhow::Result<Session> {
         let nick = opts.config.nick.clone().unwrap_or_else(config::os_username);
         let mut state = SessionState::new(denchat_proto::clean_nick(&nick));
+        let own = pictures::load_own(&opts.paths.data).map(|b| (pictures::id_of(&b), Arc::<[u8]>::from(b)));
+        state.picture = own.as_ref().map(|(id, _)| id.clone());
         state.rooms = rooms::list(&opts.paths);
         state.voice.mode = opts.config.voice.mode.clone();
         let (events, _) = broadcast::channel(1024);
@@ -492,6 +577,7 @@ impl Session {
             api_env: RwLock::new(Vec::new()),
             voice_wanted: Mutex::new(None),
             creating: Mutex::new(None),
+            pictures: Mutex::new(Pictures { own, ..Default::default() }),
             ping: Mutex::new(None),
             copy: Mutex::new(None),
             prev_me: Mutex::new(None),
@@ -889,7 +975,17 @@ impl Session {
                 }
                 self.notice(NoticeLevel::Info, lines.join("\n"));
             }
-            "nick" if !arg.is_empty() => self.set_nick(arg),
+            "nickname" | "nick" if !arg.is_empty() => self.set_nick(arg),
+            "picture" | "avatar" => match arg {
+                "" => self.notice(NoticeLevel::Warn, "usage: /picture <image file> (or /picture clear)".into()),
+                "clear" | "none" | "remove" => self.set_picture_file(None),
+                path => self.set_picture_file(Some(unquote(path).into())),
+            },
+            "roompicture" | "roompic" => match arg {
+                "" => self.notice(NoticeLevel::Warn, "usage: /roompicture <image file> (or /roompicture clear)".into()),
+                "clear" | "none" | "remove" => self.set_room_picture_file(None),
+                path => self.set_room_picture_file(Some(unquote(path).into())),
+            },
             "me" if !arg.is_empty() => {
                 let nick = self.state().me().map(|m| m.nick.clone()).unwrap_or_default();
                 self.send_message(channel, &format!("_{nick} {arg}_"));
@@ -999,6 +1095,100 @@ impl Session {
         let save = rooms::load(&self.inner.paths, &id).ok();
         let link = Link::parse(&addr).ok().or_else(|| save.as_ref().and_then(|s| s.addrs.first()).and_then(|a| Link::parse(a).ok()))?;
         Some(link.room(id).invite(save.and_then(|s| s.invite)).to_string())
+    }
+
+    // ----- pictures --------------------------------------------------------
+
+    /// A picture file by id: yours, or one a room you're in (or have been in) uses.
+    pub fn picture(&self, id: &str) -> Option<Arc<[u8]>> {
+        if !denchat_proto::valid_picture_id(id) {
+            return None;
+        }
+        if let Some(b) = self.inner.pictures.lock().get(id) {
+            return Some(b);
+        }
+        // Rooms we're not in (pictures in the lobby).
+        let rooms = std::fs::read_dir(self.paths().rooms_dir()).ok()?;
+        rooms.flatten().find_map(|e| pictures::read(&e.path().join("pictures"), id)).map(Arc::from)
+    }
+
+    /// Set your profile picture from an image (any common format: it's cut
+    /// to a square and made small), or remove it with `None`. It goes to the
+    /// room you're in now and every room you join later. Returns its id.
+    pub async fn set_picture(&self, image: Option<Vec<u8>>) -> anyhow::Result<Option<String>> {
+        let bytes = match image {
+            Some(raw) => Some(tokio::task::spawn_blocking(move || pictures::prepare(&raw)).await??),
+            None => None,
+        };
+        pictures::save_own(&self.paths().data, bytes.as_deref())?;
+        let id = bytes.as_ref().map(|b| pictures::id_of(b));
+        self.inner.pictures.lock().own = bytes.map(|b| (pictures::id_of(&b), Arc::from(b)));
+        self.inner.update(|s| s.picture = id.clone());
+        let (connected, supported) = {
+            let s = self.state();
+            (s.conn.is_connected(), s.pictures_supported())
+        };
+        if supported {
+            if let Some(id) = &id
+                && let Some(b) = self.picture(id)
+            {
+                self.inner.send(ClientMsg::PutPicture { id: id.clone(), data: pictures::to_wire(&b) });
+            }
+            self.inner.send(ClientMsg::SetPicture { picture: id.clone() });
+        } else if connected {
+            self.notice(NoticeLevel::Info, "saved; this room's host runs an older Den, so others see your picture once it updates".into());
+        }
+        Ok(id)
+    }
+
+    /// Set the picture of the room you're in (anyone in it may), or remove it
+    /// with `None`. Everyone in the room gets it, and keeps it in their copy.
+    pub async fn set_room_picture(&self, image: Option<Vec<u8>>) -> anyhow::Result<Option<String>> {
+        let (room, supported) = {
+            let s = self.state();
+            (s.room_id().map(str::to_owned).filter(|_| s.conn.is_connected()), s.pictures_supported())
+        };
+        let Some(room) = room else { bail!("not in a room") };
+        if !supported {
+            bail!("this room's host runs an older Den without room pictures");
+        }
+        let bytes = match image {
+            Some(raw) => Some(tokio::task::spawn_blocking(move || pictures::prepare(&raw)).await??),
+            None => None,
+        };
+        let id = bytes.as_ref().map(|b| {
+            let mut p = self.inner.pictures.lock();
+            let store = p.room_store(&self.inner.paths, &room);
+            store.put(b)
+        });
+        if let (Some(id), Some(b)) = (&id, &bytes) {
+            self.inner.send(ClientMsg::PutPicture { id: id.clone(), data: pictures::to_wire(b) });
+        }
+        self.inner.send(ClientMsg::SetRoomPicture { picture: id.clone() });
+        Ok(id)
+    }
+
+    /// [`Session::set_picture`] from an image file, in the background; a
+    /// problem shows as a notice.
+    pub fn set_picture_file(&self, path: Option<std::path::PathBuf>) {
+        let me = self.clone();
+        self.inner.rt.spawn(async move {
+            let res = async { me.set_picture(read_image(path.as_deref()).await?).await }.await;
+            if let Err(e) = res {
+                me.notice(NoticeLevel::Warn, format!("couldn't set your picture: {e:#}"));
+            }
+        });
+    }
+
+    /// [`Session::set_room_picture`] from an image file, in the background.
+    pub fn set_room_picture_file(&self, path: Option<std::path::PathBuf>) {
+        let me = self.clone();
+        self.inner.rt.spawn(async move {
+            let res = async { me.set_room_picture(read_image(path.as_deref()).await?).await }.await;
+            if let Err(e) = res {
+                me.notice(NoticeLevel::Warn, format!("couldn't set the room picture: {e:#}"));
+            }
+        });
     }
 
     pub fn set_nick(&self, nick: &str) {
@@ -1442,17 +1632,21 @@ async fn run_once(inner: &Arc<Inner>, epoch: u64, addr: &str, was_connected: &mu
     let me_reach = net.reach();
     let conn = net.connect(link.addr.clone(), Duration::from_secs(10)).await?;
     let (mut wr, mut rd) = conn.open_bi().await.context("opening a stream")?;
-    let nick = inner.state.read().nick.clone();
+    let (nick, picture) = {
+        let s = inner.state.read();
+        (s.nick.clone(), s.picture.clone())
+    };
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         nick,
         client: inner.client_name.clone(),
         codecs: codecs(),
-        features: vec![FEATURE_HOST.into()],
+        features: vec![FEATURE_HOST.into(), FEATURE_PICTURES.into()],
         room: Some(room.clone()),
         proof: net::prove(&conn, &room, Some(&member), invite.as_ref().map(|(_, k)| k))?,
         addr: Some(me_addr.clone()),
         reach: me_reach,
+        picture,
     };
     write_frame(&mut wr, &hello).await?;
     let first: ServerMsg = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd))
@@ -1587,6 +1781,27 @@ fn codecs() -> Vec<Codec> {
     #[cfg(not(feature = "voice"))]
     {
         Vec::new()
+    }
+}
+
+/// An image file's bytes (`None` for none), refusing huge files.
+async fn read_image(path: Option<&std::path::Path>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(path) = path else { return Ok(None) };
+    let len = tokio::fs::metadata(path).await.with_context(|| format!("reading {}", path.display()))?.len();
+    if len > MAX_IMAGE_FILE {
+        bail!("{} is too big ({} MB; up to {} MB)", path.display(), len >> 20, MAX_IMAGE_FILE >> 20);
+    }
+    Ok(Some(tokio::fs::read(path).await.with_context(|| format!("reading {}", path.display()))?))
+}
+
+impl Pictures {
+    /// The store for room `id`'s pictures, switching to it if we were in another.
+    fn room_store(&mut self, paths: &Paths, id: &str) -> &mut pictures::Store {
+        if self.room.as_ref().is_none_or(|(r, _)| r != id) {
+            self.room = Some((id.to_owned(), pictures::Store::new(Some(rooms::pictures_dir(paths, id)))));
+            self.asked.clear();
+        }
+        &mut self.room.as_mut().expect("just set").1
     }
 }
 
@@ -1727,6 +1942,28 @@ impl Inner {
         }
         drop(copy);
         self.refresh_rooms();
+    }
+
+    /// Ask the host for pictures the room uses that we don't have yet.
+    fn fetch_pictures(&self) {
+        let (room, wanted) = {
+            let s = self.state.read();
+            if !s.pictures_supported() {
+                return;
+            }
+            let Some(room) = s.room_id().map(str::to_owned) else { return };
+            (room, s.pictures_in_use())
+        };
+        let ids: Vec<String> = {
+            let mut p = self.pictures.lock();
+            p.room_store(&self.paths, &room);
+            let lacking: Vec<String> = wanted.into_iter().filter(|id| !p.asked.contains(id) && !p.has(id)).take(MAX_PICTURE_IDS).collect();
+            p.asked.extend(lacking.iter().cloned());
+            lacking
+        };
+        if !ids.is_empty() {
+            self.send(ClientMsg::GetPictures { ids });
+        }
     }
 
     /// Keep messages in our copy. When our own server is the one we're in,
@@ -1954,6 +2191,12 @@ impl Inner {
             invite,
         );
         let prev_me = self.prev_me.lock().replace(you);
+        if rooms::valid_id(&server.room_id) {
+            // A new connection: ask again for anything still missing.
+            let mut p = self.pictures.lock();
+            p.room_store(&self.paths, &server.room_id);
+            p.asked.clear();
+        }
         self.update(|s| {
             // Same room (reconnect, or the room moved host): keep what's on
             // screen. Member ids are per host, so only ours carries over.
@@ -1972,6 +2215,7 @@ impl Inner {
             s.conn = ConnState::Connected { addr: addr.to_owned() };
             s.server = Some(server);
             s.me = Some(you);
+            s.profile_pictures = profiles.iter().filter_map(|p| Some((p.key.clone(), p.picture.clone()?))).collect();
             s.members = members.into_iter().map(|m| (m.id, m)).collect();
             if let Some(me) = s.members.get(&you) {
                 s.nick = me.nick.clone();
@@ -1992,6 +2236,7 @@ impl Inner {
         for m in syncs {
             self.send(m);
         }
+        self.fetch_pictures();
         let hosting = self.state.read().hosting.is_some();
         if !hosting {
             let addr = addr.to_owned();
@@ -2060,8 +2305,10 @@ impl Inner {
                     if let Some(ch) = s.first_text() {
                         push_capped(s.messages.entry(ch.clone()).or_default(), local_line(&ch, line));
                     }
+                    s.note_picture(&member);
                     s.members.insert(member.id, member);
                 });
+                self.fetch_pictures();
                 self.emit(names::MEMBER_JOINED, data);
             }
             ServerMsg::MemberLeft { id } => {
@@ -2096,9 +2343,11 @@ impl Inner {
                         s.voice.muted = member.muted;
                         s.voice.deafened = member.deafened;
                     }
+                    s.note_picture(&member);
                     s.members.insert(member.id, member.clone());
                     (mine, before)
                 });
+                self.fetch_pictures();
                 if mine && voice_before != member.voice {
                     match &member.voice {
                         Some(ch) => self.emit(names::VOICE_JOINED, json!({"channel": ch})),
@@ -2143,6 +2392,56 @@ impl Inner {
             }
             ServerMsg::App { from, ns, channel, data } => {
                 self.emit(names::APP_MESSAGE, json!({"from": from, "ns": ns, "channel": channel, "data": data}));
+            }
+            ServerMsg::Picture { id, data } => {
+                let bytes = match pictures::from_wire(&id, &data) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("the host sent a bad picture {id}: {e:#}");
+                        return;
+                    }
+                };
+                let Some(room) = self.state.read().room_id().map(str::to_owned) else { return };
+                {
+                    let mut p = self.pictures.lock();
+                    p.asked.remove(&id);
+                    p.room_store(&self.paths, &room).put(&bytes);
+                }
+                // Nothing in the state changed, but there's something new to draw.
+                self.update(|_| {});
+                self.emit(names::PICTURE_RECEIVED, json!({"id": id}));
+            }
+            ServerMsg::WantPictures { ids } => {
+                let found: Vec<(String, Arc<[u8]>)> = {
+                    let mut p = self.pictures.lock();
+                    ids.into_iter().take(MAX_PICTURE_IDS).filter_map(|id| Some((id.clone(), p.get(&id)?))).collect()
+                };
+                for (id, b) in found {
+                    self.send(ClientMsg::PutPicture { id, data: pictures::to_wire(&b) });
+                }
+            }
+            ServerMsg::RoomUpdated { server, by } => {
+                let before = self.state.read().server.as_ref().and_then(|s| s.picture.clone());
+                if let Ok(mut save) = rooms::load(&self.paths, &server.room_id) {
+                    save.picture = server.picture.clone();
+                    save.updated = crate::now_ms();
+                    if let Err(e) = rooms::save(&self.paths, &save) {
+                        tracing::warn!("saving room: {e:#}");
+                    }
+                }
+                let data = json!({"server": server, "by": by});
+                let changed = before != server.picture;
+                self.update(|s| {
+                    if changed && let Some(ch) = s.first_text() {
+                        let who = by.and_then(|id| s.members.get(&id)).map(|m| m.nick.clone()).unwrap_or_else(|| "someone".into());
+                        let what = if server.picture.is_some() { "changed the room picture" } else { "removed the room picture" };
+                        push_capped(s.messages.entry(ch.clone()).or_default(), local_line(&ch, format!("{who} {what}")));
+                    }
+                    s.server = Some(server);
+                });
+                self.refresh_rooms();
+                self.fetch_pictures();
+                self.emit(names::ROOM_UPDATED, data);
             }
             ServerMsg::Notice { level, text } => self.notice(level, text),
             ServerMsg::Error { code, message } => self.notice(NoticeLevel::Error, format!("{message} ({code})")),
@@ -2190,6 +2489,8 @@ impl Inner {
             term,
             invite: save.invite.clone(),
             profiles: save.profiles.clone(),
+            pictures_dir: Some(rooms::pictures_dir(&self.paths, &save.id)),
+            picture: save.picture.clone(),
         })
         .await?;
         let link = handle.link().await;
@@ -2483,7 +2784,12 @@ const SESSION_METHODS: &[MethodDoc] = &[
     doc("input.submit", "{text, channel?}", "Send as if typed (slash commands work)"),
     doc("channel.focus", "{channel}", "Switch the focused text channel"),
     doc("channel.create", "{name, kind?}", "Add a channel to the room (kind: text (default) or voice)"),
-    doc("nick.set", "{nick}", "Change nick"),
+    doc("nickname.set", "{nickname}", "Change your nickname (`nick.set {nick}` still works)"),
+    doc("profile.picture.set", "{path | data}", "Set your profile picture from an image file or base64 `data`; returns its id"),
+    doc("profile.picture.clear", "{}", "Remove your profile picture"),
+    doc("room.picture.set", "{path | data}", "Set the room's picture (anyone in the room may); returns its id"),
+    doc("room.picture.clear", "{}", "Remove the room's picture"),
+    doc("picture.get", "{id, path?}", "A picture file by id: saved to `path`, or returned as base64 `data`"),
     doc("voice.join", "{channel?}", "Join a voice channel"),
     doc("voice.leave", "{}", "Leave voice"),
     doc("voice.mute", "{muted}", "Mute/unmute mic"),
@@ -2582,6 +2888,31 @@ fn frontend_call(s: &Session, method: &str, mut p: Value) -> ApiFuture {
     }
 }
 
+/// `profile.picture.*` and `room.picture.*`: read the image, then set it.
+fn picture_call(s: Session, method: &str, p: Value) -> ApiFuture {
+    let clear = method.ends_with(".clear");
+    let room = method.starts_with("room.");
+    Box::pin(async move {
+        let image = if clear {
+            None
+        } else if let Some(data) = param_str(&p, "data") {
+            Some(data_encoding::BASE64.decode(data.trim().as_bytes()).map_err(|e| format!("`data` isn't base64: {e}"))?)
+        } else if let Some(path) = param_str(&p, "path") {
+            read_image(Some(std::path::Path::new(&path))).await.map_err(|e| format!("{e:#}"))?
+        } else {
+            return Err("give `path` (an image file) or `data` (base64)".into());
+        };
+        let res = if room { s.set_room_picture(image).await } else { s.set_picture(image).await };
+        res.map(|id| json!({"picture": id})).map_err(|e| format!("{e:#}"))
+    })
+}
+
+/// `"a file.png"` → `a file.png`.
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s)
+}
+
 fn ok<T: Serialize>(v: T) -> api::ApiResult {
     serde_json::to_value(v).map_err(|e| e.to_string())
 }
@@ -2657,9 +2988,26 @@ impl ApiHandler for SessionApi {
             "channel.focus" => require_str(&p, "channel").and_then(|c| {
                 if s.focus_channel(&c) { Ok(json!({"focus": s.state().focus})) } else { Err(format!("no text channel #{c}")) }
             }),
-            "nick.set" => require_str(&p, "nick").map(|n| {
-                s.set_nick(&n);
-                json!({"nick": s.state().nick})
+            "nickname.set" | "nick.set" => param_str(&p, "nickname")
+                .or_else(|| param_str(&p, "nick"))
+                .ok_or_else(|| "missing string param `nickname`".to_owned())
+                .map(|n| {
+                    s.set_nick(&n);
+                    json!({"nickname": s.state().nick})
+                }),
+            "profile.picture.set" | "room.picture.set" | "profile.picture.clear" | "room.picture.clear" => {
+                return picture_call(s, method, p);
+            }
+            "picture.get" => require_str(&p, "id").and_then(|id| {
+                let bytes = s.picture(&id).ok_or_else(|| format!("no picture {id} here"))?;
+                let kind = pictures::kind(&bytes);
+                match param_str(&p, "path") {
+                    Some(path) => {
+                        std::fs::write(&path, &bytes).map_err(|e| format!("writing {path}: {e}"))?;
+                        Ok(json!({"id": id, "kind": kind, "path": path, "bytes": bytes.len()}))
+                    }
+                    None => Ok(json!({"id": id, "kind": kind, "data": pictures::to_wire(&bytes)})),
+                }
             }),
             "voice.join" => {
                 s.voice_join(ch);

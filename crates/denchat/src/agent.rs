@@ -453,7 +453,7 @@ pub async fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let str_of = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     let frontend = s["frontend"].as_str().unwrap_or("no window");
     let control = if s["agent_control"] == false { " · agent control off" } else { "" };
-    println!("den pid {} · {frontend} · nick {}{control}", info.pid, str_of(&s["nick"]));
+    println!("den pid {} · {frontend} · nickname {}{control}", info.pid, str_of(&s["nick"]));
     let conn = &s["conn"];
     let state = conn["state"].as_str().unwrap_or("idle");
     match &s["server"] {
@@ -705,7 +705,7 @@ pub async fn sandbox(cmd: SandboxCmd, user_paths: &Paths, nick: Option<String>) 
             }
             // Its own config: never the user's devices, never the user's clipboard.
             let mut cfg: AppConfig = config::load_or_default(&paths.config_file())?;
-            // `den sandbox start a --nick alice`; otherwise the sandbox's name.
+            // `den sandbox start a --nickname alice`; otherwise the sandbox's name.
             cfg.nick = Some(nick.unwrap_or_else(|| name.clone()));
             // A copied config may have these off; a sandbox is for driving.
             cfg.modules.api = true;

@@ -42,7 +42,8 @@ impl Panel for Members {
             kit::section(ui, &format!("With you in {ch}"), &p);
             let me = cx.state.me;
             let others: Vec<&str> = with_me.iter().filter(|m| Some(m.id) != me).map(|m| m.nick.as_str()).collect();
-            let faces: Vec<(String, Option<f32>)> = with_me.iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied())).collect();
+            let faces: Vec<kit::StackFace> =
+                with_me.iter().map(|m| (m.nick.clone(), speaking.get(&m.id).copied(), cx.picture(ui, m.picture.as_deref()))).collect();
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
             let w = kit::paint_stack(ui, pos2(r.left() + 4.0, r.center().y), &faces, (26.0, 4), behind, &p);
             let x = r.left() + 4.0 + w + 10.0;
@@ -74,7 +75,8 @@ fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, level: Option<f32>, beh
     let is_me = cx.state.me == Some(m.id);
     let (rect, resp) = kit::row(ui, 44.0, false, false, &p);
     let painter = ui.painter();
-    Face::new(&m.nick, 32.0, behind).presence(p.ok).talking(level).paint(
+    let pic = cx.picture(ui, m.picture.as_deref());
+    Face::new(&m.nick, 32.0, behind).presence(p.ok).talking(level).picture(pic).paint(
         painter,
         pos2(rect.left() + 20.0, rect.center().y),
         &p,
@@ -112,7 +114,7 @@ fn member_row(ui: &mut Ui, cx: &PanelCx<'_>, m: &Member, level: Option<f32>, beh
     kit::put(ui.painter(), &g, x, rect.center().y + 9.0, color);
     let who = match (m.identity.verified, m.identity.short()) {
         (true, Some(k)) => format!("Signed in with key {k}… (this room's profile for {})", m.nick),
-        _ => "No key: anyone could be using this nick".to_owned(),
+        _ => "No key: anyone could be using this nickname".to_owned(),
     };
     resp.on_hover_text(format!("{who}\nConnection: {}", m.reach.describe()));
 }

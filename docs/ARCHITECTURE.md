@@ -86,10 +86,10 @@ port-forwarded.
 A room is a save that every member holds, not a process:
 
 * **Save** — `<data>/rooms/<id>/room.toml` (format, id, name, motd, term,
-  last host addresses, invite key, join rules, channels, members' profiles
-  and app addresses) plus `member.key` (this member's key for the room,
-  never sent) and `history/<channel>.jsonl`
-  (the host's history files and every member's copy use the same format).
+  and app addresses, the room's picture) plus `member.key` (this member's
+  key for the room, never sent), `history/<channel>.jsonl`
+  (the host's history files and every member's copy use the same format)
+  and `pictures/<id>.<ext>` (see *Pictures* below).
   A member's `Session` writes its copy as messages arrive (`rooms::Copy`);
   when it is connected to its own hosted server, the server writes instead.
 * **Ids and terms** — the room id is stable; the `term` goes up by one on
@@ -140,6 +140,28 @@ Channels work the same way: any member can add one (`create_channel`); the
 host appends it, broadcasts `channels_updated`, and every member (and a
 `serve` node) writes the new list into its save, so whoever hosts next
 serves it.
+
+**Pictures** (`pictures`) work the same way too. Profile pictures and the
+room's picture are small image files (256 px squares, at most 256 KB) named
+by their BLAKE3 hash, so an id always means the same bytes and anyone can
+check a file against it. The room refers to them by id (`Member.picture`,
+`Profile.picture`, `ServerInfo.picture`); the files travel apart from that:
+
+* Setting one sends `put_picture {id, data}` (base64) and then
+  `set_picture {picture}` or `set_room_picture {picture}`. Anyone may change
+  the room's picture; the host broadcasts `room_updated {server, by}`.
+* A member who sees an id it lacks asks with `get_pictures {ids}` and the
+  host answers `picture {id, data}`. A host that lacks a file the room uses
+  asks the members for it (`want_pictures`), and sends it on when it comes.
+  `hello` carries the member's own picture id, so whoever hosts gets it back
+  from its owner.
+* Every member keeps the files its room uses in its copy (`pictures/`), so
+  the next host can serve them; a host deletes files nothing uses when it
+  starts. Your own picture lives in `<data>/picture.<ext>` and goes to every
+  room you join.
+* `hello` and `ServerInfo.features` say `pictures`; neither side sends the
+  picture messages to a peer that doesn't (older peers would drop the
+  connection on an unknown message).
 
 Everyone has the same rights, so there are no roles to sync; join rules
 travel in `welcome` (`access`), and with the invite key and profiles, are
@@ -196,8 +218,8 @@ secret.
 * `invite` (kind `invite`) is signed with the room's invite key, which every
   member saves. A room with an invite key admits only proofs that carry it.
   Rooms made without one (`--open`) admit anyone who can reach them.
-* The room keeps profiles (key → nick, `welcome.profiles`, saved by every
-  member). A nick that belongs to another key gets a ` (2)` suffix, so
+* The room keeps profiles (key → nickname, `welcome.profiles`, saved by every
+  member). A nickname that belongs to another key gets a ` (2)` suffix, so
   nobody can pass as someone else in that room.
 * `allow` lists key prefixes (8+ characters); when set, only those keys get
   in.
@@ -212,7 +234,8 @@ fix.
   bidirectional stream. `ClientMsg` / `ServerMsg` are tagged enums
   (`{"type": "send", …}`). A connection either sends `probe {room?}`
   (discovery: get room info, close) or `hello` (version, nick, codecs,
-  features, room, proof, the app's own link, its `reach`) and receives `welcome` with
+  features, room, proof, the app's own link, its `reach`, its picture) and receives `welcome` with
+
   members, channels, join rules, profiles and the voice setup (a per-member
   token), followed by history. Room sync and handoff messages are described
   above.

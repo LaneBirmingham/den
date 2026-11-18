@@ -21,6 +21,7 @@ pub mod icons;
 pub mod kit;
 pub mod layout;
 pub mod panels;
+pub mod pictures;
 pub mod soft;
 pub mod theme;
 
@@ -85,6 +86,10 @@ pub fn run_mode(session: Session, registry: Registry, mode: Mode) -> anyhow::Res
         persistence_path: Some(session.paths().data.join("gui")),
         // An explicit size wins over the one remembered from last time.
         persist_window: size.is_none(),
+        // Hover and clicks should land on the very next refresh: vsync with a
+        // one-frame queue (eframe's default, spelled out so it stays that way).
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig::LOW_LATENCY),
         ..Default::default()
     };
     eframe::run_native("den", options, Box::new(move |cc| Ok(Box::new(app::DenApp::new(cc, session, registry)))))

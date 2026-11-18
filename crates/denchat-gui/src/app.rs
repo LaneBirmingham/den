@@ -17,6 +17,7 @@ use crate::agent::{self, AgentPlugin, Kind};
 use crate::catalog::{Catalog, Entry};
 use crate::layout::{Layout, PttInput, Screen, ShellStyle, Slot, SlotMode, SlotName, parse_key};
 use crate::panels::{Actions, Missing, ModPanel, Panel, PanelCx, Registry, ShellCmd, ShellView};
+use crate::pictures::{PathPrompt, Pictures};
 use crate::theme::{Palette, Theme};
 
 /// Used when the configured theme is missing (keep in sync with `UiConfig::default`).
@@ -64,6 +65,10 @@ pub struct DenApp {
     auto_shot: Option<(Instant, PathBuf)>,
     /// Set by the screenshot callback when `DEN_SCREENSHOT_EXIT=1`.
     exit_now: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A window, or headless (no file dialogs there: a path prompt instead).
+    kind: Kind,
+    pictures: Pictures,
+    path_prompt: PathPrompt,
 }
 
 /// UI zoom: `DEN_SCALE` (or `--scale`) wins over `[ui] scale`.
@@ -81,13 +86,13 @@ impl DenApp {
         let repaint = ctx.clone();
         session.on_change(move || repaint.request_repaint());
         agent::attach(ctx, session.ui(), kind);
-        // The header holds View → Panels; an older build let it be hidden,
+        // Panels holding View → Panels: older builds let them be hidden,
         // which left no way to bring anything back.
         let hidden: HashSet<String> = storage
             .and_then(|s| eframe::get_value::<Vec<String>>(s, HIDDEN_KEY))
             .unwrap_or_default()
             .into_iter()
-            .filter(|id| id != crate::panels::header::ID)
+            .filter(|id| crate::panels::header::can_hide(id))
             .collect();
         let catalog = Catalog::scan(session.paths(), &session.mods());
         let ui_cfg = session.config().ui;
@@ -120,6 +125,9 @@ impl DenApp {
                 (Instant::now() + Duration::from_millis(delay), PathBuf::from(p))
             }),
             exit_now: Default::default(),
+            kind,
+            pictures: Pictures::default(),
+            path_prompt: PathPrompt::default(),
         };
         app.load_theme(ctx, &ui_cfg.theme);
         app.load_layout(&ui_cfg.layout);
@@ -333,13 +341,17 @@ impl DenApp {
                 self.session.update_config(|c| c.ui.layout = n);
             }
             ShellCmd::TogglePanel(id) => {
-                if !self.hidden.remove(&id) && id != crate::panels::header::ID {
+                if !self.hidden.remove(&id) && crate::panels::header::can_hide(&id) {
                     self.hidden.insert(id);
                 }
             }
             ShellCmd::ReloadAssets => self.reload_all(ctx),
             ShellCmd::OpenSettings => self.set_settings_open(true),
             ShellCmd::CloseSettings => self.set_settings_open(false),
+            ShellCmd::PickPicture(target) => match self.kind {
+                Kind::Window => crate::pictures::pick_with_dialog(&self.session, target),
+                Kind::Headless => self.path_prompt.open = Some(target),
+            },
             ShellCmd::OpenConfigDir => {
                 let paths = self.session.paths();
                 for d in [paths.themes_dir(), paths.layouts_dir(), paths.mods_dir()] {
@@ -497,6 +509,7 @@ impl DenApp {
                 mod_panels: &mod_panels,
                 actions: &mut actions,
                 in_card: false,
+                pictures: &self.pictures,
             };
             r.shell.placed = plan.all.iter().map(|id| (id.clone(), r.title(id))).collect();
             r.screen(ui, screen, &plan, &mut self.windows_open, &mut self.floating);
@@ -505,6 +518,9 @@ impl DenApp {
             }
         }
 
+        if let Some((target, path)) = self.path_prompt.show(&ctx) {
+            target.apply(&self.session, Some(path));
+        }
         for f in actions.session.drain(..) {
             f(&self.session);
         }
@@ -599,6 +615,7 @@ struct Render<'a> {
     actions: &'a mut Actions,
     /// The slot being drawn is a card (panels inside shouldn't draw their own).
     in_card: bool,
+    pictures: &'a Pictures,
 }
 
 impl Render<'_> {
@@ -643,8 +660,19 @@ impl Render<'_> {
             self.instance(id);
         }
         let inst = self.instances.get_mut(id).expect("instance exists");
-        let mut cx =
-            PanelCx { id, session, state, palette, voice, settings, shell: &self.shell, actions: self.actions, in_card: self.in_card };
+        let mut cx = PanelCx {
+            id,
+            session,
+            state,
+            palette,
+            voice,
+            settings,
+            shell: &self.shell,
+            actions: self.actions,
+            in_card: self.in_card,
+            pictures: self.pictures,
+        };
+
         ui.push_id(("panel", id), |ui| {
             // A node in the accessibility tree that groups the panel's widgets,
             // so `den ui tree`/`click` can tell panels apart.

@@ -100,6 +100,8 @@ impl ServerNode {
             term,
             invite: save.invite.clone(),
             profiles: save.profiles.clone(),
+            pictures_dir: Some(rooms::pictures_dir(&paths, &save.id)),
+            picture: save.picture.clone(),
         })
         .await?;
         let addr = server.addrs().await;
@@ -187,7 +189,18 @@ impl ServerNode {
                         }
                         Event::new(names::CHANNELS_UPDATED, json!({"channels": channels}))
                     }
+                    ServerEvent::RoomUpdated { server, by } => {
+                        if let Ok(mut s) = rooms::load(&save_paths, &room_id) {
+                            s.picture = server.picture.clone();
+                            s.updated = crate::now_ms();
+                            if let Err(e) = rooms::save(&save_paths, &s) {
+                                tracing::warn!("saving room: {e:#}");
+                            }
+                        }
+                        Event::new(names::ROOM_UPDATED, json!({"server": server, "by": by}))
+                    }
                 };
+
                 let _ = events.send(e);
             }
         });

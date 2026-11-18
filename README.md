@@ -36,7 +36,7 @@ never open ports on your router, set `port_mapping = false` under `[net]` in
 
 **Identity is per room.** There are no global profiles. The first time you
 join a room, your app makes a key for that room and keeps it; the room
-remembers the public half next to your nick. Signing in is signing a
+remembers the public half next to your nickname. Signing in is signing a
 challenge with that key, so nobody else can show up as you in that room, and
 nothing links your profiles across rooms.
 
@@ -97,9 +97,10 @@ copies fill each other's gaps. That means:
   need no relay to host), and when the host has vanished, *Host this room*
   says if someone else is better placed. The lobby shows your own network
   (*behind a router*, *strict network*, …).
-* Everyone in a room has the same rights: anyone can host it. The invite
-  key, members' profiles (key → nick) and join rules (`allow`) travel with
-  the room. If a host refuses you, there's no *Host this room*: the host is
+* Everyone in a room has the same rights: anyone can host it, and anyone can
+  change the room's picture (room menu → *Change room picture…*). The invite
+  key, members' profiles (key → nickname and picture), the room's picture
+  and join rules (`allow`) travel with the room. If a host refuses you, there's no *Host this room*: the host is
   up, and would refuse you again.
 
 ### Persistent server
@@ -160,7 +161,10 @@ one folder — handy for running several instances on one machine.
 change how the app shows itself for that run.
 
 In the chat box, `/invite` prints the room's invite link and `/whoami` your
-key for the room.
+key for the room. Your profile picture is in *Settings → Profile* (or click
+your picture in the lobby); `/picture <file>` and `/roompicture <file>` set
+yours and the room's from the chat box.
+
 
 ## Customising
 

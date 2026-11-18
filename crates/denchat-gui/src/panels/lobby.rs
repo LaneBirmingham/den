@@ -2,12 +2,17 @@ use denchat_core::net::short_addr;
 use denchat_core::session::{ConnState, HostOptions};
 use egui::{RichText, TextEdit, Ui};
 
-use super::{Panel, PanelCx};
+use super::{Panel, PanelCx, ShellCmd};
+use crate::pictures::PictureFor;
+
 use crate::icons;
 use crate::kit::{self, Face, W};
 
 /// The screen before you're in a room: reopen a saved room, join one by
 /// invite link, or host a new one.
+/// This panel's id.
+pub const ID: &str = "core.lobby";
+
 #[derive(Default)]
 pub struct Lobby {
     init: bool,
@@ -93,13 +98,25 @@ impl Lobby {
         let raised = !cx.in_card;
         card(ui, &p, raised, |ui| {
             ui.horizontal(|ui| {
-                Face::new(&self.nick, 36.0, p.panel).presence(if cx.state.net.is_some() { p.ok } else { p.muted }).show(ui, &p);
+                let pic = cx.my_picture(ui);
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+                let presence = if cx.state.net.is_some() { p.ok } else { p.muted };
+                Face::new(&self.nick, 36.0, p.panel).presence(presence).picture(pic).paint(ui.painter(), r.center(), &p, 0.0);
+                super::settings::picture_hover(ui, &resp, r, 18.0);
+                kit::name(&resp, egui::accesskit::Role::Button, "Your picture");
+                if resp.on_hover_text("Change your picture").clicked() {
+                    cx.actions.shell(ShellCmd::PickPicture(PictureFor::Me));
+                }
                 ui.add_space(4.0);
-                let label = ui.label(RichText::new("Nick").font(kit::font(14.0, W::Medium)));
+                let label = ui.label(RichText::new("Nickname").font(kit::font(14.0, W::Medium)));
                 let r = ui.add(TextEdit::singleline(&mut self.nick).desired_width(200.0)).labelled_by(label.id);
                 if r.lost_focus() && self.nick.trim() != cx.state.nick {
                     let n = self.nick.clone();
                     cx.actions.session(move |s| s.set_nick(&n));
+                }
+                let label = if cx.state.picture.is_some() { "Change picture" } else { "Add a picture" };
+                if kit::icon_button(ui, icons::IMAGE, label, kit::Tone::Plain, 28.0, &p).clicked() {
+                    cx.actions.shell(ShellCmd::PickPicture(PictureFor::Me));
                 }
             });
             match &cx.state.net {
@@ -161,6 +178,9 @@ impl Lobby {
                             let a = room.addr.clone();
                             cx.actions.session(move |s| s.join(a));
                         }
+                        let (tile, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                        let pic = cx.picture(ui, room.server.picture.as_deref());
+                        super::header::room_tile(ui.painter(), tile, &room.server.name, pic, &p);
                         ui.label(RichText::new(&room.server.name).strong());
                         let saved = cx.state.rooms.iter().any(|r| r.id == room.server.room_id);
                         ui.label(cx.small(format!(
@@ -215,6 +235,8 @@ impl Lobby {
                     let id = room.id.clone();
                     cx.actions.session(move |s| s.open_room(&id));
                 }
+                let (tile, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                super::header::room_tile(ui.painter(), tile, &room.name, cx.picture(ui, room.picture.as_deref()), &p);
                 ui.label(RichText::new(&room.name).strong());
                 let live = cx.state.discovery.rooms.iter().find(|d| d.server.room_id == room.id);
                 let line = match (live, room.addrs.first()) {

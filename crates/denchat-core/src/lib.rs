@@ -17,6 +17,7 @@
 //! * [`mods`] — manifest-declared extensions: slash commands, event hooks,
 //!   panels, startup daemons, themes and layouts.
 //! * [`ui`] — the declarative widget store mod panels write into.
+//! * [`pictures`] — profile and room pictures: ids, files, resizing.
 //! * [`loudness`] — voice levels as meter positions and speaking intensity.
 //! * [`net`] — the peer-to-peer transport (iroh): one endpoint per process,
 //!   links, per-room key proofs, framing.
@@ -29,6 +30,7 @@ pub mod loudness;
 pub mod mods;
 pub mod net;
 pub mod paths;
+pub mod pictures;
 pub mod relay;
 pub mod rooms;
 pub mod server;
