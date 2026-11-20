@@ -284,7 +284,7 @@ fn card(ui: &mut Ui, p: &crate::theme::Palette, raised: bool, add: impl FnOnce(&
     if raised {
         f = f.shadow(p.shadow_small());
     }
-    f.show(ui, |ui| {
+    kit::plate(ui, p, f, kit::Plate::Raised, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 8.0;
         add(ui)

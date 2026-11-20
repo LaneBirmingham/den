@@ -18,6 +18,56 @@ pub struct Theme {
     pub colors: Colors,
     pub shape: Shape,
     pub text: Text,
+    /// Skeuomorphic rendering. Absent (every theme but `studio`): flat.
+    pub material: Option<Material>,
+}
+
+/// `[material]`: light and surface for skeuomorphic themes. Cards get a
+/// bevel and a drop shadow, wells (the chat, text fields, the selected row)
+/// sink in, lit things glow like LEDs, and the canvas gets a texture. Every
+/// key is optional; an empty `[material]` table turns it on with defaults.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Material {
+    /// Texture on the canvas behind the cards: `brushed` metal, fine `grain`, or `none`.
+    pub texture: TextureKind,
+    /// How strongly the texture shows (0..1).
+    pub texture_strength: f32,
+    /// Light from above: a highlight on top edges and shade on bottom edges (0..1).
+    pub bevel: f32,
+    /// Depth of sunken things: the chat screen, text fields, the selected row (0..1).
+    pub inset: f32,
+    /// Glow around lit things: badges, the selected channel, the send button (0..1).
+    pub glow: f32,
+    /// Section labels engraved into the panel: uppercase, tracked, with a lit edge.
+    pub engrave: bool,
+    /// Screw heads in the corners of metal plates (your voice card).
+    pub screws: bool,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Material { texture: TextureKind::Brushed, texture_strength: 0.6, bevel: 0.8, inset: 0.8, glow: 0.6, engrave: true, screws: true }
+    }
+}
+
+impl Material {
+    /// Every strength in 0..1.
+    fn clamped(mut self) -> Material {
+        for v in [&mut self.texture_strength, &mut self.bevel, &mut self.inset, &mut self.glow] {
+            *v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureKind {
+    None,
+    #[default]
+    Brushed,
+    Grain,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -38,6 +88,8 @@ pub struct Colors {
     pub speaking: String,
     pub link: String,
     pub mention: String,
+    /// Behind the cards. Optional: derived from `panel` when absent.
+    pub canvas: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -70,6 +122,7 @@ impl Default for Theme {
             colors: Colors::default(),
             shape: Shape::default(),
             text: Text::default(),
+            material: None,
         }
     }
 }
@@ -94,6 +147,7 @@ impl Default for Colors {
             speaking: s("#a6e3a1"),
             link: s("#89b4fa"),
             mention: s("#3a3050"),
+            canvas: None,
         }
     }
 }
@@ -135,6 +189,8 @@ pub struct Palette {
     pub size: f32,
     pub heading_size: f32,
     pub small_size: f32,
+    /// Skeuomorphic rendering, if the theme turns it on (see [`Material`]).
+    pub material: Option<Material>,
 
     // ----- derived ----------------------------------------------------------
     /// Behind the cards (darker than `panel`).
@@ -191,6 +247,19 @@ pub fn parse_color(s: &str) -> Option<Color32> {
 }
 
 impl Palette {
+    /// The fill of a sunken well in a material theme (a text field, the
+    /// current row): a shade below `panel`, gentler on a light theme so its
+    /// dark text stays readable.
+    pub fn well(&self) -> Color32 {
+        mix(self.panel, Color32::BLACK, if self.dark { 0.35 } else { 0.07 })
+    }
+
+    /// The window of an LCD readout or a lever toggle's slot: near-black on a
+    /// dark theme; a grey a step below the well on a light one (a reflective LCD).
+    pub fn screen(&self) -> Color32 {
+        if self.dark { Color32::from_rgb(10, 10, 11) } else { mix(self.panel, Color32::BLACK, 0.14) }
+    }
+
     /// Placeholder values, overwritten by [`Palette::derived`].
     fn derive_defaults() -> Palette {
         let z = Color32::TRANSPARENT;
@@ -216,6 +285,7 @@ impl Palette {
             size: 14.5,
             heading_size: 17.0,
             small_size: 12.0,
+            material: None,
             canvas: z,
             sunk: z,
             line: z,
@@ -256,6 +326,10 @@ impl Palette {
             spread: 0,
             color: if d { Color32::from_black_alpha(80) } else { Color32::from_rgba_unmultiplied(60, 40, 30, 22) },
         };
+        if let Some(m) = self.material {
+            // Hardware sits on the desk: a tighter, darker drop shadow.
+            self.shadow = Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha((70.0 + 90.0 * m.bevel) as u8) };
+        }
         let r = self.rounding as f32;
         self.card_radius = (r * 1.5 + 2.0).clamp(4.0, 18.0) as u8;
         self.row_radius = (r + 2.0).clamp(3.0, 12.0) as u8;
@@ -298,7 +372,7 @@ impl Theme {
     fn palette_checked(&self) -> anyhow::Result<Palette> {
         let c = &self.colors;
         let get = |name: &str, v: &str| parse_color(v).with_context(|| format!("colors.{name} = {v:?} is not #RRGGBB"));
-        Ok(Palette {
+        let p = Palette {
             dark: self.dark,
             bg: get("bg", &c.bg)?,
             panel: get("panel", &c.panel)?,
@@ -320,9 +394,14 @@ impl Theme {
             size: self.text.size,
             heading_size: self.text.heading_size,
             small_size: self.text.small_size,
+            material: self.material.map(Material::clamped),
             ..Palette::derive_defaults()
         }
-        .derived())
+        .derived();
+        Ok(match &c.canvas {
+            Some(v) => Palette { canvas: get("canvas", v)?, ..p },
+            None => p,
+        })
     }
 
     pub fn palette(&self) -> Palette {
@@ -351,6 +430,12 @@ impl Theme {
         v.hyperlink_color = p.link;
         v.warn_fg_color = p.warn;
         v.error_fg_color = p.danger;
+        if p.material.is_some() {
+            // Text fields sit in wells.
+            let well = p.well();
+            v.extreme_bg_color = well;
+            v.text_edit_bg_color = Some(well);
+        }
         v.selection.bg_fill = p.accent.gamma_multiply(0.45);
         v.selection.stroke = Stroke::new(1.0, p.accent);
         let w = &mut v.widgets;
@@ -483,5 +568,25 @@ mod tests {
     #[test]
     fn bad_color_is_an_error() {
         assert!(Theme::parse("[colors]\naccent = \"blue\"").is_err());
+    }
+
+    #[test]
+    fn material_is_optional_and_clamped() {
+        assert!(Theme::parse("name = \"flat\"").unwrap().palette().material.is_none());
+        // An empty table turns it on with the defaults.
+        assert_eq!(Theme::parse("[material]").unwrap().palette().material, Some(Material::default()));
+        let m = Theme::parse("[material]\nbevel = 3.0\nglow = -1.0\ntexture = \"grain\"").unwrap().palette().material.unwrap();
+        assert_eq!((m.bevel, m.glow, m.texture), (1.0, 0.0, TextureKind::Grain));
+        assert_eq!(m.inset, Material::default().inset);
+        assert!(Theme::parse("[material]\ntexture = \"velvet\"").is_err());
+    }
+
+    #[test]
+    fn canvas_is_derived_unless_set() {
+        let derived = Theme::default().palette().canvas;
+        assert_eq!(derived, mix(parse_color("#181825").unwrap(), Color32::BLACK, 0.3));
+        let set = Theme::parse("[colors]\ncanvas = \"#123456\"").unwrap();
+        assert_eq!(set.palette().canvas, Color32::from_rgb(0x12, 0x34, 0x56));
+        assert!(Theme::parse("[colors]\ncanvas = \"nope\"").is_err());
     }
 }

@@ -12,8 +12,8 @@ Pick themes and layouts from **View** in the app, or set them in
 
 ```toml
 [ui]
-theme = "catppuccin"   # built-in: catppuccin, catppuccin-latte, tokyo-night, rose-pine, rose-pine-dawn, gruvbox
-layout = "default"     # built-in: default (three columns), messenger (chat bubbles)
+theme = "catppuccin"   # built-in: catppuccin, catppuccin-latte, tokyo-night, rose-pine, rose-pine-dawn, gruvbox, studio
+layout = "default"     # built-in: default (three columns), messenger (chat bubbles), console (a rack, for studio)
 hot_reload = true
 scale = 1.0            # UI zoom
 ```
@@ -43,6 +43,7 @@ danger = "#f7768e"
 speaking = "#9ece6a"
 link = "#7dcfff"
 mention = "#2a3150"       # background of messages that mention you
+# canvas = "#16161e"      # behind the cards (optional: derived from panel)
 
 [shape]
 rounding = 6
@@ -62,6 +63,39 @@ Every key is optional; missing ones fall back to the defaults above, and any
 colour can also be referenced by name from mod widgets (`"color": "accent"`).
 Set `monospace = true` under `[text]` to use the monospace font everywhere. A
 broken file keeps the previous theme on screen and shows the error.
+
+### Material (skeuomorphic themes)
+
+Themes are flat unless they have a `[material]` table. With one, Den draws
+things the way light falls on real parts: cards become bevelled plates on a
+textured canvas, the chat sits in a recessed screen, the current channel
+and text fields are pressed in, counts show on little LCDs, lit things glow,
+your voice card is a brushed-metal strip with lever toggles and an LED
+meter for your mic, and section labels are engraved. The built-in `studio`
+theme (with the `console` layout) shows it off.
+
+```toml
+[material]                # defaults shown; `studio` turns most of them up
+texture = "brushed"       # canvas texture: brushed | grain | none
+texture_strength = 0.6    # 0..1; "none" or 0 also leaves the voice card unbrushed
+bevel = 0.8               # lit top edges, shaded bottoms (0..1)
+inset = 0.8               # depth of wells: chat screen, fields, current channel (0..1)
+glow = 0.6                # backlights and LEDs (0..1)
+engrave = true            # engraved uppercase section labels
+screws = true             # screws on your voice card
+```
+
+Every key is optional: an empty `[material]` table turns it on with these
+defaults (`studio` uses 0.75 / 0.9 / 0.9 / 0.65). It uses the same colour
+tokens: `canvas` is the chassis, `panel` the plates, `bg` the chat screen,
+`surface` the caps and keys, `accent` the backlight and `ok` / `warn` /
+`danger` the LEDs. It works on light themes too (`dark = false`): wells are
+shallower so dark text stays readable, and counts show on a reflective
+grey LCD instead of a backlit black one.
+
+Mod panels sit on the same plates and use the same colours, but their
+widgets (headings, buttons, …) are the stock ones: the engraved labels,
+LCDs, levers and keys are drawn by Den's built-in panels.
 
 ## Layouts
 

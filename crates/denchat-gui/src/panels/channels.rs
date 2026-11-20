@@ -221,12 +221,18 @@ fn channel_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel) {
     let (rect, resp) = kit::row(ui, 34.0, selected, !cx.in_card, &p);
     let painter = ui.painter();
     let lit = selected || unread > 0;
-    kit::icon(painter, pos2(rect.left() + 18.0, rect.center().y), icons::HASH, 17.0, if selected { p.text } else { p.muted });
+    let hash = pos2(rect.left() + 18.0, rect.center().y);
+    if selected && p.material.is_some() {
+        // The current channel's lamp is on.
+        kit::lit_icon(painter, hash, icons::HASH, 17.0, p.accent, &p);
+    } else {
+        kit::icon(painter, hash, icons::HASH, 17.0, if selected { p.text } else { p.muted });
+    }
     let mut right = rect.right() - 8.0;
     if !selected && mentions > 0 {
-        right -= kit::badge(painter, ui, pos2(right, rect.center().y), &mentions.min(99).to_string(), p.danger, p.bg) + 6.0;
+        right -= kit::badge(painter, ui, pos2(right, rect.center().y), &mentions.min(99).to_string(), p.danger, p.bg, &p) + 6.0;
     } else if !selected && unread > 0 {
-        right -= kit::badge(painter, ui, pos2(right, rect.center().y), &unread.min(99).to_string(), p.surface, p.text) + 6.0;
+        right -= kit::badge(painter, ui, pos2(right, rect.center().y), &unread.min(99).to_string(), p.surface, p.text, &p) + 6.0;
     }
     let weight = if unread > 0 && !selected { W::Semibold } else { W::Medium };
     let g = kit::line(ui, &c.name, kit::font(14.5, weight), if lit { p.text } else { p.muted }, right - rect.left() - 40.0);
@@ -271,9 +277,9 @@ fn conversation_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel) {
         kit::put(painter, &g, x, top, p.text);
     }
     if !selected && mentions > 0 {
-        right -= kit::badge(painter, ui, pos2(right, bottom), "@", p.danger, p.bg) + 6.0;
+        right -= kit::badge(painter, ui, pos2(right, bottom), "@", p.danger, p.bg, &p) + 6.0;
     } else if !selected && unread > 0 {
-        right -= kit::badge(painter, ui, pos2(right, bottom), &unread.min(99).to_string(), p.accent, p.accent_text) + 6.0;
+        right -= kit::badge(painter, ui, pos2(right, bottom), &unread.min(99).to_string(), p.accent, p.accent_text, &p) + 6.0;
     }
     let preview = match last {
         Some(m) if m.kind == MessageKind::User => {
@@ -312,8 +318,7 @@ fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<
     if can_join {
         let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap("Join".into(), kit::font(12.5, W::Semibold), p.text));
         let pill = egui::Rect::from_min_size(pos2(right - g.size().x - 20.0, rect.center().y - 12.0), vec2(g.size().x + 20.0, 24.0));
-        let hot = resp.hovered();
-        painter.rect_filled(pill, CornerRadius::same(12), if hot { p.surface_hover } else { p.surface });
+        kit::pill_surface(painter, pill, if resp.hovered() { 1.0 } else { 0.0 }, &p);
         painter.galley(pill.center() - g.size() / 2.0, g, p.text);
         right = pill.left() - 8.0;
     }
@@ -342,7 +347,8 @@ fn voice_row(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<
 fn voice_card(ui: &mut Ui, cx: &mut PanelCx<'_>, c: &Channel, speaking: &HashMap<u32, f32>) {
     let p = *cx.palette;
     let fill = if cx.in_card { p.sunk } else { p.panel };
-    kit::card(&p, fill, !cx.in_card).stroke(Stroke::new(1.0, p.ok_soft)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    let frame = kit::card(&p, fill, !cx.in_card).stroke(Stroke::new(1.0, p.ok_soft)).inner_margin(egui::Margin::symmetric(10, 8));
+    kit::plate(ui, &p, frame, kit::Plate::Well, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());

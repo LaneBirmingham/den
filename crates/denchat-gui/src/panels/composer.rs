@@ -79,51 +79,67 @@ impl Panel for Composer {
         let tab = focused && !suggestions.is_empty() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
         let radius = if pill { CornerRadius::same(22) } else { CornerRadius::same(p.card_radius.min(14)) };
         let mut send_clicked = false;
-        let field = Frame::new()
-            .fill(p.surface)
+        let frame = Frame::new()
+            .fill(if p.material.is_some() { p.well() } else { p.surface })
             .stroke(Stroke::new(1.0, if focused { crate::theme::alpha(p.accent, 0.45) } else { p.line }))
             .corner_radius(radius)
-            .inner_margin(Margin { left: if pill { 16 } else { 14 }, right: 6, top: 6, bottom: 6 })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let btn = if send_button { 32.0 } else { 0.0 };
-                    let w = ui.available_width() - if send_button { btn + ui.spacing().item_spacing.x } else { 0.0 };
-                    let resp = ui
-                        .add_enabled_ui(enabled, |ui| {
-                            ui.add(
-                                TextEdit::multiline(&mut self.text)
-                                    .id(id)
-                                    .frame(egui::Frame::NONE)
-                                    .font(kit::font(p.size, W::Regular))
-                                    .hint_text(RichText::new(placeholder).color(p.muted))
-                                    .desired_rows(1)
-                                    .desired_width(w)
-                                    .min_size(vec2(w, 32.0))
-                                    .align(egui::Align2::LEFT_CENTER)
-                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
-                                    .lock_focus(false),
-                            )
-                        })
-                        .inner;
-                    if send_button {
-                        let ready = enabled && !self.text.trim().is_empty();
-                        let (r, b) = ui.allocate_exact_size(vec2(btn, btn), if ready { Sense::click() } else { Sense::hover() });
-                        let hot = kit::hover_fade(ui, b.id, b.hovered() && ready);
-                        let (bg, fg) = if ready {
-                            (crate::theme::mix(p.accent, p.text, 0.12 * hot), p.accent_text)
-                        } else {
-                            (crate::theme::alpha(p.text, 0.06), p.muted)
-                        };
-                        let c = r.center();
+            .inner_margin(Margin { left: if pill { 16 } else { 14 }, right: 6, top: 6, bottom: 6 });
+        // Material themes set the field into the surface, like a slot.
+        let field = kit::plate(ui, &p, frame, kit::Plate::Well, |ui| {
+            ui.horizontal(|ui| {
+                let btn = if send_button { 32.0 } else { 0.0 };
+                let w = ui.available_width() - if send_button { btn + ui.spacing().item_spacing.x } else { 0.0 };
+                let resp = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut self.text)
+                                .id(id)
+                                .frame(egui::Frame::NONE)
+                                .font(kit::font(p.size, W::Regular))
+                                .hint_text(RichText::new(placeholder).color(p.muted))
+                                .desired_rows(1)
+                                .desired_width(w)
+                                .min_size(vec2(w, 32.0))
+                                .align(egui::Align2::LEFT_CENTER)
+                                .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
+                                .lock_focus(false),
+                        )
+                    })
+                    .inner;
+                if send_button {
+                    let ready = enabled && !self.text.trim().is_empty();
+                    let (r, b) = ui.allocate_exact_size(vec2(btn, btn), if ready { Sense::click() } else { Sense::hover() });
+                    let hot = kit::hover_fade(ui, b.id, b.hovered() && ready);
+                    let (bg, fg) = if ready {
+                        (crate::theme::mix(p.accent, p.text, 0.12 * hot), p.accent_text)
+                    } else {
+                        (crate::theme::alpha(p.text, 0.06), p.muted)
+                    };
+                    let c = r.center();
+                    if let Some(m) = p.material {
+                        // A square key; backlit in the accent once there's something to send.
+                        let painter = ui.painter();
+                        let radius = CornerRadius::same(p.row_radius.min(8));
+                        if ready {
+                            painter.add(crate::material::glow(r, radius, p.accent, m.glow * (0.7 + 0.3 * hot)));
+                        }
+                        let fill = if ready { bg } else { p.surface };
+                        painter.extend(crate::material::button(painter, r.shrink(1.0), radius, fill, &p, &m));
+                    } else {
                         ui.painter().circle_filled(c, btn / 2.0, bg);
-                        kit::icon(ui.painter(), c, icons::ARROW_UP, 17.0, fg);
-                        b.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, ready, "Send"));
-                        send_clicked = b.on_hover_text("Send (Enter)").clicked();
                     }
-                    resp
-                })
-                .inner
-            });
+                    kit::icon(ui.painter(), c, icons::ARROW_UP, 17.0, fg);
+                    b.widget_info(|| egui::WidgetInfo::labeled(egui::accesskit::Role::Button, ready, "Send"));
+                    send_clicked = b.on_hover_text("Send (Enter)").clicked();
+                }
+                resp
+            })
+            .inner
+        });
+        if focused && p.material.is_some() {
+            let ring = Stroke::new(1.0, crate::theme::alpha(p.accent, 0.45));
+            ui.painter().rect_stroke(field.response.rect, radius, ring, egui::StrokeKind::Outside);
+        }
         let resp = field.inner;
         if self.focus_next || (enabled && !ui.ctx().memory(|m| m.focused().is_some())) {
             resp.request_focus();

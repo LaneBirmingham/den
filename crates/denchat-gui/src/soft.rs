@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use egui::epaint::textures::TextureFilter;
-use egui::epaint::textures::TexturesDelta;
+use egui::epaint::textures::{TextureWrapMode, TexturesDelta};
 use egui::epaint::{ClippedPrimitive, ImageData, Primitive, TextureId, Vertex};
 use egui::{Color32, ColorImage, Rect};
 
@@ -19,9 +19,11 @@ struct Texture {
     size: [usize; 2],
     pixels: Vec<Color32>,
     linear: bool,
+    /// Tiles (`TextureWrapMode::Repeat`, for material textures) rather than clamping at the edges.
+    repeat: bool,
 }
 
-/// A CPU copy of every texture egui has uploaded (in practice: the font atlas).
+/// A CPU copy of every texture egui has uploaded (the font atlas, pictures, material textures).
 #[derive(Default)]
 pub struct Textures {
     map: HashMap<TextureId, Texture>,
@@ -34,9 +36,10 @@ impl Textures {
             for d in deltas {
                 let ImageData::Color(img) = &d.image;
                 let linear = d.options.magnification == TextureFilter::Linear;
+                let repeat = d.options.wrap_mode == TextureWrapMode::Repeat;
                 match d.pos {
                     None => {
-                        self.map.insert(*id, Texture { size: img.size, pixels: img.pixels.clone(), linear });
+                        self.map.insert(*id, Texture { size: img.size, pixels: img.pixels.clone(), linear, repeat });
                     }
                     Some([x0, y0]) => {
                         let Some(t) = self.map.get_mut(id) else { continue };
@@ -73,16 +76,24 @@ impl Texture {
         if w == 0 || h == 0 {
             return [1.0; 4];
         }
-        let at = |x: usize, y: usize| px(self.pixels[y.min(h - 1) * w + x.min(w - 1)]);
+        let wrap = |t: f32| if t.is_finite() { t.rem_euclid(1.0) } else { 0.0 };
+        let (u, v) = if self.repeat { (wrap(u), wrap(v)) } else { (u, v) };
+        let (wi, hi) = (w as isize, h as isize);
+        // Texel (x, y): wrapped round when repeating, else held at the edge.
+        let at = |x: isize, y: isize| {
+            let (x, y) = if self.repeat { (x.rem_euclid(wi), y.rem_euclid(hi)) } else { (x.clamp(0, wi - 1), y.clamp(0, hi - 1)) };
+            px(self.pixels[y as usize * w + x as usize])
+        };
         if !self.linear {
-            let x = ((u * w as f32) as isize).clamp(0, w as isize - 1) as usize;
-            let y = ((v * h as f32) as isize).clamp(0, h as isize - 1) as usize;
-            return at(x, y);
+            return at((u * w as f32) as isize, (v * h as f32) as isize);
         }
-        let x = (u * w as f32 - 0.5).max(0.0);
-        let y = (v * h as f32 - 0.5).max(0.0);
-        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
-        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        // Texel centres sit at +0.5. Repeating, the first half texel blends
+        // with the far edge (as on the GPU); clamped, it holds the edge.
+        let (x, y) = (u * w as f32 - 0.5, v * h as f32 - 0.5);
+        let (x, y) = if self.repeat { (x, y) } else { (x.max(0.0).min(w as f32), y.max(0.0).min(h as f32)) };
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as isize, y0 as isize);
         let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
         let mut out = [0.0; 4];
         for i in 0..4 {
@@ -286,6 +297,23 @@ mod tests {
         assert!(inside.iter().all(|c| *c == inside[0]), "{inside:?}");
         assert_eq!(inside[0].b(), 100);
         assert_eq!(img.pixels[9 * 10 + 9], Color32::BLACK);
+    }
+
+    #[test]
+    fn repeating_textures_tile() {
+        let strip = |repeat| Texture { size: [2, 1], pixels: vec![Color32::BLACK, Color32::WHITE], linear: false, repeat };
+        // Past the right edge: a repeating texture starts over, a clamped one holds its edge.
+        assert_eq!(strip(true).sample(1.25, 0.5), px(Color32::BLACK));
+        assert_eq!(strip(true).sample(-0.25, 0.5), px(Color32::WHITE));
+        assert_eq!(strip(false).sample(1.25, 0.5), px(Color32::WHITE));
+        assert_eq!(strip(false).sample(-0.25, 0.5), px(Color32::BLACK));
+        // Filtered: at the left edge a repeating texture is half its far
+        // edge (as on the GPU); a clamped one is all edge.
+        let smooth = |repeat| Texture { linear: true, ..strip(repeat) };
+        let mid: Vec<f32> = (0..4).map(|i| (px(Color32::BLACK)[i] + px(Color32::WHITE)[i]) / 2.0).collect();
+        assert_eq!(smooth(true).sample(0.0, 0.5).to_vec(), mid);
+        assert_eq!(smooth(false).sample(0.0, 0.5), px(Color32::BLACK));
+        assert_eq!(smooth(true).sample(0.25, 0.5), px(Color32::BLACK), "a texel centre is that texel");
     }
 
     #[test]

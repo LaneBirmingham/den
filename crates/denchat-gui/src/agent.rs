@@ -187,7 +187,8 @@ impl Tree {
                     let hint = readable(label.as_deref().or_else(|| n.placeholder()).unwrap_or_default());
                     (hint, Some(n.value().unwrap_or_default().to_owned()))
                 } else {
-                    (text, None)
+                    // Sliders and meters: their number.
+                    (text, n.numeric_value().map(number))
                 };
                 let clipped = egui_id(id).and_then(|i| ctx.read_response(i)).map(|resp| resp.interact_rect);
                 let hidden =
@@ -1217,9 +1218,25 @@ fn readable(s: &str) -> String {
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A slider's or meter's value, as short as it reads: `0.42`, `100`.
+fn number(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.into() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbers_read_short() {
+        assert_eq!(number(0.4237), "0.42");
+        assert_eq!(number(100.0), "100");
+        assert_eq!(number(10.0), "10");
+        assert_eq!(number(0.0), "0");
+        assert_eq!(number(-0.001), "0");
+    }
 
     fn node(r: u32, role: &str, text: &str, panel: &str, clickable: bool) -> Node {
         Node {

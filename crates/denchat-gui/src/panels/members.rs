@@ -29,7 +29,15 @@ impl Panel for Members {
         kit::name(&resp, Role::Heading, format!("People ({})", cx.state.members.len()));
         let g = kit::line(ui, "People", kit::font(15.0, W::Semibold), p.text, rect.width() - 40.0);
         kit::put(ui.painter(), &g, rect.left() + 4.0, rect.center().y, p.text);
-        kit::badge(ui.painter(), ui, pos2(rect.right() - 4.0, rect.center().y), &cx.state.members.len().to_string(), p.surface, p.muted);
+        kit::badge(
+            ui.painter(),
+            ui,
+            pos2(rect.right() - 4.0, rect.center().y),
+            &cx.state.members.len().to_string(),
+            p.surface,
+            p.muted,
+            &p,
+        );
 
         let mine = cx.state.voice.channel.clone();
         let mut members: Vec<&Member> = cx.state.members.values().collect();

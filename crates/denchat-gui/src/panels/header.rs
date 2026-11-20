@@ -76,6 +76,8 @@ fn pill(ui: &mut Ui, cx: &mut PanelCx<'_>) {
     let hover = kit::hover_fade(ui, resp.id, resp.hovered());
     if cx.in_card {
         painter.rect_filled(rect, radius, crate::theme::alpha(p.text, 0.04 * hover));
+    } else if let Some(m) = p.material {
+        painter.extend(crate::material::raised(painter, rect, radius, crate::theme::mix(p.panel, p.surface, 0.35 * hover), &p, &m));
     } else {
         painter.add(p.shadow_small().as_shape(rect, radius));
         painter.rect_filled(rect, radius, crate::theme::mix(p.panel, p.surface, 0.35 * hover));
@@ -125,7 +127,17 @@ pub fn room_tile(painter: &egui::Painter, tile: egui::Rect, name: &str, picture:
     match picture {
         Some(tex) => crate::pictures::paint_rounded(painter, tile, radius, tex),
         None => {
-            painter.rect_filled(tile, CornerRadius::same(radius as u8), p.accent);
+            let r = CornerRadius::same(radius as u8);
+            match p.material {
+                // A backlit key.
+                Some(m) => {
+                    painter.add(crate::material::glow(tile, r, p.accent, m.glow));
+                    painter.extend(crate::material::button(painter, tile, r, p.accent, p, &m));
+                }
+                None => {
+                    painter.rect_filled(tile, r, p.accent);
+                }
+            }
             let size = (tile.height() * 0.45).max(9.0);
             painter.text(tile.center(), Align2::CENTER_CENTER, kit::initial(name), kit::font(size, W::Semibold), p.accent_text);
         }

@@ -29,7 +29,9 @@ impl Panel for Voice {
         let fill = if cx.in_card { p.sunk } else { p.panel };
         let levels = super::talk_levels(ui, cx);
         let mut gear = None;
-        kit::card(&p, fill, !cx.in_card).show(ui, |ui| {
+        let metal = p.material.is_some();
+        let meter = metal && supported && v.channel.is_some();
+        kit::plate(ui, &p, kit::card(&p, fill, !cx.in_card), kit::Plate::Metal, |ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
             let y = rect.center().y;
             let time = ui.input(|i| i.time);
@@ -52,18 +54,24 @@ impl Panel for Voice {
                     right = r.left() - 6.0;
                 }
                 let seg = Rect::from_min_size(pos2(right - 64.0, y - 17.0), vec2(64.0, 34.0));
-                ui.painter().rect_filled(seg, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), p.surface);
+                if !metal {
+                    ui.painter().rect_filled(seg, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), p.surface);
+                }
                 let (muted, deafened) = (v.muted, v.deafened);
-                let mic = Rect::from_min_size(seg.min + vec2(2.0, 2.0), vec2(30.0, 30.0));
-                let (glyph, tip, tone) =
-                    if muted { (icons::MICROPHONE_SLASH, "Unmute", Tone::Off) } else { (icons::MICROPHONE, "Mute", Tone::On) };
-                if kit::icon_button_at(ui, mic, "mic", glyph, tip, tone, &p).clicked() {
+                // Material themes: lever toggles, as tall as the segment.
+                let (mic, snd) = if metal {
+                    let mic = Rect::from_min_size(seg.min, vec2(30.0, 34.0));
+                    (mic, Rect::from_min_size(pos2(mic.right() + 4.0, seg.top()), vec2(30.0, 34.0)))
+                } else {
+                    let mic = Rect::from_min_size(seg.min + vec2(2.0, 2.0), vec2(30.0, 30.0));
+                    (mic, Rect::from_min_size(pos2(mic.right(), mic.top()), vec2(30.0, 30.0)))
+                };
+                let (glyph, tip) = if muted { (icons::MICROPHONE_SLASH, "Unmute") } else { (icons::MICROPHONE, "Mute") };
+                if kit::toggle_at(ui, mic, "mic", glyph, tip, !muted, &p).clicked() {
                     cx.actions.session(move |s| s.set_muted(!muted));
                 }
-                let snd = Rect::from_min_size(pos2(mic.right(), mic.top()), vec2(30.0, 30.0));
-                let (glyph, tip, tone) =
-                    if deafened { (icons::EAR_SLASH, "Undeafen", Tone::Off) } else { (icons::HEADPHONES, "Deafen", Tone::On) };
-                if kit::icon_button_at(ui, snd, "deaf", glyph, tip, tone, &p).clicked() {
+                let (glyph, tip) = if deafened { (icons::EAR_SLASH, "Undeafen") } else { (icons::HEADPHONES, "Deafen") };
+                if kit::toggle_at(ui, snd, "deaf", glyph, tip, !deafened, &p).clicked() {
                     cx.actions.session(move |s| s.set_deafened(!deafened));
                 }
                 right = seg.left() - 8.0;
@@ -130,6 +138,21 @@ impl Panel for Voice {
                 if !tip.is_empty() {
                     resp.on_hover_text(tip);
                 }
+            }
+
+            if meter {
+                // Your mic on an LED bar, like a channel strip's meter (dark while muted).
+                let level = cx.voice.filter(|_| !v.muted).map_or(0.0, |s| s.input_intensity);
+                let level = super::smooth(ui, "voice-meter", level);
+                ui.add_space(4.0);
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
+                kit::led_meter(ui.painter(), r, level, &p);
+                // Not "Mic level": that's the settings page's meter, which can be up at the same time.
+                resp.widget_info(|| {
+                    let mut info = egui::WidgetInfo::labeled(Role::ProgressIndicator, true, "Mic meter");
+                    info.value = Some(level as f64);
+                    info
+                });
             }
 
             if supported && v.channel.is_some() && v.mode == "push_to_talk" {

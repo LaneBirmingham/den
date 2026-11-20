@@ -1,0 +1,41 @@
+# Den layout. Copy into <config>/layouts/ (run `den config init`)
+# and edit: the app hot-reloads on save. See default.toml for every option.
+#
+# A rack of hardware: the room, channels and your voice strip share one
+# plate on the left, the chat sits in a recessed screen, people on the
+# right, and a status strip along the bottom. Made for the `studio` theme
+# but works with any.
+name = "console"
+description = "A rack: room, channels and voice on one plate, chat on a screen, status strip below"
+
+[shell]
+style = "cards"
+gap = 10
+
+[lobby]
+center = { panels = ["core.lobby"], card = false }
+overlays = ["core.toasts"]
+
+[room]
+left = { panels = ["core.header", "core.channels", "core.voice"], size = 256 }
+right = { panels = ["core.members", "mods:*"], size = 236 }
+center = { panels = ["core.messages", "core.composer"] }
+bottom = { panels = ["core.status"] }
+overlays = ["core.toasts"]
+
+[panel."core.header"]
+style = "pill"
+
+[panel."core.channels"]
+style = "list"
+
+[panel."core.messages"]
+style = "cozy"
+time_format = "%H:%M"
+group = true
+show_system = true
+header = true
+
+[panel."core.composer"]
+placeholder = "Message #{channel}"
+style = "field"

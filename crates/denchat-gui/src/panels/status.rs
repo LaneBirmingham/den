@@ -1,3 +1,4 @@
+use denchat_core::net::short_addr;
 use denchat_core::session::ConnState;
 use egui::{RichText, Ui};
 
@@ -15,9 +16,12 @@ impl Panel for Status {
         let p = cx.palette;
         ui.horizontal(|ui| {
             let (dot, text) = match &cx.state.conn {
-                ConnState::Connected { addr } => (p.ok, format!("connected · {addr}")),
-                ConnState::Connecting { addr, attempt } if *attempt > 0 => (p.warn, format!("reconnecting to {addr} (try {attempt})")),
-                ConnState::Connecting { addr, .. } => (p.warn, format!("connecting to {addr}")),
+                // The short form: a full invite link would push everything else off the strip.
+                ConnState::Connected { addr } => (p.ok, format!("connected · {}", short_addr(addr))),
+                ConnState::Connecting { addr, attempt } if *attempt > 0 => {
+                    (p.warn, format!("reconnecting to {} (try {attempt})", short_addr(addr)))
+                }
+                ConnState::Connecting { addr, .. } => (p.warn, format!("connecting to {}", short_addr(addr))),
                 ConnState::Failed { error, .. } => (p.danger, error.clone()),
                 ConnState::Idle => (p.muted, "offline".into()),
             };
@@ -30,7 +34,7 @@ impl Panel for Status {
                 ui.label(cx.small(format!("· {}", via.as_str())));
             }
             if let Some(h) = &cx.state.hosting {
-                ui.label(cx.small(format!("· hosting as {}", denchat_core::net::short_addr(&h.addr))));
+                ui.label(cx.small(format!("· hosting as {}", short_addr(&h.addr))));
             }
             if let Some(v) = cx.voice {
                 let codec = v.tx_codec.map(|c| format!("{c:?}")).unwrap_or_else(|| "—".into());
