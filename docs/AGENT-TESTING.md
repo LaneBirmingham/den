@@ -54,6 +54,8 @@ example.dice/history
 * Widgets are grouped by the panel that drew them (layout ids such as
   `core.members` or `my.mod/panel`). Popups and menus appear under the panel
   that opened them.
+* `value=` is a text box's contents, or a slider's or meter's number
+  (`progress "Mic meter" value="0.42"`).
 * **Targets.** Any command that takes a target accepts:
   * `@37`: a ref. A ref stays valid while that widget keeps the same text.
     Once the text changes or the widget goes away, the ref stops matching

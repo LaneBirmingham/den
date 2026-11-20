@@ -147,7 +147,12 @@ impl Panel for Voice {
                 ui.add_space(4.0);
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
                 kit::led_meter(ui.painter(), r, level, &p);
-                kit::name(&resp, Role::Meter, "Mic level");
+                // Not "Mic level": that's the settings page's meter, which can be up at the same time.
+                resp.widget_info(|| {
+                    let mut info = egui::WidgetInfo::labeled(Role::ProgressIndicator, true, "Mic meter");
+                    info.value = Some(level as f64);
+                    info
+                });
             }
 
             if supported && v.channel.is_some() && v.mode == "push_to_talk" {

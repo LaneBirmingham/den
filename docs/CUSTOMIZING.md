@@ -75,22 +75,27 @@ meter for your mic, and section labels are engraved. The built-in `studio`
 theme (with the `console` layout) shows it off.
 
 ```toml
-[material]
+[material]                # defaults shown; `studio` turns most of them up
 texture = "brushed"       # canvas texture: brushed | grain | none
-texture_strength = 0.75   # 0..1
-bevel = 0.9               # lit top edges, shaded bottoms (0..1)
-inset = 0.9               # depth of wells: chat screen, fields, current channel (0..1)
-glow = 0.65               # backlights and LEDs (0..1)
+texture_strength = 0.6    # 0..1; "none" or 0 also leaves the voice card unbrushed
+bevel = 0.8               # lit top edges, shaded bottoms (0..1)
+inset = 0.8               # depth of wells: chat screen, fields, current channel (0..1)
+glow = 0.6                # backlights and LEDs (0..1)
 engrave = true            # engraved uppercase section labels
 screws = true             # screws on your voice card
 ```
 
-Every key is optional (an empty `[material]` table turns it on with these
-defaults). It uses the same colour tokens: `canvas` is the chassis, `panel`
-the plates, `bg` the chat screen, `surface` the caps and keys, `accent` the
-backlight and `ok` / `warn` / `danger` the LEDs. Mod panels sit on the same
-plates and use the same colours; built-in widgets mods reach through the
-kit (section labels, for one) are drawn the material way too.
+Every key is optional: an empty `[material]` table turns it on with these
+defaults (`studio` uses 0.75 / 0.9 / 0.9 / 0.65). It uses the same colour
+tokens: `canvas` is the chassis, `panel` the plates, `bg` the chat screen,
+`surface` the caps and keys, `accent` the backlight and `ok` / `warn` /
+`danger` the LEDs. It works on light themes too (`dark = false`): wells are
+shallower so dark text stays readable, and counts show on a reflective
+grey LCD instead of a backlit black one.
+
+Mod panels sit on the same plates and use the same colours, but their
+widgets (headings, buttons, …) are the stock ones: the engraved labels,
+LCDs, levers and keys are drawn by Den's built-in panels.
 
 ## Layouts
 

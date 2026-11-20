@@ -95,7 +95,8 @@ async fn drive_the_app_headless() {
 async fn studio_theme_in_the_console_layout() {
     let home = std::env::temp_dir().join(format!("den-gui-studio-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
-    let mut config = AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    let mut config =
+        AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
     config.ui.theme = "studio".into();
     config.ui.layout = "console".into();
     let session = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
@@ -120,7 +121,8 @@ async fn studio_theme_in_the_console_layout() {
     // The window's left edge is bare canvas (the gap beside the left card):
     // brushed metal streaks run along rows, so going down the column the
     // brightness zig-zags. A plain fill, or the soft light gradient alone,
-    // would change smoothly.
+    // would change smoothly. The rows are in the second 256 px tile, so this
+    // also needs the texture to repeat (clamped, they'd all be its last row).
     let shot = home.join("studio.png");
     let r = call(&session, "ui.screenshot", json!({"path": shot})).await;
     assert_eq!(r["renderer"].as_str(), Some("cpu"), "{r}");
@@ -129,14 +131,14 @@ async fn studio_theme_in_the_console_layout() {
     let mut buf = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut buf).unwrap();
     let channels = info.line_size / info.width as usize;
-    let luma: Vec<i32> = (100..600)
+    let luma: Vec<i32> = (260..500)
         .map(|y| {
             let i = y * info.line_size + 4 * channels;
             buf[i] as i32 + buf[i + 1] as i32 + buf[i + 2] as i32
         })
         .collect();
     let turns = luma.windows(3).filter(|w| (w[1] - w[0]) * (w[2] - w[1]) < 0).count();
-    assert!(turns > 60, "canvas looks untextured ({turns} turns): {:?}", &luma[..20]);
+    assert!(turns > 40, "canvas looks untextured ({turns} turns): {:?}", &luma[..20]);
 
     call(&session, "app.quit", json!({})).await;
     tokio::task::spawn_blocking(move || app.join()).await.unwrap().unwrap().unwrap();

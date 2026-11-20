@@ -80,7 +80,7 @@ impl Panel for Composer {
         let radius = if pill { CornerRadius::same(22) } else { CornerRadius::same(p.card_radius.min(14)) };
         let mut send_clicked = false;
         let frame = Frame::new()
-            .fill(if p.material.is_some() { kit::well(&p) } else { p.surface })
+            .fill(if p.material.is_some() { p.well() } else { p.surface })
             .stroke(Stroke::new(1.0, if focused { crate::theme::alpha(p.accent, 0.45) } else { p.line }))
             .corner_radius(radius)
             .inner_margin(Margin { left: if pill { 16 } else { 14 }, right: 6, top: 6, bottom: 6 });

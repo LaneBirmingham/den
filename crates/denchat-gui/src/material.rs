@@ -1,5 +1,5 @@
 //! Skeuomorphic surfaces for themes with a `[material]` table: bevelled
-//! plates, sunken wells, LEDs, screws, engraved labels and textured canvases.
+//! plates, sunken wells, glows, screws, engraved labels and textured canvases.
 //!
 //! egui fills shapes with one colour, so gradients are built here as meshes:
 //! the shape is tessellated with egui's own anti-aliased path filler in
@@ -172,21 +172,6 @@ pub fn glow(rect: Rect, radius: CornerRadius, color: Color32, strength: f32) -> 
     }
     let blur = (6.0 + 10.0 * strength) as u8;
     Shadow { offset: [0, 0], blur, spread: 0, color: alpha(color, 0.5 * strength) }.as_shape(rect, radius).into()
-}
-
-/// A round LED, lit (`on`) with a glow, or dark.
-pub fn led(painter: &Painter, center: Pos2, r: f32, color: Color32, on: bool, m: &Material) -> Vec<Shape> {
-    let mut out = Vec::new();
-    if on {
-        let g = m.glow;
-        out.push(Shape::circle_filled(center, r * 2.6, alpha(color, 0.08 * g)));
-        out.push(Shape::circle_filled(center, r * 1.7, alpha(color, 0.18 * g)));
-        out.push(dome(painter, center, r, shade(color, 0.35), color));
-    } else {
-        out.push(Shape::circle_filled(center, r + 0.5, alpha(Color32::BLACK, 0.6)));
-        out.push(dome(painter, center, r, mix(color, Color32::BLACK, 0.55), mix(color, Color32::BLACK, 0.8)));
-    }
-    out
 }
 
 /// A screw head: a domed disc with a slot.

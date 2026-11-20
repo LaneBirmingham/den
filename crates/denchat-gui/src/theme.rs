@@ -247,6 +247,19 @@ pub fn parse_color(s: &str) -> Option<Color32> {
 }
 
 impl Palette {
+    /// The fill of a sunken well in a material theme (a text field, the
+    /// current row): a shade below `panel`, gentler on a light theme so its
+    /// dark text stays readable.
+    pub fn well(&self) -> Color32 {
+        mix(self.panel, Color32::BLACK, if self.dark { 0.35 } else { 0.07 })
+    }
+
+    /// The window of an LCD readout or a lever toggle's slot: near-black on a
+    /// dark theme; a grey a step below the well on a light one (a reflective LCD).
+    pub fn screen(&self) -> Color32 {
+        if self.dark { Color32::from_rgb(10, 10, 11) } else { mix(self.panel, Color32::BLACK, 0.14) }
+    }
+
     /// Placeholder values, overwritten by [`Palette::derived`].
     fn derive_defaults() -> Palette {
         let z = Color32::TRANSPARENT;
@@ -419,7 +432,7 @@ impl Theme {
         v.error_fg_color = p.danger;
         if p.material.is_some() {
             // Text fields sit in wells.
-            let well = mix(p.panel, Color32::BLACK, 0.35);
+            let well = p.well();
             v.extreme_bg_color = well;
             v.text_edit_bg_color = Some(well);
         }

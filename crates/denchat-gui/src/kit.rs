@@ -328,7 +328,7 @@ fn paint_icon_button(ui: &Ui, resp: &Response, glyph: &str, tone: Tone, p: &Pale
             // Pressed in, its icon lit.
             Tone::On | Tone::Off => {
                 let fg = if tone == Tone::On { p.accent } else { p.danger };
-                painter.extend(material::sunken(painter, rect.shrink(1.0), radius, well(p), &m));
+                painter.extend(material::sunken(painter, rect.shrink(1.0), radius, p.well(), &m));
                 lit_icon(painter, rect.center(), glyph, size, fg, p);
             }
             // A round red button, lit from inside.
@@ -405,17 +405,18 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, p: &Palette) -> Re
 
 /// A count pill (`3`, `@`) right-aligned at `right`; returns its width.
 ///
-/// In a material theme it's a little LCD instead: a dark window with the
-/// count lit in `bg` (or the accent, when `bg` is the neutral `surface`).
+/// In a material theme it's a little LCD instead: a window ([`Palette::screen`])
+/// with the count lit in `bg` (or the accent, when `bg` is the neutral `surface`).
 pub fn badge(painter: &Painter, ui: &Ui, right: Pos2, text: &str, bg: Color32, fg: Color32, p: &Palette) -> f32 {
     if let Some(m) = p.material {
         let lit = if bg == p.surface || bg == p.surface_hover { p.accent } else { bg };
         let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), FontId::monospace(11.0), lit));
         let w = (g.size().x + 10.0).max(18.0);
         let rect = Rect::from_min_size(pos2(right.x - w, right.y - 8.0), vec2(w, 16.0));
-        painter.extend(material::sunken(painter, rect, CornerRadius::same(3), Color32::from_rgb(10, 10, 11), &m));
+        painter.extend(material::sunken(painter, rect, CornerRadius::same(3), p.screen(), &m));
         let at = pos2(rect.center().x - g.size().x / 2.0, rect.center().y - g.size().y / 2.0);
-        glow_text(painter, at, &g, lit, m.glow);
+        // A light theme's LCD is reflective: dark digits, nothing glows.
+        glow_text(painter, at, &g, lit, if p.dark { m.glow } else { 0.0 });
         painter.galley(at, g, lit);
         return w;
     }
@@ -470,11 +471,6 @@ fn glow_text(painter: &Painter, at: Pos2, g: &Arc<Galley>, color: Color32, stren
     }
 }
 
-/// The fill of a sunken well (a pressed-in row, a toggle's slot).
-pub fn well(p: &Palette) -> Color32 {
-    mix(p.panel, Color32::BLACK, 0.35)
-}
-
 /// A row that highlights on hover and can be selected. Returns the click response.
 pub fn row(ui: &mut Ui, height: f32, selected: bool, raised: bool, p: &Palette) -> (Rect, Response) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
@@ -482,7 +478,7 @@ pub fn row(ui: &mut Ui, height: f32, selected: bool, raised: bool, p: &Palette) 
     let radius = CornerRadius::same(p.row_radius);
     if let (true, Some(m)) = (selected, p.material) {
         // The current one is pressed in.
-        ui.painter().extend(material::sunken(ui.painter(), rect, radius, well(p), &m));
+        ui.painter().extend(material::sunken(ui.painter(), rect, radius, p.well(), &m));
     } else if selected {
         if raised {
             ui.painter().add(p.shadow_small().as_shape(rect, radius));
@@ -535,7 +531,10 @@ pub fn plate<R>(ui: &mut Ui, p: &Palette, mut frame: Frame, look: Plate, add: im
         Plate::Metal => {
             let metal = mix(p.surface, p.surface_hover, 0.5);
             let mut v = material::raised(painter, rect, radius, metal, p, &m);
-            v.extend(material::texture_over(painter, rect, radius, crate::theme::TextureKind::Brushed, m.texture_strength.max(0.5)));
+            // Always brushed (whatever the canvas has), unless the theme turned textures off.
+            if m.texture != crate::theme::TextureKind::None && m.texture_strength > 0.0 {
+                v.extend(material::texture_over(painter, rect, radius, crate::theme::TextureKind::Brushed, m.texture_strength));
+            }
             if m.screws {
                 v.extend(material::screws(painter, rect, metal));
             }
@@ -557,7 +556,7 @@ pub fn toggle_at(ui: &mut Ui, rect: Rect, salt: &str, glyph: &str, tip: &str, on
     let t = hover_fade(ui, resp.id, resp.hovered());
     let painter = ui.painter();
     let slot = rect.shrink2(vec2(2.0, 0.0));
-    painter.extend(material::sunken(painter, slot, CornerRadius::same(5), Color32::from_rgb(16, 17, 19), &m));
+    painter.extend(material::sunken(painter, slot, CornerRadius::same(5), p.screen(), &m));
     // The lever: a chrome cap in the upper or lower half; the lamp in the other.
     let half = slot.height() / 2.0;
     let lever = Rect::from_center_size(
