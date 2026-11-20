@@ -695,20 +695,30 @@ impl Render<'_> {
         let ctx = ui.ctx().clone();
         let screen = ctx.content_rect();
         let size = egui::vec2((screen.width() - 48.0).clamp(320.0, 760.0), (screen.height() - 64.0).clamp(280.0, 640.0));
+        let radius = CornerRadius::same(p.card_radius.min(18));
+        let margin = Margin::symmetric(18, 14);
+        let mat = crate::material::of(&p);
         let frame = Frame::new()
-            .fill(p.panel)
-            .corner_radius(CornerRadius::same(p.card_radius.min(18)))
-            .inner_margin(Margin::symmetric(18, 14))
-            .stroke(Stroke::new(1.0, p.line))
-            .shadow(p.shadow);
+            .fill(if mat.is_some() { egui::Color32::TRANSPARENT } else { p.panel })
+            .corner_radius(radius)
+            .inner_margin(margin)
+            .stroke(if mat.is_some() { Stroke::NONE } else { Stroke::new(1.0, p.line) })
+            .shadow(if mat.is_some() { egui::Shadow::NONE } else { p.shadow });
         let modal = egui::Modal::new(Id::unique("den-settings"))
             .frame(frame)
             .backdrop_color(crate::theme::alpha(egui::Color32::BLACK, 0.45))
             .show(&ctx, |ui| {
                 ui.set_width(size.x);
                 ui.set_height(size.y);
+                // A material theme's plate goes behind the page, out to the frame's edge.
+                let plate = mat.map(|_| ui.painter().add(egui::Shape::Noop));
                 self.in_card = true;
                 self.panel(ui, SETTINGS_PANEL);
+                if let (Some(idx), Some(m)) = (plate, mat) {
+                    let outer = ui.min_rect() + margin;
+                    let painter = ui.painter().with_clip_rect(outer.expand(2.0));
+                    painter.set(idx, egui::Shape::Vec(crate::material::raised(&painter, outer, radius, p.panel, &p, &m)));
+                }
             });
         if modal.should_close() {
             self.actions.shell(ShellCmd::CloseSettings);
@@ -728,6 +738,14 @@ impl Render<'_> {
         let full = ui.max_rect();
         let cards = self.layout.shell.style == ShellStyle::Cards;
         let g = self.layout.shell.gap.clamp(0.0, 40.0) as i8;
+        let mat = crate::material::of(&p).filter(|_| cards);
+        // A material theme paints its textured canvas once, under every slot.
+        let canvas = if let Some(m) = &mat {
+            ui.painter().extend(crate::material::canvas(ui.painter(), full, p.canvas, m));
+            egui::Color32::TRANSPARENT
+        } else {
+            p.canvas
+        };
         let shown = |name| screen.slot(name).is_some_and(|s| s.visible && !plan.slot(name).is_empty());
         let (side_max, drop_right) = side_widths(full.width(), shown(SlotName::Left), shown(SlotName::Right));
         for name in [SlotName::Top, SlotName::Bottom, SlotName::Left, SlotName::Right] {
@@ -745,7 +763,7 @@ impl Render<'_> {
                     SlotName::Left => Margin { left: g, right: 0, top: g, bottom: g },
                     _ => Margin { left: 0, right: g, top: g, bottom: g },
                 };
-                Frame::new().fill(p.canvas).inner_margin(m)
+                Frame::new().fill(canvas).inner_margin(m)
             } else {
                 Frame::new().fill(p.panel).inner_margin(Margin::symmetric(pad, if name.horizontal() { pad / 2 } else { pad }))
             };
@@ -771,10 +789,7 @@ impl Render<'_> {
                 self.in_card = carded;
                 if carded {
                     let m = if name.horizontal() { Margin::symmetric(pad + 2, pad / 2 + 2) } else { Margin::symmetric(pad, pad + 2) };
-                    slot_card(&p, p.panel, m).show(ui, |ui| {
-                        ui.set_min_size(ui.available_size());
-                        self.slot(ui, name, slot, ids);
-                    });
+                    slot_card(ui, &p, p.panel, m, Depth::Raised, |ui| self.slot(ui, name, slot, ids));
                 } else {
                     self.slot(ui, name, slot, ids);
                 }
@@ -782,7 +797,7 @@ impl Render<'_> {
         }
         let center_ids = plan.slot(SlotName::Center).to_vec();
         let frame = if cards {
-            Frame::new().fill(p.canvas).inner_margin(Margin::same(g))
+            Frame::new().fill(canvas).inner_margin(Margin::same(g))
         } else {
             Frame::new().fill(p.bg).inner_margin(Margin::same(pad))
         };
@@ -791,10 +806,8 @@ impl Render<'_> {
                 let carded = cards && slot.card.unwrap_or(true);
                 self.in_card = carded;
                 if carded {
-                    slot_card(&p, p.bg, Margin { left: 10, right: 10, top: 4, bottom: 10 }).show(ui, |ui| {
-                        ui.set_min_size(ui.available_size());
-                        self.slot(ui, SlotName::Center, slot, &center_ids);
-                    });
+                    let m = Margin { left: 10, right: 10, top: 4, bottom: 10 };
+                    slot_card(ui, &p, p.bg, m, Depth::Sunken, |ui| self.slot(ui, SlotName::Center, slot, &center_ids));
                 } else {
                     self.slot(ui, SlotName::Center, slot, &center_ids);
                 }
@@ -897,7 +910,7 @@ impl Render<'_> {
     fn stack(&mut self, ui: &mut Ui, name: SlotName, ids: &[String]) {
         let fill = ids.iter().position(|id| self.fills(id));
         let cards = self.layout.shell.style == ShellStyle::Cards;
-        let (in_card, line) = (self.in_card, self.palette.line);
+        let (in_card, line, mat) = (self.in_card, self.palette.line, self.palette.material);
         let gap = |ui: &mut Ui, i: usize| {
             if i == 0 || name.horizontal() || name == SlotName::Center {
                 return;
@@ -909,7 +922,20 @@ impl Render<'_> {
                 // A hairline between panels sharing a card.
                 ui.add_space(10.0);
                 let r = ui.available_rect_before_wrap();
-                ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, line));
+                match mat {
+                    // A groove: a dark cut with a lit lower edge.
+                    Some(m) => {
+                        ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, egui::Color32::from_black_alpha(150)));
+                        ui.painter().hline(
+                            r.x_range(),
+                            r.top() + 1.0,
+                            Stroke::new(1.0, crate::theme::alpha(egui::Color32::WHITE, 0.05 * m.bevel)),
+                        );
+                    }
+                    None => {
+                        ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, line));
+                    }
+                }
                 ui.add_space(10.0);
             } else {
                 ui.add_space(6.0);
@@ -950,14 +976,45 @@ impl Render<'_> {
     }
 }
 
-/// The frame for a slot drawn as a card.
-fn slot_card(p: &Palette, fill: egui::Color32, margin: Margin) -> Frame {
-    Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(p.card_radius))
-        .stroke(Stroke::new(1.0, p.line))
-        .shadow(p.shadow)
+/// How a material theme draws a slot's card.
+#[derive(Clone, Copy, PartialEq)]
+enum Depth {
+    /// A plate standing off the canvas (side slots).
+    Raised,
+    /// A well set into it (the centre: the chat sits in a recessed screen).
+    Sunken,
+}
+
+/// A slot drawn as a card, filling the space it's given. Flat themes get a
+/// filled, outlined frame; material themes a bevelled plate or a sunken well.
+fn slot_card(ui: &mut Ui, p: &Palette, fill: egui::Color32, margin: Margin, depth: Depth, add: impl FnOnce(&mut Ui)) {
+    let radius = CornerRadius::same(p.card_radius);
+    let Some(m) = crate::material::of(p) else {
+        Frame::new().fill(fill).corner_radius(radius).stroke(Stroke::new(1.0, p.line)).shadow(p.shadow).inner_margin(margin).show(
+            ui,
+            |ui| {
+                ui.set_min_size(ui.available_size());
+                add(ui);
+            },
+        );
+        return;
+    };
+    // Lay the content out first, then put the surface behind it.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let rect = Frame::new()
         .inner_margin(margin)
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            add(ui);
+        })
+        .response
+        .rect;
+    let painter = ui.painter();
+    let shapes = match depth {
+        Depth::Raised => crate::material::raised(painter, rect, radius, fill, p, &m),
+        Depth::Sunken => crate::material::sunken(painter, rect, radius, fill, &m),
+    };
+    painter.set(bg, egui::Shape::Vec(shapes));
 }
 
 /// Narrowest a left/right slot gets, and the width the centre keeps.

@@ -88,6 +88,62 @@ async fn drive_the_app_headless() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The skeuomorphic look: the `studio` theme in the `console` layout. Panels
+/// keep their names under the new drawing (engraved labels, pressed-in rows),
+/// and the CPU renderer tiles the brushed-metal canvas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn studio_theme_in_the_console_layout() {
+    let home = std::env::temp_dir().join(format!("den-gui-studio-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let mut config = AppConfig { nick: Some("alice".into()), bind: "localhost".into(), net: NetConfig::direct_only(), ..AppConfig::default() };
+    config.ui.theme = "studio".into();
+    config.ui.layout = "console".into();
+    let session = Session::start(SessionOptions { paths: Paths::under(&home), config, client_name: "test".into() }).await.unwrap();
+    session.host(HostOptions { name: "test room".into(), open: false });
+    let rt = tokio::runtime::Handle::current();
+    let app = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            let _guard = rt.enter();
+            denchat_gui::run_mode(session, Registry::with_builtins(), Mode::Headless)
+        })
+    };
+
+    call(&session, "ui.wait", json!({"target": "button:Room menu", "timeout_ms": 15_000})).await;
+    let t = tree(&session).await;
+    for want in ["core.status", "heading \"Text channels\"", "button \"#general\" on", "textbox \"Message #general\""] {
+        assert!(t.contains(want), "{want} missing from:\n{t}");
+    }
+    call(&session, "ui.type", json!({"text": "on the console", "enter": true})).await;
+    call(&session, "ui.wait", json!({"target": "you: on the console", "timeout_ms": 10_000})).await;
+
+    // The window's left edge is bare canvas (the gap beside the left card):
+    // brushed metal streaks run along rows, so going down the column the
+    // brightness zig-zags. A plain fill, or the soft light gradient alone,
+    // would change smoothly.
+    let shot = home.join("studio.png");
+    let r = call(&session, "ui.screenshot", json!({"path": shot})).await;
+    assert_eq!(r["renderer"].as_str(), Some("cpu"), "{r}");
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&shot).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    let channels = info.line_size / info.width as usize;
+    let luma: Vec<i32> = (100..600)
+        .map(|y| {
+            let i = y * info.line_size + 4 * channels;
+            buf[i] as i32 + buf[i + 1] as i32 + buf[i + 2] as i32
+        })
+        .collect();
+    let turns = luma.windows(3).filter(|w| (w[1] - w[0]) * (w[2] - w[1]) < 0).count();
+    assert!(turns > 60, "canvas looks untextured ({turns} turns): {:?}", &luma[..20]);
+
+    call(&session, "app.quit", json!({})).await;
+    tokio::task::spawn_blocking(move || app.join()).await.unwrap().unwrap().unwrap();
+    session.close().await;
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The lobby holds the View menu on its screen: View → Panels must not hide
 /// it, or the window goes blank with nothing left to bring it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

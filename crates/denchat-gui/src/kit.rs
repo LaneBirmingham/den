@@ -7,10 +7,11 @@ use std::sync::{Arc, LazyLock};
 use egui::accesskit::Role;
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Galley, Margin, Painter, Pos2, Rect, Response, Sense, Shadow, Stroke, Ui,
-    Vec2, pos2, vec2,
+    Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Galley, InnerResponse, Margin, Painter, Pos2, Rect, Response, Sense, Shadow,
+    Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
 
+use crate::material;
 use crate::theme::{Palette, alpha, mix};
 
 /// Inter Medium / SemiBold, registered by the theme (egui can't fake bold).
@@ -145,9 +146,17 @@ impl<'a> Face<'a> {
             Some(tex) => crate::pictures::paint_round(painter, center, self.size, tex),
             None => {
                 painter.circle_filled(center, r, avatar_fill(self.nick, p));
+                if let Some(m) = p.material {
+                    // A domed button: lit from the top left.
+                    let b = m.bevel;
+                    painter.add(material::dome(painter, center, r, alpha(Color32::WHITE, 0.3 * b), alpha(Color32::BLACK, 0.22 * b)));
+                }
                 let ink = avatar_ink(p);
                 painter.text(center, Align2::CENTER_CENTER, initial(self.nick), font((self.size * 0.42).max(8.0), W::Semibold), ink);
             }
+        }
+        if p.material.is_some() {
+            painter.circle_stroke(center, r, Stroke::new(1.0, alpha(Color32::BLACK, 0.5)));
         }
         if let Some(c) = self.presence {
             let dr = (self.size * 0.15).clamp(3.0, 6.0);
@@ -305,6 +314,34 @@ fn paint_icon_button(ui: &Ui, resp: &Response, glyph: &str, tone: Tone, p: &Pale
     let rect = resp.rect;
     let t = hover_fade(ui, resp.id, resp.hovered());
     let radius = CornerRadius::same(p.row_radius.min((rect.height() / 2.0) as u8));
+    if let Some(m) = p.material {
+        let painter = ui.painter();
+        let size = (rect.height() * 0.56).round();
+        match tone {
+            // A bare icon on the panel; a metal cap rises under the pointer.
+            Tone::Plain => {
+                if t > 0.0 {
+                    painter.extend(material::button(painter, rect.shrink(1.0), radius, mix(p.surface, p.surface_hover, t), p, &m));
+                }
+                icon(painter, rect.center(), glyph, size, mix(p.muted, p.text, t));
+            }
+            // Pressed in, its icon lit.
+            Tone::On | Tone::Off => {
+                let fg = if tone == Tone::On { p.accent } else { p.danger };
+                painter.extend(material::sunken(painter, rect.shrink(1.0), radius, well(p), &m));
+                lit_icon(painter, rect.center(), glyph, size, fg, p);
+            }
+            // A round red button, lit from inside.
+            Tone::Danger => {
+                let round = CornerRadius::same((rect.height() / 2.0) as u8);
+                let body = rect.shrink(1.0);
+                painter.add(material::glow(body, round, p.danger, m.glow * (0.6 + 0.4 * t)));
+                painter.extend(material::button(painter, body, round, mix(p.danger, Color32::BLACK, 0.22 - 0.1 * t), p, &m));
+                icon(painter, rect.center(), glyph, size, mix(p.danger, Color32::WHITE, 0.85));
+            }
+        }
+        return;
+    }
     let (bg, fg) = match tone {
         Tone::Plain => (alpha(p.text, 0.07 * t), mix(p.muted, p.text, t)),
         Tone::On => (alpha(p.text, 0.05 + 0.05 * t), p.text),
@@ -320,10 +357,23 @@ pub fn pill_button(ui: &mut Ui, text: &str, p: &Palette) -> Response {
     let size = vec2(g.size().x + 20.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let t = hover_fade(ui, resp.id, resp.hovered());
-    ui.painter().rect_filled(rect, CornerRadius::same(12), mix(p.surface, p.surface_hover, t));
+    pill_surface(ui.painter(), rect, t, p);
     put(ui.painter(), &g, rect.left() + 10.0, rect.center().y, p.text);
     name(&resp, Role::Button, text);
     resp
+}
+
+/// The body of a small rounded button (`hot` 0..1 under the pointer): a
+/// filled pill, or a metal cap in a material theme.
+pub fn pill_surface(painter: &Painter, rect: Rect, hot: f32, p: &Palette) {
+    let radius = CornerRadius::same((rect.height() / 2.0).min(12.0) as u8);
+    let fill = mix(p.surface, p.surface_hover, hot);
+    match p.material {
+        Some(m) => painter.extend(material::button(painter, rect, radius, fill, p, &m)),
+        None => {
+            painter.rect_filled(rect, radius, fill);
+        }
+    }
 }
 
 /// The main action of a form (Join, Host): accent fill.
@@ -334,14 +384,41 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, p: &Palette) -> Re
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let t = hover_fade(ui, resp.id, resp.hovered() && enabled);
     let bg = if enabled { mix(p.accent, p.text, 0.12 * t) } else { p.surface };
-    ui.painter().rect_filled(rect, CornerRadius::same(p.row_radius.saturating_add(2).min(12)), bg);
+    let radius = CornerRadius::same(p.row_radius.saturating_add(2).min(12));
+    match p.material {
+        Some(m) => {
+            let painter = ui.painter();
+            if enabled {
+                // Backlit: the accent glows through.
+                painter.add(material::glow(rect, radius, p.accent, m.glow * (0.7 + 0.3 * t)));
+            }
+            painter.extend(material::button(painter, rect, radius, bg, p, &m));
+        }
+        None => {
+            ui.painter().rect_filled(rect, radius, bg);
+        }
+    }
     ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
     resp.widget_info(|| egui::WidgetInfo::labeled(Role::Button, enabled, text));
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
 }
 
 /// A count pill (`3`, `@`) right-aligned at `right`; returns its width.
-pub fn badge(painter: &Painter, ui: &Ui, right: Pos2, text: &str, bg: Color32, fg: Color32) -> f32 {
+///
+/// In a material theme it's a little LCD instead: a dark window with the
+/// count lit in `bg` (or the accent, when `bg` is the neutral `surface`).
+pub fn badge(painter: &Painter, ui: &Ui, right: Pos2, text: &str, bg: Color32, fg: Color32, p: &Palette) -> f32 {
+    if let Some(m) = p.material {
+        let lit = if bg == p.surface || bg == p.surface_hover { p.accent } else { bg };
+        let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), FontId::monospace(11.0), lit));
+        let w = (g.size().x + 10.0).max(18.0);
+        let rect = Rect::from_min_size(pos2(right.x - w, right.y - 8.0), vec2(w, 16.0));
+        painter.extend(material::sunken(painter, rect, CornerRadius::same(3), Color32::from_rgb(10, 10, 11), &m));
+        let at = pos2(rect.center().x - g.size().x / 2.0, rect.center().y - g.size().y / 2.0);
+        glow_text(painter, at, &g, lit, m.glow);
+        painter.galley(at, g, lit);
+        return w;
+    }
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(11.0, W::Semibold), fg));
     let w = (g.size().x + 12.0).max(18.0);
     let rect = Rect::from_min_size(pos2(right.x - w, right.y - 9.0), vec2(w, 18.0));
@@ -355,10 +432,47 @@ pub fn section(ui: &mut Ui, text: &str, p: &Palette) -> Response {
     ui.add_space(10.0);
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
-    let g = line(ui, text, font(12.5, W::Semibold), p.muted, w - 8.0);
-    put(ui.painter(), &g, rect.left() + 8.0, rect.center().y, p.muted);
+    if let Some(m) = p.material.filter(|m| m.engrave) {
+        engraved_label(ui.painter(), pos2(rect.left() + 8.0, rect.center().y), text, w - 40.0, p, &m);
+    } else {
+        let g = line(ui, text, font(12.5, W::Semibold), p.muted, w - 8.0);
+        put(ui.painter(), &g, rect.left() + 8.0, rect.center().y, p.muted);
+    }
     name(&resp, Role::Heading, text);
     resp
+}
+
+/// A label engraved into the panel (uppercase, tracked), its left edge at
+/// `left.x`, centred on `left.y`.
+pub fn engraved_label(painter: &Painter, left: Pos2, text: &str, max_width: f32, p: &Palette, m: &crate::theme::Material) {
+    let color = mix(p.muted, p.panel, 0.2);
+    let g = material::tracked(painter, &text.to_uppercase(), font(10.5, W::Semibold), color, 1.3, max_width);
+    material::engraved(painter, pos2(left.x, left.y - g.size().y / 2.0), &g, color, m);
+}
+
+/// An icon that glows like an indicator lamp in a material theme.
+pub fn lit_icon(painter: &Painter, c: Pos2, glyph: &str, size: f32, color: Color32, p: &Palette) {
+    if let Some(m) = p.material.filter(|m| m.glow > 0.0) {
+        painter.circle_filled(c, size * 0.75, alpha(color, 0.07 * m.glow));
+        painter.circle_filled(c, size * 0.45, alpha(color, 0.1 * m.glow));
+    }
+    icon(painter, c, glyph, size, color);
+}
+
+/// A soft halo of `color` around a galley at `at` (LCD digits, lit labels).
+fn glow_text(painter: &Painter, at: Pos2, g: &Arc<Galley>, color: Color32, strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    let halo = alpha(color, 0.22 * strength);
+    for d in [vec2(-0.8, 0.0), vec2(0.8, 0.0), vec2(0.0, -0.8), vec2(0.0, 0.8)] {
+        painter.galley_with_override_text_color(at + d, g.clone(), halo);
+    }
+}
+
+/// The fill of a sunken well (a pressed-in row, a toggle's slot).
+pub fn well(p: &Palette) -> Color32 {
+    mix(p.panel, Color32::BLACK, 0.35)
 }
 
 /// A row that highlights on hover and can be selected. Returns the click response.
@@ -366,7 +480,10 @@ pub fn row(ui: &mut Ui, height: f32, selected: bool, raised: bool, p: &Palette) 
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let t = hover_fade(ui, resp.id, resp.hovered());
     let radius = CornerRadius::same(p.row_radius);
-    if selected {
+    if let (true, Some(m)) = (selected, p.material) {
+        // The current one is pressed in.
+        ui.painter().extend(material::sunken(ui.painter(), rect, radius, well(p), &m));
+    } else if selected {
         if raised {
             ui.painter().add(p.shadow_small().as_shape(rect, radius));
             ui.painter().rect_filled(rect, radius, p.panel);
@@ -386,6 +503,102 @@ pub fn card(p: &Palette, fill: Color32, raised: bool) -> Frame {
     } else {
         Shadow::NONE
     })
+}
+
+/// How a material theme draws a [`plate`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Plate {
+    /// A bevelled panel.
+    Raised,
+    /// Brushed metal, with screws if the theme has them (your voice card).
+    Metal,
+    /// Set into the surface (text fields, the voice channel you're in).
+    Well,
+}
+
+/// Show `frame` around `add`. Flat themes draw the frame as it is; material
+/// themes keep its margin and corner radius and put a [`Plate`] behind it.
+pub fn plate<R>(ui: &mut Ui, p: &Palette, mut frame: Frame, look: Plate, add: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    let Some(m) = p.material else { return frame.show(ui, add) };
+    let fill = frame.fill;
+    let radius = frame.corner_radius;
+    frame.fill = Color32::TRANSPARENT;
+    frame.stroke = Stroke::NONE;
+    frame.shadow = Shadow::NONE;
+    let bg = ui.painter().add(Shape::Noop);
+    let inner = frame.show(ui, add);
+    let rect = inner.response.rect;
+    let painter = ui.painter();
+    let shapes = match look {
+        Plate::Raised => material::raised(painter, rect, radius, fill, p, &m),
+        Plate::Well => material::sunken(painter, rect, radius, fill, &m),
+        Plate::Metal => {
+            let metal = mix(p.surface, p.surface_hover, 0.5);
+            let mut v = material::raised(painter, rect, radius, metal, p, &m);
+            v.extend(material::texture_over(painter, rect, radius, crate::theme::TextureKind::Brushed, m.texture_strength.max(0.5)));
+            if m.screws {
+                v.extend(material::screws(painter, rect, metal));
+            }
+            v
+        }
+    };
+    painter.set(bg, Shape::Vec(shapes));
+    inner
+}
+
+/// A lever toggle at `rect` (material themes): the lever up and its lamp lit
+/// when `on`, down with a red lamp when off. Flat themes get [`icon_button_at`]
+/// with `Tone::On` / `Tone::Off`.
+pub fn toggle_at(ui: &mut Ui, rect: Rect, salt: &str, glyph: &str, tip: &str, on: bool, p: &Palette) -> Response {
+    let Some(m) = p.material else {
+        return icon_button_at(ui, rect, salt, glyph, tip, if on { Tone::On } else { Tone::Off }, p);
+    };
+    let resp = ui.interact(rect, ui.scope_id().with(salt), Sense::click());
+    let t = hover_fade(ui, resp.id, resp.hovered());
+    let painter = ui.painter();
+    let slot = rect.shrink2(vec2(2.0, 0.0));
+    painter.extend(material::sunken(painter, slot, CornerRadius::same(5), Color32::from_rgb(16, 17, 19), &m));
+    // The lever: a chrome cap in the upper or lower half; the lamp in the other.
+    let half = slot.height() / 2.0;
+    let lever = Rect::from_center_size(
+        pos2(slot.center().x, if on { slot.top() + half * 0.55 } else { slot.bottom() - half * 0.55 }),
+        vec2(slot.width() * 0.5, half * 0.85),
+    );
+    let chrome = Color32::from_rgb(0xb4, 0xb8, 0xbe);
+    painter.extend(material::button(painter, lever, CornerRadius::same(3), mix(chrome, Color32::WHITE, 0.2 * t), p, &m));
+    painter.hline(lever.x_range().shrink(2.0), lever.center().y, Stroke::new(1.0, alpha(Color32::BLACK, 0.25)));
+    let lamp = pos2(slot.center().x, if on { slot.bottom() - half * 0.5 } else { slot.top() + half * 0.5 });
+    lit_icon(painter, lamp, glyph, (half * 0.62).round(), if on { p.ok } else { p.danger }, p);
+    name_icon_button(&resp, salt, tip, Tone::On);
+    if !tip.is_empty() { resp.on_hover_text(tip) } else { resp }
+}
+
+/// An LED bar meter across `rect`: green, then amber, then red as `level`
+/// (0..1) rises; unlit segments stay dark.
+pub fn led_meter(painter: &Painter, rect: Rect, level: f32, p: &Palette) {
+    let n = ((rect.width() + 2.0) / 7.0).floor().max(4.0) as usize;
+    let w = (rect.width() - 2.0 * (n - 1) as f32) / n as f32;
+    let lit = (level.clamp(0.0, 1.0) * n as f32).round() as usize;
+    let glow = p.material.map_or(0.0, |m| m.glow);
+    for i in 0..n {
+        let f = i as f32 / n as f32;
+        let color = if f < 0.6 {
+            p.ok
+        } else if f < 0.85 {
+            p.warn
+        } else {
+            p.danger
+        };
+        let seg = Rect::from_min_size(pos2(rect.left() + i as f32 * (w + 2.0), rect.top()), vec2(w, rect.height()));
+        if i < lit {
+            if glow > 0.0 {
+                painter.rect_filled(seg.expand(1.5), CornerRadius::same(2), alpha(color, 0.18 * glow));
+            }
+            painter.rect_filled(seg, CornerRadius::same(1), color);
+        } else {
+            painter.rect_filled(seg, CornerRadius::same(1), mix(color, Color32::BLACK, 0.82));
+        }
+    }
 }
 
 /// Three connection-strength bars (like a phone's), `n` lit out of 3.
@@ -447,6 +660,19 @@ pub fn day_divider(ui: &mut Ui, text: &str, p: &Palette) {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
     name(&resp, Role::Label, text);
+    if let Some(m) = p.material {
+        // A groove cut across the screen, the day engraved in a gap.
+        let painter = ui.painter();
+        let g = material::tracked(painter, &text.to_uppercase(), font(10.5, W::Semibold), p.muted, 1.3, w - 40.0);
+        let gap = g.size().x / 2.0 + 14.0;
+        let y = rect.center().y;
+        for range in [rect.left()..=rect.center().x - gap, rect.center().x + gap..=rect.right()] {
+            painter.hline(range.clone(), y, Stroke::new(1.0, alpha(Color32::BLACK, 0.6)));
+            painter.hline(range, y + 1.0, Stroke::new(1.0, alpha(Color32::WHITE, 0.05 * m.bevel)));
+        }
+        material::engraved(painter, rect.center() - g.size() / 2.0, &g, p.muted, &m);
+        return;
+    }
     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(12.0, W::Semibold), p.muted));
     let pill = Rect::from_center_size(rect.center(), vec2(g.size().x + 24.0, 22.0));
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.line));
@@ -462,6 +688,10 @@ pub fn new_divider(ui: &mut Ui, label: &str, centred: bool, p: &Palette) {
     name(&resp, Role::Label, label);
     let y = rect.center().y;
     let stroke = Stroke::new(1.0, alpha(p.danger, 0.75));
+    if let Some(m) = p.material.filter(|m| m.glow > 0.0) {
+        // A lit wire: a soft halo under the line.
+        ui.painter().hline(rect.x_range(), y, Stroke::new(4.0, alpha(p.danger, 0.1 * m.glow)));
+    }
     if centred {
         let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font(12.0, W::Semibold), p.danger));
         let half = g.size().x / 2.0 + 10.0;

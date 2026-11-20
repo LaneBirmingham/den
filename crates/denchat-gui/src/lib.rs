@@ -20,6 +20,7 @@ pub mod headless;
 pub mod icons;
 pub mod kit;
 pub mod layout;
+pub mod material;
 pub mod panels;
 pub mod pictures;
 pub mod soft;

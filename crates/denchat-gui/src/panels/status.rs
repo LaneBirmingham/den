@@ -15,7 +15,8 @@ impl Panel for Status {
         let p = cx.palette;
         ui.horizontal(|ui| {
             let (dot, text) = match &cx.state.conn {
-                ConnState::Connected { addr } => (p.ok, format!("connected · {addr}")),
+                // The short form: a full invite link would push everything else off the strip.
+                ConnState::Connected { addr } => (p.ok, format!("connected · {}", denchat_core::net::short_addr(addr))),
                 ConnState::Connecting { addr, attempt } if *attempt > 0 => (p.warn, format!("reconnecting to {addr} (try {attempt})")),
                 ConnState::Connecting { addr, .. } => (p.warn, format!("connecting to {addr}")),
                 ConnState::Failed { error, .. } => (p.danger, error.clone()),

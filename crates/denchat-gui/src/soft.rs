@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use egui::epaint::textures::TextureFilter;
-use egui::epaint::textures::TexturesDelta;
+use egui::epaint::textures::{TextureWrapMode, TexturesDelta};
 use egui::epaint::{ClippedPrimitive, ImageData, Primitive, TextureId, Vertex};
 use egui::{Color32, ColorImage, Rect};
 
@@ -19,9 +19,11 @@ struct Texture {
     size: [usize; 2],
     pixels: Vec<Color32>,
     linear: bool,
+    /// Tiles (`TextureWrapMode::Repeat`, for material textures) rather than clamping at the edges.
+    repeat: bool,
 }
 
-/// A CPU copy of every texture egui has uploaded (in practice: the font atlas).
+/// A CPU copy of every texture egui has uploaded (the font atlas, pictures, material textures).
 #[derive(Default)]
 pub struct Textures {
     map: HashMap<TextureId, Texture>,
@@ -34,9 +36,10 @@ impl Textures {
             for d in deltas {
                 let ImageData::Color(img) = &d.image;
                 let linear = d.options.magnification == TextureFilter::Linear;
+                let repeat = d.options.wrap_mode == TextureWrapMode::Repeat;
                 match d.pos {
                     None => {
-                        self.map.insert(*id, Texture { size: img.size, pixels: img.pixels.clone(), linear });
+                        self.map.insert(*id, Texture { size: img.size, pixels: img.pixels.clone(), linear, repeat });
                     }
                     Some([x0, y0]) => {
                         let Some(t) = self.map.get_mut(id) else { continue };
@@ -73,7 +76,11 @@ impl Texture {
         if w == 0 || h == 0 {
             return [1.0; 4];
         }
-        let at = |x: usize, y: usize| px(self.pixels[y.min(h - 1) * w + x.min(w - 1)]);
+        let (u, v) = if self.repeat { (u.rem_euclid(1.0), v.rem_euclid(1.0)) } else { (u, v) };
+        let at = |x: usize, y: usize| {
+            let (x, y) = if self.repeat { (x % w, y % h) } else { (x.min(w - 1), y.min(h - 1)) };
+            px(self.pixels[y * w + x])
+        };
         if !self.linear {
             let x = ((u * w as f32) as isize).clamp(0, w as isize - 1) as usize;
             let y = ((v * h as f32) as isize).clamp(0, h as isize - 1) as usize;
@@ -286,6 +293,16 @@ mod tests {
         assert!(inside.iter().all(|c| *c == inside[0]), "{inside:?}");
         assert_eq!(inside[0].b(), 100);
         assert_eq!(img.pixels[9 * 10 + 9], Color32::BLACK);
+    }
+
+    #[test]
+    fn repeating_textures_tile() {
+        let strip = |repeat| Texture { size: [2, 1], pixels: vec![Color32::BLACK, Color32::WHITE], linear: false, repeat };
+        // Past the right edge: a repeating texture starts over, a clamped one holds its edge.
+        assert_eq!(strip(true).sample(1.25, 0.5), px(Color32::BLACK));
+        assert_eq!(strip(true).sample(-0.25, 0.5), px(Color32::WHITE));
+        assert_eq!(strip(false).sample(1.25, 0.5), px(Color32::WHITE));
+        assert_eq!(strip(false).sample(-0.25, 0.5), px(Color32::BLACK));
     }
 
     #[test]

@@ -293,7 +293,11 @@ same mod works in the GUI, a future TUI, or a web view.
   windows and overlays, per screen (`lobby`, `room`). `mods:<slot>` and
   `mods:*` expand to mod panels.
 * `Theme` (TOML) → egui visuals, spacing, fonts. Panels read colour tokens
-  from a `Palette`, never hard-coded colours.
+  from a `Palette`, never hard-coded colours. A theme's optional
+  `[material]` table switches the kit and the shell to skeuomorphic drawing
+  (`material.rs`): gradients built as recoloured meshes, bevelled plates,
+  sunken wells, LEDs and procedurally generated, tiling canvas textures
+  (which `soft.rs` tiles too, so CPU screenshots match the GPU).
 * `Catalog` finds themes/layouts: built-in < mods < user files.
 * Panels get a read-only `PanelCx` and queue intents on `Actions`; the shell
   applies them after the frame (no locks held while user code runs).

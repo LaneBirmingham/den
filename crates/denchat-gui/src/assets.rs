@@ -11,6 +11,7 @@ pub const THEMES: &[(&str, &str)] = &[
     ("rose-pine", include_str!("../../../assets/themes/rose-pine.toml")),
     ("rose-pine-dawn", include_str!("../../../assets/themes/rose-pine-dawn.toml")),
     ("gruvbox", include_str!("../../../assets/themes/gruvbox.toml")),
+    ("studio", include_str!("../../../assets/themes/studio.toml")),
 ];
 
 /// Bundled fonts (`assets/fonts`): Inter in three weights and the Phosphor icon font.
@@ -24,6 +25,7 @@ pub const FONTS: &[(&str, &[u8])] = &[
 pub const LAYOUTS: &[(&str, &str)] = &[
     ("default", include_str!("../../../assets/layouts/default.toml")),
     ("messenger", include_str!("../../../assets/layouts/messenger.toml")),
+    ("console", include_str!("../../../assets/layouts/console.toml")),
 ];
 
 /// Copy built-ins into the config dir as editable starting points. Never overwrites.

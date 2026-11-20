@@ -1,0 +1,46 @@
+# Den theme. Copy this file into <config>/themes/ (run `den config init`)
+# and edit it: the app hot-reloads on save. Every key is optional.
+# Studio: a voice app dressed as audio hardware. Brushed gunmetal, black
+# anodised plates, amber backlights and green LEDs. Pairs with the
+# `console` layout.
+name = "studio"
+dark = true
+
+[colors]
+bg = "#16181b"            # the recessed chat screen
+panel = "#24262a"         # anodised plates
+canvas = "#33363b"        # the brushed chassis behind them
+surface = "#2f3236"       # caps and keys
+surface_hover = "#3b3e43"
+border = "#101113"
+text = "#ebe5d8"
+muted = "#938f86"
+accent = "#f2a33a"        # amber backlight
+accent_text = "#241604"
+ok = "#5fe08a"
+warn = "#f2c14a"
+danger = "#ff6b5a"
+speaking = "#5fe08a"
+link = "#7cc4f0"
+mention = "#3a2f1c"
+
+[shape]
+rounding = 6
+spacing = 6
+padding = 10
+border_width = 1
+
+[text]
+size = 14.5
+heading_size = 17
+small_size = 12
+
+# Skeuomorphic rendering. Leave the table out for a flat theme.
+[material]
+texture = "brushed"       # canvas texture: brushed | grain | none
+texture_strength = 0.75
+bevel = 0.9               # lit top edges, shaded bottoms
+inset = 0.9               # depth of wells: chat screen, fields, the current channel
+glow = 0.65               # backlights and LEDs
+engrave = true            # engraved uppercase section labels
+screws = true             # screws on your voice card
