@@ -220,3 +220,9 @@ servers that claim their room back), a relay built into `serve`. Not yet:
 signed messages (today the host relays what members say, and a malicious
 host could alter it), screen share, file transfer, mobile clients, automatic
 takeover when a host vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+
+## License
+
+MIT or Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE). The bundled fonts keep their own licences
+(see [assets/fonts](assets/fonts)).
