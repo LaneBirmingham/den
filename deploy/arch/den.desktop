@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Den
+Comment=Peer-to-peer voice and text chat
+Exec=den
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+StartupWMClass=den

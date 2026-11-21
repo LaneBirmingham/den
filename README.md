@@ -60,6 +60,13 @@ and run `den`. It is rebuilt from `main` on every push. The builds aren't
 signed: on macOS run `xattr -d com.apple.quarantine ./den` once, and on
 Windows choose *More info → Run anyway*.
 
+On Arch Linux and Omarchy, install the package instead (`aarch64` for ARM);
+it adds Den to the app launcher:
+
+```sh
+sudo pacman -U https://github.com/LaneBirmingham/den/releases/latest/download/denchat-x86_64.pkg.tar.zst
+```
+
 Or build it yourself:
 
 ```sh

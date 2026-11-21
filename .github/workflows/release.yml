@@ -51,8 +51,42 @@ jobs:
           path: den-${{ matrix.name }}.*
           if-no-files-found: error
 
-  release:
+  # Arch Linux and Omarchy: wrap the two Linux binaries as pacman packages.
+  arch:
     needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: den-linux-*
+          path: linux
+          merge-multiple: true
+      - name: Package
+        shell: bash
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1).r$GITHUB_RUN_NUMBER"
+          useradd -m build   # makepkg refuses to run as root
+          for arch in x86_64 aarch64; do
+            dir=/tmp/denchat-$arch
+            mkdir -p "$dir/out"
+            tar -xzf "linux/den-linux-$arch.tar.gz" -C "$dir"
+            cp deploy/arch/PKGBUILD deploy/arch/den.desktop "$dir/"
+            # Nothing is compiled here, so the host can package for either architecture.
+            sed "s/^CARCH=.*/CARCH=\"$arch\"/" /etc/makepkg.conf > "$dir/makepkg.conf"
+            chown -R build "$dir"
+            (cd "$dir" && runuser -u build -- env DEN_PKGVER="$ver" PKGDEST="$dir/out" makepkg --config "$dir/makepkg.conf" --nodeps)
+            cp "$dir"/out/denchat-*-"$arch".pkg.tar.zst "denchat-$arch.pkg.tar.zst"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: den-arch
+          path: denchat-*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    needs: [build, arch]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}

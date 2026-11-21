@@ -1,0 +1,25 @@
+# Arch Linux (and Omarchy) package for Den, made from an already-built binary.
+# The release workflow runs this once per architecture, next to `den` and
+# `LICENSE` from that architecture's Linux build. By hand:
+#   cargo build --release && cp target/release/den LICENSE deploy/arch/
+#   cd deploy/arch && makepkg -si
+pkgname=denchat
+pkgver=${DEN_PKGVER:-0.1.0}
+pkgrel=1
+pkgdesc="Minimal, moddable peer-to-peer voice + text chat"
+arch=('x86_64' 'aarch64')
+url="https://github.com/LaneBirmingham/den"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'alsa-lib' 'libxkbcommon' 'wayland')
+optdepends=('python: the example mods'
+            'xdg-desktop-portal: file pickers for profile and room pictures')
+# The binary is stripped already, and may be for another architecture than the host's.
+options=('!strip' '!debug')
+source=('den' 'LICENSE' 'den.desktop')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 den "$pkgdir/usr/bin/den"
+  install -Dm644 den.desktop "$pkgdir/usr/share/applications/den.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
