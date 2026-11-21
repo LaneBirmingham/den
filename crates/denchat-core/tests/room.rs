@@ -225,6 +225,8 @@ async fn control_api_drives_a_session() {
     alice.join(&addr);
     bob.join(&addr);
     wait_for("connected", || alice.state().conn.is_connected() && bob.state().conn.is_connected()).await;
+    // Alice can be connected before she has heard that bob joined.
+    wait_for("both members", || alice.state().members.len() == 2).await;
 
     let env: std::collections::HashMap<_, _> = alice.api_env().into_iter().collect();
     let mut api = ApiClient::connect(&env["DEN_API"], &env["DEN_API_TOKEN"]).await.unwrap();

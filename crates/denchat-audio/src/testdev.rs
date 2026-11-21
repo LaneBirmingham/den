@@ -595,13 +595,16 @@ mod tests {
         let stop = AtomicBool::new(false);
         let start = Instant::now();
         let mut total = 0usize;
+        // Time of the last tick, not of `pace` returning: a busy machine can oversleep after it.
+        let mut at = Duration::ZERO;
         pace(48_000, &stop, |n| {
             total += n;
-            if start.elapsed() >= Duration::from_millis(300) {
+            at = start.elapsed();
+            if at >= Duration::from_millis(300) {
                 stop.store(true, Relaxed);
             }
         });
-        let expected = 48_000.0 * start.elapsed().as_secs_f64();
-        assert!((total as f64 - expected).abs() < 48_000.0 * 0.03, "{total} samples in {:?}", start.elapsed());
+        let expected = 48_000.0 * at.as_secs_f64();
+        assert!((total as f64 - expected).abs() < 48_000.0 * 0.03, "{total} samples in {at:?}");
     }
 }
