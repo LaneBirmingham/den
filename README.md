@@ -53,6 +53,15 @@ dice mod's panel on the right.*
 
 ## Quick start
 
+Download the build for your machine from the
+[latest release](https://github.com/LaneBirmingham/den/releases/latest)
+(Windows x64, macOS Apple Silicon or Intel, Linux x86_64 or arm64), unpack it
+and run `den`. It is rebuilt from `main` on every push. The builds aren't
+signed: on macOS run `xattr -d com.apple.quarantine ./den` once, and on
+Windows choose *More info → Run anyway*.
+
+Or build it yourself:
+
 ```sh
 cargo build --release              # GUI + voice (default features)
 ./target/release/den          # opens the lobby: host, join, or reopen a saved room

@@ -1,0 +1,75 @@
+name: release
+# Every push to main rebuilds the app for each platform and replaces the
+# files on the "latest" release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # 22.04, not latest: an older glibc runs on more distros.
+          - { os: ubuntu-22.04, name: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, name: linux-aarch64 }
+          - { os: macos-latest, name: macos-aarch64 }
+          - { os: macos-15-intel, name: macos-x86_64 }
+          - { os: windows-latest, name: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p denchat
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp LICENSE README.md dist/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/den.exe dist/
+            (cd dist && 7z a ../den-${{ matrix.name }}.zip .)
+          else
+            cp target/release/den dist/
+            tar -czf den-${{ matrix.name }}.tar.gz -C dist .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: den-${{ matrix.name }}
+          path: den-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        run: |
+          notes="Built from main at $GITHUB_SHA."
+          if gh release view latest >/dev/null 2>&1; then
+            # Move the tag, then swap the files in place.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release upload latest dist/* --clobber
+            gh release edit latest --notes "$notes"
+          else
+            gh release create latest dist/* --target "$GITHUB_SHA" --title "Latest build" --notes "$notes"
+          fi
