@@ -64,7 +64,7 @@ On Arch Linux and Omarchy, install the package instead (`aarch64` for ARM);
 it adds Den to the app launcher:
 
 ```sh
-sudo pacman -U https://github.com/LaneBirmingham/den/releases/latest/download/denchat-x86_64.pkg.tar.zst
+sudo pacman -U https://github.com/LaneBirmingham/den/releases/latest/download/den-archlinux-x86_64.pkg.tar.zst
 ```
 
 Or build it yourself:

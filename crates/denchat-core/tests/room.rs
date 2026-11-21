@@ -252,7 +252,17 @@ async fn control_api_drives_a_session() {
     let sub = ApiClient::connect(&env["DEN_API"], &env["DEN_API_TOKEN"]).await.unwrap();
     let mut stream = sub.subscribe(&["message.*".into()]).await.unwrap();
     bob.submit(None, "streamed");
-    let ev = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let ev = stream.next().await.unwrap().unwrap();
+            // Alice's own "via api" can still be on its way to her when she subscribes.
+            if ev.data["message"]["text"] != "via api" {
+                break ev;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(ev.event, "message.created");
     assert_eq!(ev.data["message"]["text"], "streamed");
     srv.shutdown();

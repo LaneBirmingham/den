@@ -3,7 +3,7 @@
 # `LICENSE` from that architecture's Linux build. By hand:
 #   cargo build --release && cp target/release/den LICENSE deploy/arch/
 #   cd deploy/arch && makepkg -si
-pkgname=denchat
+pkgname=den
 pkgver=${DEN_PKGVER:-0.1.0}
 pkgrel=1
 pkgdesc="Minimal, moddable peer-to-peer voice + text chat"

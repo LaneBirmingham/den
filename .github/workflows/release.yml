@@ -69,7 +69,7 @@ jobs:
           ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1).r$GITHUB_RUN_NUMBER"
           useradd -m build   # makepkg refuses to run as root
           for arch in x86_64 aarch64; do
-            dir=/tmp/denchat-$arch
+            dir=/tmp/pkg-$arch
             mkdir -p "$dir/out"
             tar -xzf "linux/den-linux-$arch.tar.gz" -C "$dir"
             cp deploy/arch/PKGBUILD deploy/arch/den.desktop "$dir/"
@@ -77,12 +77,12 @@ jobs:
             sed "s/^CARCH=.*/CARCH=\"$arch\"/" /etc/makepkg.conf > "$dir/makepkg.conf"
             chown -R build "$dir"
             (cd "$dir" && runuser -u build -- env DEN_PKGVER="$ver" PKGDEST="$dir/out" makepkg --config "$dir/makepkg.conf" --nodeps)
-            cp "$dir"/out/denchat-*-"$arch".pkg.tar.zst "denchat-$arch.pkg.tar.zst"
+            cp "$dir"/out/den-*-"$arch".pkg.tar.zst "den-archlinux-$arch.pkg.tar.zst"
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: den-arch
-          path: denchat-*.pkg.tar.zst
+          name: den-archlinux
+          path: den-archlinux-*.pkg.tar.zst
           if-no-files-found: error
 
   release:
