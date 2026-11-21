@@ -46,17 +46,10 @@ panel placed by a TOML **layout**, colours and shapes come from a TOML
 layouts. Everything the UI can do is also on a local **control API**, so
 scripts and AI agents can drive and reshape the app without touching Rust.
 
-```
- ╭ core.header ──╮ ╭ core.messages ──────────────────╮ ╭ core.members ──╮
- │ ▣ lane's room │ │ # general                       │ │ People      4  │
- ╰───────────────╯ │ ◉ bob  7:04 PM                  │ │ ◉ bob  Online  │
-  core.channels    │   hey lane                      │ │ ◉ amy  In lou… │
-  # general    2   │ ◉ lane 7:04 PM                  │ ├ mods:* ────────┤
-  🔊 lounge  ◉◉    │   rolled 2d6+1 = 6              │ │ Dice           │
- ╭ core.voice ───╮ │ ╭ core.composer ──────────────╮ │ │                │
- │ ◉ lane  🎙 🎧 │ │ │ Message #general         ⬆ │ │ │                │
- ╰───────────────╯ ╰─────────────────────────────────╯ ╰────────────────╯
-```
+![Den with the tokyo-night theme: channels and voice on the left, chat in the middle, people and a mod panel on the right](docs/screenshot.png)
+
+*The default layout in the built-in `tokyo-night` theme, with the example
+dice mod's panel on the right.*
 
 ## Quick start
 
@@ -223,6 +216,5 @@ takeover when a host vanishes (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## License
 
-MIT or Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE). The bundled fonts keep their own licences
-(see [assets/fonts](assets/fonts)).
+[MIT](LICENSE). The bundled fonts keep their own licences (see
+[assets/fonts](assets/fonts)).
